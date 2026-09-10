@@ -1,6 +1,6 @@
 # LexiLoop 产品与技术设计
 
-- 状态：已完成逐节确认，待规格独立审查
+- 状态：已完成逐节确认；独立规格审查通过（第三轮，无剩余问题）
 - 日期：2026-09-10
 - 首发内容：《2024 恋练有词考研英语真题词汇 6500 分层串记》本地 PDF
 - 部署目标：Cloudflare Workers、单个 D1 数据库、私有 R2
@@ -211,6 +211,18 @@ flowchart LR
 
 每张卡使用稳定 `content_card_key`。模板版本变化不应自动创建新卡；语义目标变化才通过新 key 或显式 alias 处理。
 
+#### 多卡首次引入规则
+
+新词学习以“词”为内容展示单位，以“卡”为 FSRS 状态单位。一个词可能产生多张卡，V1 采用以下确定规则：
+
+1. 用户完成一组词的完整内容学习后，Compiler 为这些词生成的全部 active `card_definition` 都进入该组的快速回忆队列，不静默省略某一卡型。
+2. 队列按固定排序键构造：`card_type_rank`（`WORD_MEANING`、`CONTEXT_MEANING`、`PHRASE`、`SENSE_DISCRIMINATION`）→ `word.source_order` → `target_entity_key` → `content_card_key`。因此同样的 release、词组和配置始终得到同样的队列。
+3. 每张卡揭示答案后必须获得一次 `Again | Hard | Good | Easy` 评分；首次成功提交评分时才创建该卡的 `card_state`。只看过内容或只选择熟悉度不会创建 FSRS 状态。
+4. 中断后从 `study_session` 的队列位置继续；已经评分的卡不重复创建状态，尚未评分的卡仍保留在队列。
+5. `word_progress.stage` 是持久化状态。开始展示词时从 `UNSEEN` 变为 `IN_PROGRESS`；当该词在首次引入 Session 的固定 release 中，全部 active 卡都至少有一个有效 `card_state` 时，与最后一张卡的评分在同一原子 batch 中变为 `INTRODUCED`，并记录 `introduced_release_id` 与 `introduced_at`。统计中的“已学词”使用此状态；已学卡数按存在有效 `card_state` 的卡计算。后续 release 新增卡不会把已引入词退回未学状态，新卡通过后续“待引入卡”队列补充。
+6. 为控制单次负担，用户设置的是“每组新词数”，UI 在开始前同时显示按当前卡定义计算出的预计卡数；V1 不设置隐藏的卡片数量上限。
+7. “待引入卡”定义为：当前 active release 中存在、但该用户尚无 `card_state`，且其所属词已经是 `INTRODUCED` 的卡。它们在今日页单独计数，按上述固定卡排序进入快速回忆；首次评分只创建该卡状态，不改变词的 `INTRODUCED` 状态。每个可学习词至少必须生成一张 active 卡，否则 Compiler 阻断对应 Unit。
+
 ### 5.8 TTS 合成与音频校验
 
 - V1 为每个词头和每条真题例句预生成音频。
@@ -292,15 +304,17 @@ rollback.json
 #### 用户与学习状态
 
 - `app_user`：用户 ID、用户名规范化值、盐、密码 verifier、状态、`session_version`、创建时间。
+- `auth_session`：服务端 Session ID、token hash、用户 ID、签发/过期/撤销时间、签发时的 `session_version` 和最近使用时间。
 - `user_settings`：起始 Unit、新词批量大小、每日目标、时区和显示偏好。
-- `word_progress`：首次接触时间、初始熟悉度、学习阶段、最近接触时间。
+- `word_progress`：首次接触时间、初始熟悉度、`UNSEEN | IN_PROGRESS | INTRODUCED` 学习阶段、`introduced_release_id`、引入时间和最近接触时间。
 - `card_state`：`user_id + content_card_key` 唯一；保存 FSRS card 状态、due、reps、lapses、last_review。
 - `review_log`：append-only；保存 `event_id`、评分、前后状态、耗时、时间和 `undone_at`。
-- `study_session`：模式、队列快照、当前位置、创建/过期时间。
+- `study_session`：模式、固定 `release_id`、队列快照、当前位置、创建/过期时间。
 
 ### 6.3 关键索引与约束
 
 - `app_user(normalized_username)` 唯一。
+- `auth_session(token_hash)` 唯一，并索引 `(user_id, expires_at)`。
 - `card_state(user_id, content_card_key)` 唯一。
 - `card_state(user_id, due)` 用于到期队列。
 - `review_log(user_id, reviewed_at desc)` 与 `review_log(event_id)` 唯一。
@@ -311,12 +325,15 @@ rollback.json
 
 ### 6.4 内容版本与学习进度
 
-- 当前内容读取一律限定 `active_release_id`。
+- 普通浏览和新建 Session 的内容读取限定 `active_release_id`；通过已有 `study_session` 进行的读取例外，必须限定该 Session 固定的 `release_id`。
 - `card_state` 引用稳定 `content_card_key`，不引用某 release 的行 ID。
 - 新 release 保留相同语义目标和稳定 key 时，用户 FSRS 状态自动延续。
 - 新卡在用户后续学习时创建状态。
 - 被弃用卡不再进入新队列，但历史 review log 保留。
 - 只有 `content_key_alias` 明确声明时才迁移 key；迁移工具先检测一对多/多对一冲突。
+- 新建 `study_session` 时把当时的 `active_release_id` 固定写入 Session。进行中的学习 Session 始终读取其固定 release，内容激活或回滚都不在中途替换队列。
+- `study_session` 最长有效 24 小时。到期后未评分卡的临时队列可丢弃，已提交的 `card_state` 与 `review_log` 保留；用户在当前 active release 上创建新 Session。
+- release 只有在既不是当前 active、也不是紧邻上一回滚版本、且没有未过期 `study_session` 引用时才有资格被清理。
 
 ## 7. 鉴权与预置账户
 
@@ -328,9 +345,9 @@ rollback.json
 
 ### 7.2 Session 与请求保护
 
-- 登录成功后签发带 HMAC 的不透明 Session Cookie。
+- 登录成功后生成 256-bit 随机不透明 token；Cookie 保存原 token，D1 `auth_session` 只保存其 SHA-256 hash。每次鉴权同时检查 Session 未撤销、未过期、账户可用且 `session_version` 匹配。
 - Cookie 属性：`HttpOnly`、`Secure`、`SameSite=Strict`、限定 Path、合理过期时间。
-- `SESSION_SECRET` 存储为 Worker Secret。
+- 登出把当前 `auth_session.revoked_at` 写入 D1 并清除 Cookie，因此当前 Session 可立即失效；禁用账户或修改密码则递增 `session_version`，使该账户所有 Session 失效。
 - 所有写请求校验 Origin 和 CSRF token。
 - 登录接口使用 Cloudflare Worker Rate Limiting binding。[官方文档](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
 - API 忽略客户端传入的 `user_id`；数据归属只取自有效 Session。
@@ -352,13 +369,15 @@ rollback.json
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/api/content/bootstrap` | 当前 release、书籍、Unit 摘要、客户端配置 |
-| `GET` | `/api/content/units/:unitKey` | Unit 结构和进度摘要 |
-| `GET` | `/api/content/words/:wordKey` | 完整词条、义项、短语、例句和解释 |
+| `GET` | `/api/content/bootstrap` | 只返回当前 release、书籍、Unit 和客户端内容配置，不含个人进度 |
+| `GET` | `/api/content/units/:unitKey` | 只返回 Unit 教材结构与内容摘要 |
+| `GET` | `/api/content/words/:wordKey` | 只返回完整教材词条、义项、短语、例句和解释 |
 | `GET` | `/api/content/search?q=` | 前缀、普通索引与 FTS5 搜索 |
 | `GET` | `/api/audio/:assetKey` | 鉴权后从私有 R2 流式返回音频 |
 
 音频响应使用内容哈希 ETag 和长缓存；R2 bucket 不公开，`assetKey` 仍需校验其属于当前或保留 release。
+
+`/api/content/*` 的响应只包含所有预置账户共享的教材数据，绝不混入熟悉度、到期时间或个人统计。Unit 和词条的个人进度由 `/api/study/*`、`/api/stats/*` 或独立的 `GET /api/progress/words/:wordKey` 返回。
 
 ### 8.3 Study 与 Review
 
@@ -371,17 +390,18 @@ rollback.json
 | `POST` | `/api/reviews/:eventId/undo` | 仅撤销当前用户最新的有效评分 |
 | `GET` | `/api/stats/overview` | 今日、30 天、Unit 和错难词统计 |
 
-评分请求包含 `event_id`、`session_id`、`card_key`、`rating` 和答题耗时。Worker 依次验证 Session、Origin/CSRF、`event_id` 幂等性、队列位置、卡有效性与 release 兼容性，然后运行服务端 `ts-fsrs`。
+评分请求包含 `event_id`、`session_id`、`card_key`、`rating` 和答题耗时。Worker 依次验证登录 Session、Origin/CSRF、`event_id` 幂等性、学习 Session 队列位置，以及卡在该 `study_session.release_id` 中有效，然后运行服务端 `ts-fsrs`。评分成功后同时重新计算相关词是否已达到 `INTRODUCED`。
 
 一次评分通过 D1 `batch()` 原子完成：
 
 1. 插入带 `before_state`、`after_state` 的 `review_log`。
 2. upsert `card_state`。
 3. 推进 `study_session` 位置。
+4. 如果该评分补齐了某词首次引入队列中的最后一张 active 卡，把 `word_progress.stage`、`introduced_release_id` 和 `introduced_at` 更新为 `INTRODUCED`。
 
 D1 `batch()` 中任一语句失败则整体回滚。[D1 Worker API](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch)
 
-重复提交同一 `event_id` 返回原结果，不再次计数。客户端在收到成功响应前不进入下一张卡。撤销只允许最新且未撤销事件，将 `card_state` 恢复到 `before_state` 并填写 `undone_at`，不删除日志。
+重复提交同一 `event_id` 返回原结果，不再次计数。客户端在收到成功响应前不进入下一张卡。撤销只允许未过期 `study_session` 中当前用户最新且未撤销的事件，并在一个 batch 中填写 `undone_at`、回退 Session 位置和恢复 `before_state`。如果 `before_state` 为空，说明撤销的是该卡首次评分，此时删除对应 `card_state`；若这使首次引入 Session 中某词不再全卡完成，则把该词的 `word_progress.stage` 原子退回 `IN_PROGRESS`，并清空 `introduced_release_id/introduced_at`。日志本身始终保留。
 
 ## 9. 学习体验
 
@@ -432,10 +452,13 @@ D1 `batch()` 中任一语句失败则整体回滚。[D1 Worker API](https://deve
 
 ## 10. PWA、离线与缓存
 
-- 静态 App Shell 可缓存，支持添加到主屏幕。
-- 教材 JSON 与音频采用版本化 URL/ETag 缓存，但浏览器离线缓存不是权威数据源。
-- V1 不支持离线评分写入：网络断开时允许查看已缓存内容，但评分按钮明确提示等待联网，避免客户端和服务端 FSRS 分叉。
-- `bootstrap` 响应携带 `active_release_id`；发现版本变化时清理旧内容查询缓存，但保留当前未提交交互位置。
+- Service Worker 只预缓存静态 App Shell，支持添加到主屏幕；V1 不承诺教材离线阅读，也不支持离线评分写入。
+- `/api/auth/*`、`/api/progress/*`、`/api/study/*`、`/api/reviews/*` 和 `/api/stats/*` 一律返回 `Cache-Control: private, no-store`，Service Worker 永不缓存。
+- `/api/content/*` 只含账户共享的教材数据，可按 `release_id + URL` 存入独立 Cache Storage；绝不把个人进度合并进内容响应。
+- 音频按内容哈希缓存。内容与音频缓存即使可跨同一浏览器中的预置账户复用，也只包含这些账户共同有权访问的教材资源，不包含身份或学习状态。
+- 登出时清除内存中的用户状态、所有个人 IndexedDB/本地存储项，并通知 Service Worker 清除教材与音频 Cache Storage；静态 App Shell 可保留。
+- 离线时应用只显示离线提示和静态壳，不从缓存展示教材详情或个人进度，避免绕过 Session 状态。
+- `bootstrap` 响应携带 `active_release_id`；发现版本变化时启用新 release 的内容缓存命名空间，并在没有进行中旧 Session 后清理旧缓存。
 - 音频失败不阻塞阅读，可重试或继续学习。
 
 ## 11. 可靠性与失败处理
@@ -533,9 +556,9 @@ pnpm workspace 管理 TypeScript 包。TypeScript CLI 负责状态机、共享 S
 2. **上传音频**：按内容哈希上传到私有 R2，已存在且哈希一致的对象跳过。
 3. **暂存 D1**：导入新的 inactive release；分批大小遵守 D1 请求和行大小限制。[D1 限制](https://developers.cloudflare.com/d1/platform/limits/)
 4. **预发布验证**：核对 manifest、行数、FK、FTS、R2 对象和预置测试账户冒烟流程。
-5. **原子激活**：切换 `active_release_id`，使下一次 bootstrap 获取新版本。
-6. **观察与回滚**：保留上一版本；出现硬错误时只切回指针。
-7. **延迟清理**：确认稳定后清理更旧的 D1 release 和无引用 R2 对象；清理前重新计算引用集并输出 dry-run 清单。
+5. **原子激活**：切换 `active_release_id`，使新建 Session 和下一次普通 bootstrap 使用新版本；已经存在的 `study_session` 继续固定在其创建版本。
+6. **观察与回滚**：至少保留紧邻上一版本 14 天；出现硬错误时只切回指针。即使超过 14 天，只要仍有未过期 Session 引用就不能清理。
+7. **延迟清理**：release 只有在非 active、非紧邻上一版本、保留期已过且没有未过期 Session 引用时才可删除。R2 音频按所有保留 release 的 manifest 计算引用集；零引用对象另设 7 天宽限期。任何删除前先输出 dry-run 清单和备份定位信息。
 
 R2 标准存储具有免费额度且公网出口费为零，但所有成本假设在实施与上线前以官方定价重新核对。[R2 定价](https://developers.cloudflare.com/r2/pricing/)
 
@@ -603,4 +626,3 @@ R2 标准存储具有免费额度且公网出口费为零，但所有成本假�
 - [Cloudflare R2 Pricing](https://developers.cloudflare.com/r2/pricing/)
 - [Cloudflare Worker Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
 - [ts-fsrs](https://github.com/open-spaced-repetition/ts-fsrs)
-
