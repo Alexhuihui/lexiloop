@@ -34,6 +34,9 @@ function firstVersionLine(result: ReturnType<typeof spawnSync>): string {
 }
 
 let failed = false;
+// A prerequisite message may be shared by several checks (e.g. ffmpeg and
+// ffprobe); collect and print each distinct one exactly once at the end.
+const prerequisites = new Set<string>();
 
 for (const check of checks) {
   // Always spawn with an argument array (no shell string) so paths and
@@ -44,7 +47,7 @@ for (const check of checks) {
     failed = true;
     console.error(`[toolchain] ${check.label}: not available`);
     if (check.prerequisite !== undefined) {
-      console.error(`[toolchain] ${check.prerequisite}`);
+      prerequisites.add(check.prerequisite);
     }
     continue;
   }
@@ -53,5 +56,8 @@ for (const check of checks) {
 }
 
 if (failed) {
+  for (const prerequisite of prerequisites) {
+    console.error(`[toolchain] ${prerequisite}`);
+  }
   process.exit(1);
 }

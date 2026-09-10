@@ -10,6 +10,7 @@ export default tseslint.config(
       "test-results/**",
       "artifacts/**",
       "**/.venv/**",
+      "**/.wrangler/**",
       "**/node_modules/**",
     ],
   },

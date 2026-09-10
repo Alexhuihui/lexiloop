@@ -1,15 +1,17 @@
 {
   "name": "lexiloop",
   "private": true,
+  "type": "module",
   "packageManager": "pnpm@11.15.1",
   "scripts": {
     "compiler": "pnpm --filter @lexiloop/content-compiler exec tsx src/cli.ts",
     "toolchain:check": "tsx scripts/check-toolchain.ts",
     "typecheck": "pnpm -r typecheck",
+    "typecheck:root": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:python": "uv run pytest",
     "lint": "eslint .",
-    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:python"
+    "verify": "pnpm lint && pnpm typecheck:root && pnpm typecheck && pnpm test && pnpm test:python"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.22.0",
