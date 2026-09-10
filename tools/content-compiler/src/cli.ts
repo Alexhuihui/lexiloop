@@ -71,6 +71,8 @@ async function executeRun(deps: CliDeps, options: RunCommandOptions): Promise<vo
     through,
     releaseGate: releaseGateFor(),
     logger: deps.logger,
+    // Single-writer guard: one advisory lockfile per source work directory.
+    lockDirectory: path.join(deps.workRoot, options.sourceHash),
   });
   for (const outcome of report.results) {
     const suffix = outcome.error_code ? ` error=${outcome.error_code}` : "";

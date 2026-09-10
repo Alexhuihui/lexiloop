@@ -8,6 +8,11 @@
  * written in the same directory and renamed over the target, so a crash can
  * never leave a half-written entry (at worst a stale RUNNING entry, which the
  * pipeline recovers on the next invocation).
+ *
+ * Single-writer assumption: a work directory must have at most one compile
+ * run writing the ledger at a time. `runPipeline` enforces this with an
+ * advisory lockfile (see pipeline.ts); any direct ledger use outside the
+ * pipeline must uphold the same constraint.
  */
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";

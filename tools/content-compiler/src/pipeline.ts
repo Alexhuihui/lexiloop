@@ -1,16 +1,31 @@
 /**
- * Pipeline scheduling: resume, invalidation, retries, and the release gate
- * (spec 5.2, 11.1).
+ * Pipeline scheduling: resume, invalidation, retries, locking, and the
+ * release gate (spec 5.2, 11.1).
  *
  * Resume semantics:
  * - A stage is skipped only when its ledger entry is PASSED and both the
  *   current input hash and the stage config version hash still match.
+ * - A skipped stage carries its ledger provenance forward: the next stage
+ *   observes `upstream.outputHash` from the ledger, so stages that fold
+ *   upstream identity into their input hash stay resume-stable.
  * - As soon as any stage re-runs, every downstream stage re-runs too
  *   (cascade invalidation), because its upstream input may have changed.
- * - A stale RUNNING entry (crashed process) is recovered to a resumable
- *   FAILED with code STALE_RUNNING before scheduling.
+ * - A stale RUNNING entry (crashed process) anywhere in the registry — not
+ *   only within the scheduled prefix — is recovered to a resumable FAILED
+ *   with code STALE_RUNNING before scheduling, so `status` never reports a
+ *   phantom RUNNING stage after a crash.
  * - Only `StageError.retryable` failures are retried, with capped
- *   exponential backoff plus jitter. Everything else fails the run closed.
+ *   exponential backoff plus jitter. The retry budget is per invocation;
+ *   the ledger `attempts` field is cumulative across runs for observability.
+ *   Everything else fails the run closed.
+ *
+ * Single-writer: a work directory supports at most one compile run at a
+ * time. When `lockDirectory` is provided, the run holds an advisory lockfile
+ * (`compile.lock`, created with the exclusive "wx" flag) for the run's
+ * duration and releases it on every exit path. An existing lock always
+ * refuses the run with an actionable message — a fresh lock reports an
+ * active run, and a lock older than the TTL reports as stale; neither is
+ * ever broken automatically.
  *
  * Note: stage outputs are passed in memory between consecutively executed
  * stages. A stage scheduled right after a skipped predecessor receives
@@ -18,6 +33,8 @@
  * stage implementations (tasks 5-10).
  */
 import { randomUUID } from "node:crypto";
+import { mkdir, open, rm, stat } from "node:fs/promises";
+import path from "node:path";
 import { ZodError } from "zod";
 import type { LedgerStore } from "./ledger";
 import { silentLogger, type CompilerLogger } from "./logging";
@@ -86,6 +103,13 @@ export interface RunPipelineOptions {
   logger?: CompilerLogger;
   retry?: Partial<RetryPolicy>;
   releaseGate?: ReleaseGate;
+  /**
+   * Directory for the advisory single-writer lockfile. The CLI passes the
+   * source work directory; when omitted the run is unguarded (tests).
+   */
+  lockDirectory?: string;
+  /** Age at which an existing lock is reported as stale. */
+  lockTtlMs?: number;
 }
 
 export type StageOutcomeStatus = StageStatus | "SKIPPED";
@@ -118,6 +142,99 @@ export function resolveStagePrefix(stages: readonly AnyStage[], through: string)
 }
 
 // --------------------------------------------------------------------------
+// Advisory single-writer work lock
+// --------------------------------------------------------------------------
+
+export const LOCK_FILE_NAME = "compile.lock";
+
+/** Default age at which an existing work lock is reported as stale. */
+export const DEFAULT_LOCK_TTL_MS = 12 * 60 * 60 * 1000;
+
+function formatDuration(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  return `${(ms / 3_600_000).toFixed(1)}h`;
+}
+
+/** Raised when a run refuses to start because a work lock already exists. */
+export class PipelineLockError extends Error {
+  readonly lockPath: string;
+  readonly stale: boolean;
+
+  constructor(lockPath: string, stale: boolean, ageMs: number, ttlMs: number) {
+    const detail = stale
+      ? `Stale work lock at ${lockPath}: age ${formatDuration(ageMs)} exceeds the lock TTL ` +
+        `(${formatDuration(ttlMs)}). Verify no compiler process is still writing this work ` +
+        "directory, then delete the lock file manually and re-run. Locks are never broken " +
+        "automatically."
+      : `Another compile run appears to be active: work lock at ${lockPath} held for ` +
+        `${formatDuration(ageMs)}. A work directory supports a single writer; wait for the ` +
+        "active run to finish, or — only after verifying no compiler process is running — " +
+        "delete the lock file manually.";
+    super(detail);
+    this.name = "PipelineLockError";
+    this.lockPath = lockPath;
+    this.stale = stale;
+  }
+}
+
+export interface WorkLock {
+  path: string;
+  /** Idempotent; removes the lockfile. */
+  release(): Promise<void>;
+}
+
+/**
+ * Acquire the advisory lockfile for a work directory. Creation uses the
+ * exclusive "wx" flag, so concurrent acquirers cannot both win. An existing
+ * lock always refuses: below the TTL it is reported as an active run, past
+ * the TTL as stale. Stale locks are never removed automatically.
+ */
+export async function acquireWorkLock(options: {
+  directory: string;
+  ttlMs?: number;
+}): Promise<WorkLock> {
+  const ttlMs = options.ttlMs ?? DEFAULT_LOCK_TTL_MS;
+  await mkdir(options.directory, { recursive: true });
+  const lockPath = path.join(options.directory, LOCK_FILE_NAME);
+  const payload = `${JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() })}\n`;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    let handle;
+    try {
+      handle = await open(lockPath, "wx");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      let ageMs = 0;
+      let vanished = false;
+      try {
+        ageMs = Math.max(0, Date.now() - (await stat(lockPath)).mtimeMs);
+      } catch {
+        vanished = true; // Lock disappeared between EEXIST and stat; retry.
+      }
+      if (!vanished) throw new PipelineLockError(lockPath, ageMs > ttlMs, ageMs, ttlMs);
+      continue;
+    }
+    try {
+      await handle.writeFile(payload, "utf8");
+    } finally {
+      await handle.close();
+    }
+    let released = false;
+    return {
+      path: lockPath,
+      release: async () => {
+        if (released) return;
+        released = true;
+        await rm(lockPath, { force: true });
+      },
+    };
+  }
+  // Only reachable if the lock kept vanishing between EEXIST and stat.
+  throw new PipelineLockError(lockPath, false, 0, ttlMs);
+}
+
+// --------------------------------------------------------------------------
 // Pipeline
 // --------------------------------------------------------------------------
 
@@ -144,6 +261,22 @@ export async function runPipeline(
   ledger: LedgerStore,
   options: RunPipelineOptions = {},
 ): Promise<RunReport> {
+  const workLock = options.lockDirectory
+    ? await acquireWorkLock({ directory: options.lockDirectory, ttlMs: options.lockTtlMs })
+    : null;
+  try {
+    return await runPipelineLocked(stages, ledger, options);
+  } finally {
+    // Released on every exit path, including failures and rejections.
+    await workLock?.release();
+  }
+}
+
+async function runPipelineLocked(
+  stages: readonly AnyStage[],
+  ledger: LedgerStore,
+  options: RunPipelineOptions,
+): Promise<RunReport> {
   const policy: RetryPolicy = { ...DEFAULT_RETRY_POLICY, ...options.retry };
   const logger = options.logger ?? silentLogger;
   const runId = options.runId ?? `compile-${randomUUID()}`;
@@ -151,9 +284,10 @@ export async function runPipeline(
   const config = options.config ?? {};
   const prefix = options.through ? resolveStagePrefix(stages, options.through) : [...stages];
 
-  // 1. Crash recovery: any RUNNING entry is from a dead process; turn it into
-  //    a resumable FAILED before scheduling anything.
-  for (const stage of prefix) {
+  // 1. Crash recovery: any RUNNING entry belongs to a dead process; recover
+  //    it across the full registry so status never shows phantom RUNNING
+  //    stages after a crash past the scheduled prefix.
+  for (const stage of stages) {
     const entry = await ledger.load(stage.name);
     if (entry?.status === "RUNNING") {
       await ledger.save({
@@ -207,6 +341,9 @@ export async function runPipeline(
       upstream,
     };
 
+    const entry = await ledger.load(stage.name);
+    const configHash = configVersionHash(stage);
+
     let inputHash: string;
     try {
       inputHash = await stage.computeInputHash(ctx);
@@ -216,9 +353,9 @@ export async function runPipeline(
         status: "FAILED",
         compile_run_id: runId,
         input_hash: null,
-        config_version_hash: configVersionHash(stage),
+        config_version_hash: configHash,
         output_hash: null,
-        attempts: 1,
+        attempts: (entry?.attempts ?? 0) + 1,
         started_at: null,
         finished_at: nowIso(),
         updated_at: nowIso(),
@@ -227,16 +364,19 @@ export async function runPipeline(
       logger.error("stage_failed", {
         stage: stage.name,
         compile_run_id: runId,
+        attempt: (entry?.attempts ?? 0) + 1,
         error_code: "INPUT_HASH_FAILED",
       });
-      results.push({ name: stage.name, status: "FAILED", attempts: 1, error_code: "INPUT_HASH_FAILED" });
+      results.push({
+        name: stage.name,
+        status: "FAILED",
+        attempts: (entry?.attempts ?? 0) + 1,
+        error_code: "INPUT_HASH_FAILED",
+      });
       runStatus = "FAILED";
       stoppedAt = stage.name;
       break;
     }
-
-    const entry = await ledger.load(stage.name);
-    const configHash = configVersionHash(stage);
 
     // 3. Resume: skip only when PASSED with matching input and config hashes.
     if (
@@ -251,9 +391,11 @@ export async function runPipeline(
         compile_run_id: runId,
         input_hash: inputHash,
       });
-      // Upstream output is not available for skipped stages; see module doc.
+      // The in-memory output is unavailable, but the recorded output hash is
+      // still valid provenance: stages hashing `upstream.outputHash` stay
+      // resume-stable across invocations.
       upstreamRaw = undefined;
-      upstream = null;
+      upstream = entry.output_hash !== null ? { stage: stage.name, outputHash: entry.output_hash } : null;
       continue;
     }
 
@@ -346,11 +488,13 @@ export async function runPipeline(
     }
 
     // 7. Execute with capped exponential backoff for retryable failures.
-    const priorAttempts = entry && entry.status !== "PASSED" ? entry.attempts : 0;
+    //    Retry decisions and backoff use the per-invocation attempt index;
+    //    the persisted `attempts` value stays cumulative across runs.
+    const priorAttempts = entry?.attempts ?? 0;
     const stageStart = Date.now();
-    let attempt = priorAttempts;
+    let attemptThisRun = 0;
 
-    const saveRunning = async (nextAttempt: number, errorCode: string | null): Promise<void> => {
+    const saveRunning = async (totalAttempts: number): Promise<void> => {
       await ledger.save({
         stage: stage.name,
         status: "RUNNING",
@@ -358,17 +502,18 @@ export async function runPipeline(
         input_hash: inputHash,
         config_version_hash: configHash,
         output_hash: null,
-        attempts: nextAttempt,
+        attempts: totalAttempts,
         started_at: startedAt,
         finished_at: null,
         updated_at: nowIso(),
-        error_code: errorCode,
+        error_code: null,
       });
     };
 
     for (;;) {
-      attempt += 1;
-      await saveRunning(attempt, null);
+      attemptThisRun += 1;
+      const totalAttempts = priorAttempts + attemptThisRun;
+      await saveRunning(totalAttempts);
       try {
         const rawOutput = await stage.run(input, ctx);
         const output = stage.outputSchema.parse(rawOutput);
@@ -381,7 +526,7 @@ export async function runPipeline(
           input_hash: inputHash,
           config_version_hash: configHash,
           output_hash: outputHash,
-          attempts: attempt,
+          attempts: totalAttempts,
           started_at: startedAt,
           finished_at: nowIso(),
           updated_at: nowIso(),
@@ -390,7 +535,7 @@ export async function runPipeline(
         logger.info("stage_completed", {
           stage: stage.name,
           compile_run_id: runId,
-          attempt,
+          attempt: totalAttempts,
           duration_ms: durationMs,
           input_hash: inputHash,
           output_hash: outputHash,
@@ -398,7 +543,7 @@ export async function runPipeline(
         results.push({
           name: stage.name,
           status: "PASSED",
-          attempts: attempt,
+          attempts: totalAttempts,
           duration_ms: durationMs,
         });
         cascade = true;
@@ -407,16 +552,16 @@ export async function runPipeline(
         break;
       } catch (err) {
         const stageErr = normalizeStageError(err);
-        const canRetry = stageErr.retryable && attempt < policy.maxAttempts;
+        const canRetry = stageErr.retryable && attemptThisRun < policy.maxAttempts;
         if (canRetry) {
           logger.warn("stage_retry", {
             stage: stage.name,
             compile_run_id: runId,
-            attempt,
-            retry_count: attempt,
+            attempt: totalAttempts,
+            retry_count: attemptThisRun,
             error_code: stageErr.code,
           });
-          await policy.sleep(backoffDelayMs(policy, attempt));
+          await policy.sleep(backoffDelayMs(policy, attemptThisRun));
           continue;
         }
         const finalStatus: StageStatus = stageErr.blocked ? "BLOCKED" : "FAILED";
@@ -428,7 +573,7 @@ export async function runPipeline(
           input_hash: inputHash,
           config_version_hash: configHash,
           output_hash: null,
-          attempts: attempt,
+          attempts: totalAttempts,
           started_at: startedAt,
           finished_at: nowIso(),
           updated_at: nowIso(),
@@ -437,7 +582,7 @@ export async function runPipeline(
         logger.error("stage_failed", {
           stage: stage.name,
           compile_run_id: runId,
-          attempt,
+          attempt: totalAttempts,
           duration_ms: durationMs,
           error_code: stageErr.code,
           input_hash: inputHash,
@@ -445,7 +590,7 @@ export async function runPipeline(
         results.push({
           name: stage.name,
           status: finalStatus,
-          attempts: attempt,
+          attempts: totalAttempts,
           duration_ms: durationMs,
           error_code: stageErr.code,
         });

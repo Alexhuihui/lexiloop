@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -6,7 +6,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { buildCli, type CliDeps } from "../src/cli";
 import { createFileLedger, ledgerDirectory, type LedgerEntry, type LedgerStore } from "../src/ledger";
 import { collectEnvSecrets, createCompilerLogger, silentLogger } from "../src/logging";
-import { runPipeline } from "../src/pipeline";
+import {
+  PipelineLockError,
+  acquireWorkLock,
+  runPipeline,
+} from "../src/pipeline";
 import {
   PRODUCTION_STAGE_DEPENDENCIES,
   PRODUCTION_STAGE_NAMES,
@@ -38,6 +42,10 @@ interface FixtureStageOptions {
   error?: StageError;
   /** Raw source-text-like content flowing through the stage output. */
   rawText?: string;
+  /** Throw a non-Error value (exercises the STAGE_UNEXPECTED_ERROR path). */
+  throwValue?: unknown;
+  /** Return an output that violates outputSchema (OUTPUT_SCHEMA_INVALID path). */
+  invalidOutput?: boolean;
 }
 
 function fixtureStage(name: string, calls: string[], opts: FixtureStageOptions = {}): AnyStage {
@@ -51,8 +59,12 @@ function fixtureStage(name: string, calls: string[], opts: FixtureStageOptions =
     async run() {
       calls.push(name);
       runs += 1;
+      if (opts.throwValue !== undefined) throw opts.throwValue;
       if (opts.failTimes !== undefined && runs <= opts.failTimes) {
         throw opts.error ?? new StageError("TRANSIENT_FAILURE", "transient", { retryable: true });
+      }
+      if (opts.invalidOutput) {
+        return { unexpected: true } as unknown as { stage: string };
       }
       if (opts.rawText !== undefined) {
         // Extra keys are stripped by outputSchema.parse before anything is logged.
@@ -135,6 +147,38 @@ describe("pipeline resume", () => {
     expect(entry?.output_hash).toMatch(/^[0-9a-f]{64}$/);
     expect(entry?.config_version_hash).toMatch(/^[0-9a-f]{64}$/);
     expect(entry?.compile_run_id).toBeTruthy();
+  });
+
+  it("keeps resume stability when stages hash upstream provenance", async () => {
+    const ledger = await makeLedger();
+    const calls: string[] = [];
+    // A dependent stage that folds its predecessor's ledger output hash into
+    // its own input hash (as production stages will for artifact chaining).
+    const makeDependent = (sink: string[]): AnyStage => ({
+      name: "dependent",
+      configVersion: "1",
+      inputSchema: z.unknown(),
+      outputSchema: z.object({ stage: z.string() }),
+      computeInputHash: (ctx) => hashString(`${ctx.upstream?.stage}:${ctx.upstream?.outputHash}`),
+      async run() {
+        sink.push("dependent");
+        return { stage: "dependent" };
+      },
+    });
+
+    await runPipeline([fixtureStage("source", calls), makeDependent(calls)], ledger.store);
+    expect(calls).toEqual(["source", "dependent"]);
+
+    // Second invocation: source is skipped, and the dependent must observe
+    // the skipped stage's recorded output hash — so it skips too.
+    const rerunCalls: string[] = [];
+    const report = await runPipeline(
+      [fixtureStage("source", rerunCalls), makeDependent(rerunCalls)],
+      ledger.store,
+    );
+    expect(report.status).toBe("COMPLETED");
+    expect(report.results.map((r) => r.status)).toEqual(["SKIPPED", "SKIPPED"]);
+    expect(rerunCalls).toEqual([]);
   });
 });
 
@@ -296,6 +340,100 @@ describe("stage state machine", () => {
     });
   });
 
+  it("grants a fresh retry budget on each invocation after an exhausted run", async () => {
+    const ledger = await makeLedger();
+    const calls: string[] = [];
+    const sleeps: number[] = [];
+    const baseRetry = {
+      baseDelayMs: 100,
+      factor: 2,
+      maxDelayMs: 250,
+      jitterRatio: 0,
+      random: () => 0,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+      },
+    };
+    const error = () => new StageError("RATE_LIMITED", "429", { retryable: true });
+
+    const exhausted = await runPipeline(
+      [fixtureStage("flaky", calls, { failTimes: 2, error: error() })],
+      ledger.store,
+      { retry: { ...baseRetry, maxAttempts: 2 } },
+    );
+    expect(exhausted.status).toBe("FAILED");
+    expect(await ledger.store.load("flaky")).toMatchObject({ status: "FAILED", attempts: 2 });
+
+    // A new invocation gets a fresh per-run budget; backoff restarts from the
+    // base delay instead of beginning at the cap.
+    const recovered = await runPipeline(
+      [fixtureStage("flaky", calls, { failTimes: 2, error: error() })],
+      ledger.store,
+      { retry: { ...baseRetry, maxAttempts: 3 } },
+    );
+    expect(recovered.status).toBe("COMPLETED");
+    expect(calls).toEqual(["flaky", "flaky", "flaky", "flaky", "flaky"]);
+    expect(sleeps).toEqual([100, 100, 200]);
+    expect(await ledger.store.load("flaky")).toMatchObject({ status: "PASSED", attempts: 5 });
+  });
+
+  it("accumulates cumulative attempts across invocations", async () => {
+    const ledger = await makeLedger();
+    const calls: string[] = [];
+    const broken = () =>
+      fixtureStage("broken", calls, {
+        failTimes: 99,
+        error: new StageError("CONFIG_INVALID", "bad config", { retryable: false }),
+      });
+    const first = await runPipeline([broken()], ledger.store);
+    const second = await runPipeline([broken()], ledger.store);
+    expect(first.status).toBe("FAILED");
+    expect(second.status).toBe("FAILED");
+    expect(second.results[0]).toMatchObject({ attempts: 2 });
+    expect(await ledger.store.load("broken")).toMatchObject({
+      status: "FAILED",
+      error_code: "CONFIG_INVALID",
+      attempts: 2,
+    });
+    expect(calls).toEqual(["broken", "broken"]);
+  });
+
+  it("records cumulative attempts when input hashing fails", async () => {
+    const ledger = await makeLedger();
+    const hashBroken: AnyStage = {
+      name: "hash-broken",
+      configVersion: "1",
+      inputSchema: z.unknown(),
+      outputSchema: z.object({ stage: z.string() }),
+      computeInputHash: () => {
+        throw new Error("cannot hash inputs");
+      },
+      run: async () => ({ stage: "hash-broken" }),
+    };
+    await runPipeline([hashBroken], ledger.store);
+    const report = await runPipeline([hashBroken], ledger.store);
+    expect(report.status).toBe("FAILED");
+    expect(await ledger.store.load("hash-broken")).toMatchObject({
+      status: "FAILED",
+      error_code: "INPUT_HASH_FAILED",
+      attempts: 2,
+    });
+  });
+
+  it("recovers stale RUNNING entries beyond the scheduled prefix", async () => {
+    const ledger = await makeLedger();
+    await ledger.store.save(entryFor({ stage: "ocr", status: "RUNNING", attempts: 1 }));
+    const calls: string[] = [];
+    const report = await runPipeline(fixtureStages(calls), ledger.store, { through: "source" });
+    expect(report.status).toBe("COMPLETED");
+    expect(calls).toEqual(["source"]);
+    // `ocr` was outside the scheduled prefix but must not stay RUNNING forever.
+    expect(await ledger.store.load("ocr")).toMatchObject({
+      status: "FAILED",
+      error_code: "STALE_RUNNING",
+    });
+  });
+
   it("refuses to re-run a BLOCKED stage without explicit intervention", async () => {
     const ledger = await makeLedger();
     await ledger.store.save(
@@ -403,6 +541,154 @@ describe("contiguous traversal", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Work-dir advisory lock (single-writer)
+// ---------------------------------------------------------------------------
+
+describe("work lock", () => {
+  it("refuses to start while another run holds the work lock", async () => {
+    const ledger = await makeLedger();
+    const lockDir = await mkdtemp(path.join(tmpdir(), "lexiloop-lock-"));
+    tempDirs.push(lockDir);
+    const held = await acquireWorkLock({ directory: lockDir });
+    const calls: string[] = [];
+    await expect(
+      runPipeline(fixtureStages(calls), ledger.store, { lockDirectory: lockDir }),
+    ).rejects.toThrow(PipelineLockError);
+    expect(calls).toEqual([]);
+    // The blocking lock is never broken automatically.
+    expect(await readdir(lockDir)).toContain("compile.lock");
+    await held.release();
+    const report = await runPipeline(fixtureStages(calls), ledger.store, {
+      lockDirectory: lockDir,
+    });
+    expect(report.status).toBe("COMPLETED");
+    expect(calls).toEqual(["source", "images", "ocr"]);
+    await expect(readdir(lockDir)).resolves.not.toContain("compile.lock");
+  });
+
+  it("refuses and never auto-breaks a stale lock past the TTL", async () => {
+    const ledger = await makeLedger();
+    const lockDir = await mkdtemp(path.join(tmpdir(), "lexiloop-stale-lock-"));
+    tempDirs.push(lockDir);
+    const held = await acquireWorkLock({ directory: lockDir });
+    const lockPath = path.join(lockDir, "compile.lock");
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lockPath, old, old);
+    const calls: string[] = [];
+    await expect(
+      runPipeline(fixtureStages(calls), ledger.store, {
+        lockDirectory: lockDir,
+        lockTtlMs: 1_000,
+      }),
+    ).rejects.toThrow(/stale/i);
+    expect(calls).toEqual([]);
+    // Refusal leaves the stale lock in place for human inspection.
+    expect(await readFile(lockPath, "utf8")).toContain('"pid"');
+    await held.release();
+  });
+
+  it("releases the work lock when the run fails", async () => {
+    const ledger = await makeLedger();
+    const lockDir = await mkdtemp(path.join(tmpdir(), "lexiloop-lock-fail-"));
+    tempDirs.push(lockDir);
+    const calls: string[] = [];
+    const failing = fixtureStage("broken", calls, {
+      failTimes: 99,
+      error: new StageError("BOOM", "hard failure", { retryable: false }),
+    });
+    const report = await runPipeline([failing], ledger.store, { lockDirectory: lockDir });
+    expect(report.status).toBe("FAILED");
+    // The lock was released on the failure exit path, so the next run starts.
+    const followUp = await runPipeline([fixtureStage("ok", [])], ledger.store, {
+      lockDirectory: lockDir,
+    });
+    expect(followUp.status).toBe("COMPLETED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed error paths
+// ---------------------------------------------------------------------------
+
+describe("fail-closed error paths", () => {
+  it("records STAGE_UNEXPECTED_ERROR for non-Error throws", async () => {
+    const ledger = await makeLedger();
+    const calls: string[] = [];
+    const weird = fixtureStage("weird", calls, { throwValue: "boom string" });
+    const report = await runPipeline([weird], ledger.store);
+    expect(report.status).toBe("FAILED");
+    expect(report.results[0]).toMatchObject({
+      name: "weird",
+      status: "FAILED",
+      error_code: "STAGE_UNEXPECTED_ERROR",
+      attempts: 1,
+    });
+    expect(await ledger.store.load("weird")).toMatchObject({
+      status: "FAILED",
+      error_code: "STAGE_UNEXPECTED_ERROR",
+    });
+  });
+
+  it("records OUTPUT_SCHEMA_INVALID when output violates the stage schema", async () => {
+    const ledger = await makeLedger();
+    const calls: string[] = [];
+    const bad = fixtureStage("bad-output", calls, { invalidOutput: true });
+    const report = await runPipeline([bad], ledger.store);
+    expect(report.status).toBe("FAILED");
+    expect(await ledger.store.load("bad-output")).toMatchObject({
+      status: "FAILED",
+      error_code: "OUTPUT_SCHEMA_INVALID",
+      attempts: 1,
+    });
+  });
+
+  it("records BLOCKED when a stage fails with a blocked StageError", async () => {
+    const ledger = await makeLedger();
+    const calls: string[] = [];
+    const repair = fixtureStage("repair", calls, {
+      failTimes: 1,
+      error: new StageError("UNIT_BLOCKED", "three repair rounds exhausted", { blocked: true }),
+    });
+    const downstream = fixtureStage("downstream", calls);
+    const report = await runPipeline([repair, downstream], ledger.store);
+    expect(report.status).toBe("BLOCKED");
+    expect(report.stoppedAt).toBe("repair");
+    expect(calls).toEqual(["repair"]);
+    expect(await ledger.store.load("repair")).toMatchObject({
+      status: "BLOCKED",
+      error_code: "UNIT_BLOCKED",
+    });
+  });
+
+  it("records INPUT_SCHEMA_INVALID for a strict stage after a skipped predecessor", async () => {
+    const ledger = await makeLedger();
+    const calls: string[] = [];
+    await runPipeline([fixtureStage("source", calls)], ledger.store);
+
+    const strict: AnyStage = {
+      name: "strict",
+      configVersion: "1",
+      inputSchema: z.object({ stage: z.string() }),
+      outputSchema: z.object({ stage: z.string() }),
+      computeInputHash: () => hashString("strict"),
+      async run() {
+        calls.push("strict");
+        return { stage: "strict" };
+      },
+    };
+    // `source` is skipped, so `strict` receives no in-memory upstream output.
+    const report = await runPipeline([fixtureStage("source", calls), strict], ledger.store);
+    expect(report.status).toBe("FAILED");
+    expect(report.stoppedAt).toBe("strict");
+    expect(calls).toEqual(["source"]);
+    expect(await ledger.store.load("strict")).toMatchObject({
+      status: "FAILED",
+      error_code: "INPUT_SCHEMA_INVALID",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Logging and redaction (spec 13.2)
 // ---------------------------------------------------------------------------
 
@@ -474,6 +760,16 @@ describe("compiler logging", () => {
     // Secrets and full source text never appear.
     expect(joined).not.toContain("mimo-api-key-123");
     expect(joined).not.toContain("The entire textbook sentence");
+  });
+
+  it("skips scrubbing for secrets containing JSON-significant characters", () => {
+    const lines: string[] = [];
+    // Splicing a secret like `"}` into a serialized JSON line would corrupt
+    // its structure; scrubbing must skip such secrets entirely.
+    const logger = createCompilerLogger({ sink: (line) => lines.push(line), secrets: ['"}'] });
+    logger.info("stage_completed", { stage: "LAYOUT_OCR" });
+    const parsed = JSON.parse(lines[0]!) as { stage: string };
+    expect(parsed.stage).toBe("LAYOUT_OCR");
   });
 
   it("collects likely secrets from the environment by key name", () => {

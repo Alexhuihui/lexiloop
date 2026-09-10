@@ -30,6 +30,23 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_RANK: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 const REDACTED = "[REDACTED]";
+const JSON_SIGNIFICANT_CHARS = '"\\{}[],:';
+
+/**
+ * Secrets containing JSON-significant characters (quotes, backslashes,
+ * structural punctuation, control chars) either only appear escaped in the
+ * serialized line (quotes/backslashes, so a raw-substring splice would never
+ * match anyway) or would corrupt the line's JSON structure when replaced.
+ * Scrubbing skips them instead of splice-replacing.
+ */
+function containsJsonSignificantChars(value: string): boolean {
+  for (const ch of value) {
+    if (JSON_SIGNIFICANT_CHARS.includes(ch)) return true;
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20) return true; // control characters
+  }
+  return false;
+}
 
 export interface CompilerLogger {
   debug(event: string, fields?: LogFields): void;
@@ -47,7 +64,9 @@ export interface CompilerLoggerOptions {
 
 export function createCompilerLogger(options: CompilerLoggerOptions): CompilerLogger {
   const sink = options.sink;
-  const secrets = (options.secrets ?? []).filter((secret) => secret.length > 0);
+  const secrets = (options.secrets ?? []).filter(
+    (secret) => secret.length > 0 && !containsJsonSignificantChars(secret),
+  );
   const minRank = LEVEL_RANK[options.level ?? "debug"];
   const allowlisted = new Set<string>(LOG_FIELDS);
 
