@@ -211,25 +211,70 @@ def test_exclusion_holes_are_never_changed(scan_page, rule) -> None:
     assert changed_pixels_outside(scan_page, cleaned, mask) == 0
 
 
-def test_background_fill_preserves_near_black_print() -> None:
-    # The footer repair uses flat background fill: light watermark remnants
-    # and the orphaned speck are flattened, near-black genuine text survives.
+def test_background_fill_preserves_near_black_and_chromatic_print() -> None:
+    # The footer repair uses flat background fill: light neutral watermark
+    # remnants and the orphaned speck are flattened, near-black genuine text
+    # AND chromatic body print (light-teal sprig) survive (QA round 2).
     image = np.full((200, 200, 3), 255, dtype=np.uint8)
-    image[20:30, 10:180] = (205, 205, 205)  # watermark remnant strip
+    image[20:30, 10:180] = (205, 205, 205)  # neutral watermark strip
     image[40:50, 10:120] = (30, 30, 30)  # genuine near-black print
-    image[60:64, 130:150] = (150, 150, 150)  # orphaned mid-gray speck
+    image[60:64, 130:150] = (150, 150, 150)  # genuine mid-gray print (lum < 180)
+    image[70:74, 130:150] = (190, 190, 190)  # neutral bright remnant (lum >= 180)
+    image[80:90, 20:100] = (110, 190, 190)  # light-teal sprig (lum~181, spread 80)
     rule = WatermarkRule(
-        rule_version=2,
+        rule_version=3,
         book_key="footer-case",
         fill=FillConfig(default_mode="background"),
-        evidence=EvidenceConfig(),
+        evidence=EvidenceConfig(dark_fill_preserve_luminance=180),
         regions=[RectRegion(name="footer", box=(0.0, 0.0, 1.0, 0.5))],
     )
     cleaned, mask = clean_watermarks(image, rule, page_number=32)
     assert changed_pixels_outside(image, cleaned, mask) == 0
     assert np.array_equal(cleaned[40:50, 10:120], image[40:50, 10:120])  # print kept
+    assert np.array_equal(cleaned[60:64, 130:150], image[60:64, 130:150])  # mid print kept
+    assert np.array_equal(cleaned[80:90, 20:100], image[80:90, 20:100])  # teal kept
     assert _ink_pixels(cleaned[20:30, 10:180]) == 0  # remnant flattened
-    assert _ink_pixels(cleaned[60:64, 130:150]) == 0  # speck flattened
+    assert _ink_pixels(cleaned[70:74, 130:150]) == 0  # bright remnant flattened
+
+
+def test_band_fill_removes_only_the_luminance_band() -> None:
+    # Cover footer repair: watermark ink sits in a mid-gray luminance band;
+    # near-black print below the band and bright background above it must
+    # both survive untouched.
+    image = np.full((200, 200, 3), 255, dtype=np.uint8)
+    image[20:30, 10:180] = (170, 170, 170)  # mid-gray watermark glyph (lum 170)
+    image[40:50, 10:120] = (60, 60, 60)  # near-black imprint glyph (lum 60)
+    rule = WatermarkRule(
+        rule_version=3,
+        book_key="band-case",
+        regions=[
+            RectRegion(
+                name="footer-band",
+                box=(0.0, 0.0, 1.0, 1.0),
+                fill_mode="band",
+                remove_lo_luminance=150,
+                remove_hi_luminance=182,
+            )
+        ],
+    )
+    cleaned, mask = clean_watermarks(image, rule, page_number=1)
+    assert changed_pixels_outside(image, cleaned, mask) == 0
+    assert np.array_equal(cleaned[40:50, 10:120], image[40:50, 10:120])  # imprint kept
+    assert _ink_pixels(cleaned[20:30, 10:180]) == 0  # watermark band filled
+    assert np.array_equal(cleaned[100:200, :], image[100:200, :])  # paper untouched
+
+
+def test_band_fill_requires_luminance_thresholds() -> None:
+    with pytest.raises(pydantic.ValidationError):
+        RectRegion(name="band", box=(0.0, 0.0, 1.0, 1.0), fill_mode="band")
+    with pytest.raises(pydantic.ValidationError):
+        RectRegion(
+            name="band",
+            box=(0.0, 0.0, 1.0, 1.0),
+            fill_mode="band",
+            remove_lo_luminance=182,
+            remove_hi_luminance=160,  # inverted band
+        )
 
 
 def test_selective_fill_preserves_dark_text_inside_region() -> None:

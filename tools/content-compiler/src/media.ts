@@ -163,7 +163,7 @@ export function createPythonRunner(options: PythonRunnerOptions = {}): SpawnPyth
 const hex64 = z.string().regex(HEX64);
 const unit = z.number().min(0).max(1);
 const boxTuple = z.tuple([unit, unit, unit, unit]);
-const fillMode = z.enum(["selective", "background", "inpaint"]);
+const fillMode = z.enum(["selective", "background", "inpaint", "band"]);
 
 /** Page scoping for a region (1-based PDF pages). */
 export const PageSelectorSchema = z.discriminatedUnion("kind", [
@@ -173,26 +173,51 @@ export const PageSelectorSchema = z.discriminatedUnion("kind", [
 ]);
 export type PageSelector = z.infer<typeof PageSelectorSchema>;
 
-export const RectRegionSchema = z.object({
-  kind: z.literal("rect"),
+const regionBase = {
   name: z.string().min(1),
-  box: boxTuple,
   fill_mode: fillMode.nullish(),
   page_selector: PageSelectorSchema.default({ kind: "all" }),
   /** Normalized rect holes never touched by cleanup. */
   exclude: z.array(boxTuple).default([]),
+  /** Inclusive luminance band removed by `band` fill (required for it). */
+  remove_lo_luminance: z.number().int().min(0).max(255).nullish(),
+  remove_hi_luminance: z.number().int().min(0).max(255).nullish(),
+};
+
+const bandIssue = (ctx: { addIssue(message: string): void }) => (value: {
+  fill_mode?: string | null;
+  remove_lo_luminance?: number | null;
+  remove_hi_luminance?: number | null;
+}) => {
+  if (
+    value.fill_mode === "band" &&
+    (value.remove_lo_luminance == null || value.remove_hi_luminance == null)
+  ) {
+    ctx.addIssue("fill_mode 'band' requires remove_lo_luminance and remove_hi_luminance");
+  }
+};
+
+const RectRegionObject = z.object({
+  kind: z.literal("rect"),
+  box: boxTuple,
+  ...regionBase,
 });
-export const PolygonRegionSchema = z.object({
+export const RectRegionSchema = RectRegionObject.superRefine((value, ctx) =>
+  bandIssue(ctx)(value),
+);
+const PolygonRegionObject = z.object({
   kind: z.literal("polygon"),
-  name: z.string().min(1),
   points: z.array(z.tuple([unit, unit])).min(3),
-  fill_mode: fillMode.nullish(),
-  page_selector: PageSelectorSchema.default({ kind: "all" }),
-  exclude: z.array(boxTuple).default([]),
+  ...regionBase,
 });
+export const PolygonRegionSchema = PolygonRegionObject.superRefine((value, ctx) =>
+  bandIssue(ctx)(value),
+);
 export const FillConfigSchema = z.object({
   default_mode: fillMode.default("selective"),
   inpaint_radius: z.number().int().min(1).default(3),
+  chroma_preserve_spread: z.number().int().min(0).max(255).default(25),
+  chroma_preserve_max_luminance: z.number().int().min(0).max(255).default(220),
 });
 export const EvidenceConfigSchema = z.object({
   min_page_fraction: z.number().min(0).max(1).default(0.6),
@@ -202,13 +227,18 @@ export const EvidenceConfigSchema = z.object({
   max_chroma_spread: z.number().int().min(0).max(255).default(32),
   dark_text_max_ratio: z.number().gt(0).max(1).default(0.02),
   min_chromatic_pixels: z.number().int().min(1).default(400),
-  dark_fill_preserve_luminance: z.number().int().min(0).max(255).default(100),
+  dark_fill_preserve_luminance: z.number().int().min(0).max(255).default(180),
 });
 export const WatermarkRuleSchema = z.object({
   rule_version: z.number().int().positive(),
   book_key: z.string().min(1),
   notes: z.string().nullish(),
-  fill: FillConfigSchema.default({ default_mode: "selective", inpaint_radius: 3 }),
+  fill: FillConfigSchema.default({
+    default_mode: "selective",
+    inpaint_radius: 3,
+    chroma_preserve_spread: 25,
+    chroma_preserve_max_luminance: 220,
+  }),
   evidence: EvidenceConfigSchema.default({
     min_page_fraction: 0.6,
     min_ink_ratio: 0.002,

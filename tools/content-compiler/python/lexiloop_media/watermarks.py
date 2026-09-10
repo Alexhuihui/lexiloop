@@ -29,7 +29,7 @@ import numpy as np
 import pydantic
 
 UnitFloat = Annotated[float, pydantic.Field(ge=0.0, le=1.0)]
-FillMode = Literal["selective", "background", "inpaint"]
+FillMode = Literal["selective", "background", "inpaint", "band"]
 
 DEFAULT_RING_RADIUS_PX = 24
 
@@ -72,14 +72,27 @@ class RegionBase(pydantic.BaseModel):
     exclude: list[tuple[UnitFloat, UnitFloat, UnitFloat, UnitFloat]] = pydantic.Field(
         default_factory=list
     )
+    """Inclusive luminance band removed by ``band`` fill (required for it)."""
+    remove_lo_luminance: int | None = pydantic.Field(default=None, ge=0, le=255)
+    remove_hi_luminance: int | None = pydantic.Field(default=None, ge=0, le=255)
 
     @pydantic.model_validator(mode="after")
-    def _holes_ordered(self) -> "RegionBase":
+    def _validate_fill(self) -> "RegionBase":
         for x0, y0, x1, y1 in self.exclude:
             if x1 <= x0 or y1 <= y0:
                 raise ValueError(
                     f"exclusion hole in {self.name!r} must satisfy x0 < x1 and y0 < y1: "
                     f"{(x0, y0, x1, y1)}"
+                )
+        if self.fill_mode == "band":
+            if self.remove_lo_luminance is None or self.remove_hi_luminance is None:
+                raise ValueError(
+                    f"region {self.name!r}: fill_mode 'band' requires remove_lo_luminance "
+                    "and remove_hi_luminance"
+                )
+            if self.remove_hi_luminance <= self.remove_lo_luminance:
+                raise ValueError(
+                    f"region {self.name!r}: remove_hi_luminance must exceed remove_lo_luminance"
                 )
         return self
 
@@ -111,6 +124,12 @@ Region = Annotated[RectRegion | PolygonRegion, pydantic.Field(discriminator="kin
 class FillConfig(pydantic.BaseModel):
     default_mode: FillMode = "selective"
     inpaint_radius: int = pydantic.Field(default=3, ge=1)
+    """``background``/``selective`` chroma preserve (visual QA round 2):
+    pixels with channel spread above ``chroma_preserve_spread`` and luminance
+    below ``chroma_preserve_max_luminance`` are treated as chromatic body
+    print (light-teal sprigs, colored marks) and never flattened."""
+    chroma_preserve_spread: int = pydantic.Field(default=25, ge=0, le=255)
+    chroma_preserve_max_luminance: int = pydantic.Field(default=220, ge=0, le=255)
 
 
 class EvidenceConfig(pydantic.BaseModel):
@@ -332,22 +351,53 @@ def _fill_region(
     region_mask: np.ndarray,
     mode: FillMode,
     rule: WatermarkRule,
+    region: RectRegion | PolygonRegion,
 ) -> None:
     radius = rule.fill.inpaint_radius
     evidence = rule.evidence
+    gray = _gray_of(original)
+    if mode == "band":
+        # Luminance-band fill: replace only pixels inside the configured
+        # [lo, hi] band (watermark ink). The fill color is content-aware
+        # (inpaint from the local neighborhood) so the patch blends into
+        # shaded/gradient backgrounds; darker print below the band (imprint)
+        # and brighter art/background above it survive.
+        lo = region.remove_lo_luminance
+        hi = region.remove_hi_luminance
+        if lo is None or hi is None:
+            raise ValueError(
+                f"band fill on {region.name!r} requires remove_lo_luminance/"
+                "remove_hi_luminance (rule schema should enforce this)"
+            )
+        remove = region_mask & (gray >= lo) & (gray <= hi)
+        if remove.any():
+            result = cv2.inpaint(
+                original,
+                (remove.astype(np.uint8)) * 255,
+                radius,
+                cv2.INPAINT_TELEA,
+            )
+            cleaned[remove] = result[remove]
+        return
+
     if mode == "background":
-        # Flat paper fill: every pixel becomes the ring-estimated background
-        # except near-black print (genuine body text is preserved even when
-        # the band is declared background-fill; only light/mid remnants and
-        # paper noise are flattened).
+        # Flat fill of the region with the ring-estimated background, except
+        # pixels that look like genuine print: darker than the preserve
+        # threshold (near-black text) OR chromatic body print such as
+        # light-teal sprigs (channel spread above the chroma threshold while
+        # still not paper-bright).
         background = _background_color(original, region_mask)
-        gray_region = _gray_of(original)
-        preserve = region_mask & (gray_region < evidence.dark_fill_preserve_luminance)
-        fill_mask = region_mask & ~preserve
+        preserve_dark = region_mask & (gray < evidence.dark_fill_preserve_luminance)
+        spread = _channel_spread(original)
+        preserve_chroma = (
+            region_mask
+            & (spread > rule.fill.chroma_preserve_spread)
+            & (gray < rule.fill.chroma_preserve_max_luminance)
+        )
+        fill_mask = region_mask & ~preserve_dark & ~preserve_chroma
         cleaned[fill_mask] = background
         return
 
-    gray = _gray_of(original)
     if mode == "inpaint":
         fill_mask = region_mask
     else:  # selective: only watermark-colored ink; body text pixels survive
@@ -407,7 +457,7 @@ def clean_watermarks(
     for region in active_regions:
         region_mask = build_mask(image.shape[:2], [region], page_number)
         mode = region.fill_mode or rule.fill.default_mode
-        _fill_region(cleaned, image, region_mask, mode, rule)
+        _fill_region(cleaned, image, region_mask, mode, rule, region)
     return cleaned, mask
 
 

@@ -1,10 +1,12 @@
 {
-  "rule_version": 2,
+  "rule_version": 3,
   "book_key": "llcy-2024",
-  "notes": "Candidate watermark regions for the 2024 LLRC 6500 vocabulary scan (single-page portrait rasters, origin top-left, normalized to [0,1], y from top). v2 applies visual-QA round-1 repairs: (1) top banner band tightened to y<=0.072 (measured watermark bottom <=0.069 on body pages; first body line starts y=0.0736) and x<=0.725 (measured banner right edge 0.7172-0.7178 on body pages), with a cover-only x<=0.72 override to protect the leaf-badge arc art; (2) cover-only exclusion hole over the pale tree-trunk art in the bottom-promo band (trunk bbox x 0.439-0.559, y 0.75-0.854); (3) bottom footer switched to flat background fill that preserves print darker than luminance 180 (measured: genuine footer quote cores 72-170, watermark 190-240; measured on page 32), with a cover-only x-split [0.15-0.365]+[0.62-0.88] sparing the publisher imprint (dark bbox x 0.3765-0.6013, y 0.9036-0.9436). No source/book text is stored in this file.",
+  "notes": "Candidate watermark regions for the 2024 LLRC 6500 vocabulary scan (single-page portrait rasters, origin top-left, normalized to [0,1], y from top). v3 applies visual-QA round-2 repairs on top of v2: (1) background fill is chroma-preserving (fill.chroma_preserve_spread=25 / chroma_preserve_max_luminance=220) so light-teal body print such as the page-32 footer sprig (measured lum 188-212, spread 51-82) survives while neutral watermark gray (spread 0-12) is still flattened; (2) the three cover footer bands switch to luminance band fill - the x-split bands [0.15-0.365]+[0.62-0.88] remove lum 140-182 (measured watermark ink 19.6K/12.9K px, zero genuine dark print there) and the previously unprocessed gap [0.365-0.62] removes lum 150-182, preserving the near-black publisher imprint (lum~69, 7.3K dark px); (3) the cover exclusion hole is enlarged to the measured pale trunk/branch silhouette x 0.4197-0.5991, y 0.7498-0.8531 (v2 had already flattened 14,686 of 14,769 exposed pale px), and the leftover glyph-fragment zone inside the protected silhouette is cleaned by a declared band-fill overlay [0.435-0.585]x[0.775-0.86] removing lum 140-182 (measured fragment strokes span 140-182) while the bright trunk (>190) survives; holes keep their strict guarantee against their own region's fill, and the band overlay is a separate declared region. No source/book text is stored in this file.",
   "fill": {
     "default_mode": "selective",
-    "inpaint_radius": 3
+    "inpaint_radius": 3,
+    "chroma_preserve_spread": 25,
+    "chroma_preserve_max_luminance": 220
   },
   "evidence": {
     "min_page_fraction": 0.6,
@@ -40,7 +42,16 @@
       "name": "bottom-promo-cover",
       "box": [0.46, 0.76, 0.94, 0.875],
       "page_selector": { "kind": "pages", "pages": [1] },
-      "exclude": [[0.435, 0.75, 0.545, 0.885]]
+      "exclude": [[0.415, 0.745, 0.605, 0.86]]
+    },
+    {
+      "kind": "rect",
+      "name": "bottom-promo-cover-trunk-band",
+      "box": [0.415, 0.745, 0.605, 0.86],
+      "fill_mode": "band",
+      "remove_lo_luminance": 140,
+      "remove_hi_luminance": 182,
+      "page_selector": { "kind": "pages", "pages": [1] }
     },
     {
       "kind": "rect",
@@ -53,14 +64,27 @@
       "kind": "rect",
       "name": "bottom-footer-cover-left",
       "box": [0.15, 0.915, 0.365, 0.965],
-      "fill_mode": "background",
+      "fill_mode": "band",
+      "remove_lo_luminance": 140,
+      "remove_hi_luminance": 182,
       "page_selector": { "kind": "pages", "pages": [1] }
     },
     {
       "kind": "rect",
       "name": "bottom-footer-cover-right",
       "box": [0.62, 0.915, 0.88, 0.965],
-      "fill_mode": "background",
+      "fill_mode": "band",
+      "remove_lo_luminance": 140,
+      "remove_hi_luminance": 182,
+      "page_selector": { "kind": "pages", "pages": [1] }
+    },
+    {
+      "kind": "rect",
+      "name": "bottom-footer-cover-gap",
+      "box": [0.365, 0.915, 0.62, 0.965],
+      "fill_mode": "band",
+      "remove_lo_luminance": 150,
+      "remove_hi_luminance": 182,
       "page_selector": { "kind": "pages", "pages": [1] }
     }
   ]
