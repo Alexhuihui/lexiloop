@@ -135,6 +135,9 @@ importers:
       drizzle-orm:
         specifier: 0.45.2
         version: 0.45.2(@cloudflare/workers-types@5.20260908.1)(@types/better-sqlite3@9.6.0)(better-sqlite3@13.0.3)
+      zod:
+        specifier: 4.5.4
+        version: 4.5.4
 
   packages/domain:
     dependencies:
