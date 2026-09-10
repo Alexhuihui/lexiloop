@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import type { LexiloopDatabase } from "../schema";
 import {
   audioAsset,
@@ -31,113 +31,111 @@ export type AudioEntityType = "word" | "example";
  * Release-scoped content reads (spec 6.2/6.4). Every method takes the
  * release id explicitly: browsing reads pass the active release, in-session
  * reads pass the session's pinned release. No list-everything escape hatches.
+ * All statements are awaited so the repositories run unchanged on the sync
+ * better-sqlite3 driver and the async D1 driver.
  */
 export class ContentRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
-  getBook(releaseId: string, bookKey: string): BookRow | undefined {
-    return this.db
+  async getBook(releaseId: string, bookKey: string): Promise<BookRow | undefined> {
+    return await this.db
       .select()
       .from(book)
       .where(and(eq(book.releaseId, releaseId), eq(book.bookKey, bookKey)))
       .get();
   }
 
-  getUnit(releaseId: string, unitKey: string): UnitRow | undefined {
-    return this.db
+  async getUnit(releaseId: string, unitKey: string): Promise<UnitRow | undefined> {
+    return await this.db
       .select()
       .from(unit)
       .where(and(eq(unit.releaseId, releaseId), eq(unit.unitKey, unitKey)))
       .get();
   }
 
-  getWord(releaseId: string, wordKey: string): WordRow | undefined {
-    return this.db
+  async getWord(releaseId: string, wordKey: string): Promise<WordRow | undefined> {
+    return await this.db
       .select()
       .from(word)
       .where(and(eq(word.releaseId, releaseId), eq(word.wordKey, wordKey)))
       .get();
   }
 
-  listSenses(releaseId: string, wordKey: string): SenseRow[] {
-    return this.db
+  async listSenses(releaseId: string, wordKey: string): Promise<SenseRow[]> {
+    return await this.db
       .select()
       .from(sense)
       .where(and(eq(sense.releaseId, releaseId), eq(sense.wordKey, wordKey)))
-      .orderBy(asc(sense.senseOrder))
-      .all();
+      .orderBy(asc(sense.senseOrder));
   }
 
-  listPhrases(releaseId: string, wordKey: string): PhraseRow[] {
-    return this.db
+  async listPhrases(releaseId: string, wordKey: string): Promise<PhraseRow[]> {
+    return await this.db
       .select()
       .from(phrase)
       .where(and(eq(phrase.releaseId, releaseId), eq(phrase.wordKey, wordKey)))
-      .orderBy(asc(phrase.sourceOrder))
-      .all();
+      .orderBy(asc(phrase.sourceOrder));
   }
 
-  listExamples(releaseId: string, wordKey: string): ExampleRow[] {
-    return this.db
+  async listExamples(releaseId: string, wordKey: string): Promise<ExampleRow[]> {
+    return await this.db
       .select()
       .from(example)
       .where(and(eq(example.releaseId, releaseId), eq(example.wordKey, wordKey)))
-      .orderBy(asc(example.sourceOrder))
-      .all();
+      .orderBy(asc(example.sourceOrder));
   }
 
-  listExplanations(releaseId: string, wordKey: string): ExplanationRow[] {
-    return this.db
+  async listExplanations(releaseId: string, wordKey: string): Promise<ExplanationRow[]> {
+    return await this.db
       .select()
       .from(explanation)
-      .where(and(eq(explanation.releaseId, releaseId), eq(explanation.wordKey, wordKey)))
-      .all();
+      .where(and(eq(explanation.releaseId, releaseId), eq(explanation.wordKey, wordKey)));
   }
 
-  listRelationsFrom(releaseId: string, fromWordKey: string): LexicalRelationRow[] {
-    return this.db
+  async listRelationsFrom(releaseId: string, fromWordKey: string): Promise<LexicalRelationRow[]> {
+    return await this.db
       .select()
       .from(lexicalRelation)
-      .where(and(eq(lexicalRelation.releaseId, releaseId), eq(lexicalRelation.fromWordKey, fromWordKey)))
-      .all();
+      .where(and(eq(lexicalRelation.releaseId, releaseId), eq(lexicalRelation.fromWordKey, fromWordKey)));
   }
 
-  getCard(releaseId: string, contentCardKey: string): CardDefinitionRow | undefined {
-    return this.db
+  async getCard(releaseId: string, contentCardKey: string): Promise<CardDefinitionRow | undefined> {
+    return await this.db
       .select()
       .from(cardDefinition)
       .where(and(eq(cardDefinition.releaseId, releaseId), eq(cardDefinition.contentCardKey, contentCardKey)))
       .get();
   }
 
-  listCards(releaseId: string, wordKey: string): CardDefinitionRow[] {
-    return this.db
+  async listCards(releaseId: string, wordKey: string): Promise<CardDefinitionRow[]> {
+    return await this.db
       .select()
       .from(cardDefinition)
-      .where(and(eq(cardDefinition.releaseId, releaseId), eq(cardDefinition.wordKey, wordKey)))
-      .all();
+      .where(and(eq(cardDefinition.releaseId, releaseId), eq(cardDefinition.wordKey, wordKey)));
   }
 
-  /** Audio assets linked to one content entity (spec 5.8/6.2). */
-  listAudio(releaseId: string, entityType: AudioEntityType, entityKey: string): AudioAssetRow[] {
-    return this.db
-      .select({ asset: audioAsset })
+  /**
+   * Audio assets linked to one content entity (spec 5.8/6.2). Implemented as
+   * two plain selects: the union handle type does not preserve aliased
+   * join-select result shapes, and a link-first lookup avoids the join.
+   */
+  async listAudio(releaseId: string, entityType: AudioEntityType, entityKey: string): Promise<AudioAssetRow[]> {
+    const links = await this.db
+      .select()
       .from(contentAudioLink)
-      .innerJoin(
-        audioAsset,
-        and(
-          eq(contentAudioLink.releaseId, audioAsset.releaseId),
-          eq(contentAudioLink.assetKey, audioAsset.assetKey),
-        ),
-      )
       .where(
         and(
           eq(contentAudioLink.releaseId, releaseId),
           eq(contentAudioLink.entityType, entityType),
           eq(contentAudioLink.entityKey, entityKey),
         ),
-      )
-      .all()
-      .map((row) => row.asset);
+      );
+    if (links.length === 0) {
+      return [];
+    }
+    return await this.db
+      .select()
+      .from(audioAsset)
+      .where(and(eq(audioAsset.releaseId, releaseId), inArray(audioAsset.assetKey, links.map((link) => link.assetKey))));
   }
 }

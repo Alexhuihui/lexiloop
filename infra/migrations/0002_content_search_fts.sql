@@ -3,8 +3,28 @@
 --
 -- Sync strategy: a standalone FTS5 table kept in sync by triggers on the four
 -- searchable content tables, so ordinary inserts/deletes always leave the
--- index queryable. FTS5 is not a backup source (spec 6.3); after a restore,
--- repopulate via the 'rebuild' command:
+-- index queryable.
+--
+-- CJK tokenizer decision (Task 3 review): unicode61 treats a run of Han
+-- characters as ONE token, so substring matching inside Chinese glosses is
+-- impossible by design. Kept unicode61 anyway; Chinese-sense search
+-- (Task 12, spec 9.5) uses token-prefix queries, e.g.
+--   SELECT ... FROM content_search_fts WHERE content_search_fts MATCH '放弃*'
+-- which matches glosses like 放弃计划 but not 计划 (no substring matches).
+-- Alternative considered and rejected: the trigram tokenizer would enable
+-- substring search, but its D1 support is unverified and its index size for
+-- the English headword corpus that dominates V1 is disproportionate.
+--
+-- Retention/rollback delete ordering (review finding): the per-row delete
+-- triggers below scan this table for (release_id, entity_type, entity_key).
+-- Any bulk delete of a release (retention cleanup or rollback, spec 6.4)
+-- MUST therefore first bulk-clear the index, then delete the content rows:
+--   DELETE FROM content_search_fts WHERE release_id = ?;   -- 1st
+--   DELETE FROM word ...  -- then cascading content deletes -- 2nd
+-- so every trigger scans a near-empty index instead of the whole table.
+--
+-- FTS is not a backup source (spec 6.3); after a restore, repopulate via the
+-- 'rebuild' command:
 --   INSERT INTO content_search_fts(content_search_fts) VALUES('rebuild');
 
 CREATE VIRTUAL TABLE content_search_fts USING fts5 (

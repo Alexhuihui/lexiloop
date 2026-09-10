@@ -1,4 +1,5 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import type { DrizzleD1Database } from "drizzle-orm/d1";
 import {
   audioAsset,
   book,
@@ -48,8 +49,16 @@ export const schema = {
 };
 
 /**
- * Drizzle database handle type. The sync better-sqlite3 driver is used by
- * local tests and tools; the D1 worker binds the same table definitions and
- * composes critical write paths with D1 `batch()` (spec 6.1).
+ * Drizzle database handle accepted by every repository in this package.
+ *
+ * Driver-agnostic by construction: both the sync better-sqlite3 driver
+ * (compiler, scripts, tests) and the async D1 driver (worker) satisfy the
+ * union. All repository statements are executed with `await`, which both
+ * drivers support; the single exception is ReleaseRepository.setActive's
+ * interactive transaction, isolated there with a documented cast (drizzle's
+ * per-driver transaction callbacks cannot be inferred through the union).
+ * A tsc-level probe lives in test/driver.test.ts.
  */
-export type LexiloopDatabase = BetterSQLite3Database<typeof schema>;
+export type LexiloopDatabase =
+  | BetterSQLite3Database<typeof schema>
+  | DrizzleD1Database<typeof schema>;

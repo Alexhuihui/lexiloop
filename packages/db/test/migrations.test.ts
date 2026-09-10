@@ -173,7 +173,7 @@ describe("D1 migrations", () => {
     try {
       seedWord(env.sqlite, "r1", "w1", "abandon");
       env.sqlite
-        .prepare("INSERT INTO sense (release_id, sense_key, word_key, pos, gloss, sense_order, provenance_json) VALUES ('r1', 's1', 'w1', 'v', '放弃', 1, '{}')")
+        .prepare("INSERT INTO sense (release_id, sense_key, word_key, pos, gloss, sense_order, provenance_json) VALUES ('r1', 's1', 'w1', 'v', '放弃计划', 1, '{}')")
         .run();
       env.sqlite
         .prepare("INSERT INTO phrase (release_id, phrase_key, word_key, sense_key, text, gloss, source_order, provenance_json) VALUES ('r1', 'p1', 'w1', 's1', 'abandon ship', '弃船', 1, '{}')")
@@ -188,7 +188,13 @@ describe("D1 migrations", () => {
           .all(term) as Array<{ entity_type: string }>).map((row) => row.entity_type).sort();
 
       expect(match("abandon")).toEqual(["example", "phrase", "word"]);
-      expect(match("放弃")).toEqual(["sense"]);
+      // unicode61 pins each Han-character run as ONE token: no substring
+      // matches. Chinese-sense search (Task 12) must use prefix queries
+      // (decision recorded in 0002_content_search_fts.sql).
+      expect(match("放弃")).toEqual([]);
+      expect(match("放弃*")).toEqual(["sense"]);
+      expect(match("计划")).toEqual([]);
+      expect(match("放弃计划")).toEqual(["sense"]);
       // V1 indexes phrase text, not phrase glosses (spec 9.5 search fields).
       expect(match("弃船")).toEqual([]);
 

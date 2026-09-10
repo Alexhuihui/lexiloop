@@ -1,4 +1,4 @@
-import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { foreignKey, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 /**
  * Release and metadata tables (spec 6.2 "发布与元数据").
@@ -37,6 +37,7 @@ export const releaseUnit = sqliteTable(
   },
   (t) => [
     primaryKey({ columns: [t.releaseId, t.unitKey] }),
+    foreignKey({ name: "release_unit_release_fk", columns: [t.releaseId], foreignColumns: [contentRelease.releaseId] }).onDelete("cascade"),
     index("release_unit_release_idx").on(t.releaseId),
   ],
 );
@@ -46,7 +47,7 @@ export type ReleaseUnitRow = typeof releaseUnit.$inferSelect;
 /** Singleton row (id = 1): the unique active release pointer (spec 11.3). */
 export const appMeta = sqliteTable("app_meta", {
   id: integer("id").primaryKey(),
-  activeReleaseId: text("active_release_id"),
+  activeReleaseId: text("active_release_id").references(() => contentRelease.releaseId, { onDelete: "restrict" }),
   configVersion: integer("config_version").notNull().default(1),
 });
 
@@ -69,6 +70,7 @@ export const contentKeyAlias = sqliteTable(
   },
   (t) => [
     primaryKey({ columns: [t.releaseId, t.fromKey, t.toKey] }),
+    foreignKey({ name: "content_key_alias_release_fk", columns: [t.releaseId], foreignColumns: [contentRelease.releaseId] }).onDelete("cascade"),
     uniqueIndex("content_key_alias_from_uq").on(t.releaseId, t.fromKey),
     uniqueIndex("content_key_alias_to_uq").on(t.releaseId, t.toKey),
   ],

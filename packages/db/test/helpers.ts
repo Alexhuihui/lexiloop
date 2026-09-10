@@ -1,12 +1,14 @@
 import { mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
 /** Absolute path of the D1 SQL migrations (repo-root relative). */
 export const migrationsDir = resolve(
-  fileURLToPath(new URL(".", import.meta.url)),
+  // String overload: workers-types (referenced by driver.test.ts) replaces the
+  // global URL type, so only the string overload is compatible with both.
+  dirname(fileURLToPath(import.meta.url)),
   "../../../infra/migrations",
 );
 
@@ -34,8 +36,15 @@ export function createMigratedTestDb(): TestDatabase {
     rmSync(dir, { recursive: true, force: true });
     throw new Error(`no SQL migrations found in ${migrationsDir}`);
   }
-  for (const file of files) {
-    sqlite.exec(readFileSync(join(migrationsDir, file), "utf8"));
+  try {
+    for (const file of files) {
+      sqlite.exec(readFileSync(join(migrationsDir, file), "utf8"));
+    }
+  } catch (cause) {
+    // Never leak a half-migrated temp database when a migration fails.
+    sqlite.close();
+    rmSync(dir, { recursive: true, force: true });
+    throw cause;
   }
   return {
     sqlite,

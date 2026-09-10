@@ -9,10 +9,10 @@ import { LogicalKey } from "@lexiloop/content-schema";
  */
 
 /**
- * FSRS card state envelope (v1), mirroring the ts-fsrs card fields we persist.
- * `due_at` / `last_review_at` are UTC epoch ms; `due`, `reps`, `lapses` and
- * `last_review_at` are additionally mirrored into card_state columns for the
- * due-queue index (spec 6.3).
+ * FSRS card state envelope (v1), mirroring the ts-fsrs v5 card fields we
+ * persist. `due_at` / `last_review_at` are UTC epoch ms; `due`, `reps`,
+ * `lapses` and `last_review_at` are additionally mirrored into card_state
+ * columns for the due-queue index (spec 6.3).
  */
 export const FsrsStateEnvelope = z.strictObject({
   version: z.literal(1),
@@ -24,6 +24,12 @@ export const FsrsStateEnvelope = z.strictObject({
   last_review_at: z.number().int().nonnegative().nullable(),
   reps: z.number().int().nonnegative(),
   lapses: z.number().int().nonnegative(),
+  /** Days between the last review and this due date (ts-fsrs scheduled_days). */
+  scheduled_days: z.number().int().nonnegative(),
+  /** Learning-step index (ts-fsrs learning_steps); -1 outside learning states. */
+  learning_steps: z.number().int().min(-1),
+  // elapsed_days is intentionally omitted: deprecated upstream in ts-fsrs v5
+  // and derivable from due_at/last_review_at.
 });
 
 export type FsrsState = z.infer<typeof FsrsStateEnvelope>;
@@ -42,6 +48,11 @@ export const QueueSnapshotEnvelope = z.strictObject({
       presented_card_key: LogicalKey,
     }),
   ),
+  /**
+   * Review event ids already answered inside this session. Reserved for the
+   * Task 13 grading idempotency/replay bookkeeping; writers may omit it.
+   */
+  patch_event_ids: z.array(z.string().min(1)).optional(),
 });
 
 export type QueueSnapshot = z.infer<typeof QueueSnapshotEnvelope>;

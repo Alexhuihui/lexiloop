@@ -9,8 +9,9 @@ import {
   UserSettingsRepository,
   UserRepository,
   WordProgressRepository,
+  type FsrsState,
+  type QueueSnapshot,
 } from "../src";
-import type { FsrsState } from "../src";
 import * as schema from "../src/schema";
 import { createMigratedTestDb, T0, type TestDatabase } from "./helpers";
 
@@ -51,20 +52,15 @@ const INSERT_RELEASE = `INSERT INTO content_release
   (release_id, source_pdf_sha256, schema_version, prompt_version, model_config_json, status, created_at, manifest_sha256)
   VALUES (?, ?, 'schema-v1', 'prompt-v1', '{}', 'READY', ?, 'manifest-sha')`;
 
-function seedReleaseWithWord(
-  env: TestDatabase,
-  releaseId: string,
-  wordKey: string,
-  headword: string,
-): void {
-  env.sqlite.prepare(INSERT_RELEASE).run(releaseId, "a".repeat(64), T0);
-  env.sqlite
+function seedReleaseWithWord(fx: Fixture, releaseId: string, wordKey: string, headword: string): void {
+  fx.env.sqlite.prepare(INSERT_RELEASE).run(releaseId, "a".repeat(64), T0);
+  fx.env.sqlite
     .prepare("INSERT INTO book (release_id, book_key, title, edition, provenance_json) VALUES (?, 'bk-1', 't', 'e', '{}')")
     .run(releaseId);
-  env.sqlite
+  fx.env.sqlite
     .prepare("INSERT INTO unit (release_id, unit_key, book_key, level, unit_order, title, provenance_json) VALUES (?, 'u1', 'bk-1', 1, 1, 'Unit 1', '{}')")
     .run(releaseId);
-  env.sqlite
+  fx.env.sqlite
     .prepare("INSERT INTO word (release_id, word_key, unit_key, headword, phonetic, tier, source_order, provenance_json) VALUES (?, ?, 'u1', ?, NULL, 'core', 1, '{}')")
     .run(releaseId, wordKey, headword);
 }
@@ -79,19 +75,23 @@ function fsrsState(dueAt: number): FsrsState {
     last_review_at: T0,
     reps: 2,
     lapses: 0,
+    scheduled_days: 3,
+    learning_steps: -1,
   };
+}
+
+function queueFor(releaseId: string, cardKey: string): QueueSnapshot {
+  return { version: 1, release_id: releaseId, cards: [{ canonical_card_key: cardKey, presented_card_key: cardKey }] };
 }
 
 let fx: Fixture;
 
-beforeEach(() => {
+beforeEach(async () => {
   const env = createMigratedTestDb();
   const db = drizzle(env.sqlite, { schema });
-
-  seedReleaseWithWord(env, "r1", "w-alice", "abandon");
-  seedReleaseWithWord(env, "r2", "w-bob", "zeal");
-
-  const fixture: Fixture = {
+  // fx is assigned before any seeding so afterEach cleans up even if a seed
+  // statement or repository call throws midway.
+  fx = {
     env,
     users: new UserRepository(db),
     settings: new UserSettingsRepository(db),
@@ -114,24 +114,26 @@ beforeEach(() => {
     aliceWordKey: "w-alice",
     bobWordKey: "w-bob",
   };
-  fx = fixture;
 
-  const { alice, bob } = fixture;
-  fixture.users.create({ userId: alice.userId, normalizedUsername: "alice", passwordSalt: "s", passwordVerifier: "v", createdAt: T0 });
-  fixture.users.create({ userId: bob.userId, normalizedUsername: "bob", passwordSalt: "s", passwordVerifier: "v", createdAt: T0 });
+  seedReleaseWithWord(fx, "r1", fx.aliceWordKey, "abandon");
+  seedReleaseWithWord(fx, "r2", fx.bobWordKey, "zeal");
+
+  const { alice, bob } = fx;
+  await fx.users.create({ userId: alice.userId, normalizedUsername: "alice", passwordSalt: "s", passwordVerifier: "v", createdAt: T0 });
+  await fx.users.create({ userId: bob.userId, normalizedUsername: "bob", passwordSalt: "s", passwordVerifier: "v", createdAt: T0 });
 
   // Auth sessions (cookie token stays client-side; only the hash is stored).
-  fixture.authSessions.create(alice, { sessionId: fixture.aliceAuthSessionId, tokenHash: "hash-alice", issuedAt: T0, expiresAt: T0 + 12 * HOUR, sessionVersion: 1 });
-  fixture.authSessions.create(bob, { sessionId: fixture.bobAuthSessionId, tokenHash: "hash-bob", issuedAt: T0, expiresAt: T0 + 12 * HOUR, sessionVersion: 1 });
+  await fx.authSessions.create(alice, { sessionId: fx.aliceAuthSessionId, tokenHash: "hash-alice", issuedAt: T0, expiresAt: T0 + 12 * HOUR, sessionVersion: 1 });
+  await fx.authSessions.create(bob, { sessionId: fx.bobAuthSessionId, tokenHash: "hash-bob", issuedAt: T0, expiresAt: T0 + 12 * HOUR, sessionVersion: 1 });
 
   // Card states: Bob's card is due EARLIER, so an unscoped due queue would leak it.
-  fixture.cardStates.upsert(alice, { contentCardKey: fixture.aliceCardKey, state: fsrsState(T0 + 2 * HOUR), updatedAt: T0 });
-  fixture.cardStates.upsert(bob, { contentCardKey: fixture.bobCardKey, state: fsrsState(T0 + 1 * HOUR), updatedAt: T0 });
+  await fx.cardStates.upsert(alice, { contentCardKey: fx.aliceCardKey, state: fsrsState(T0 + 2 * HOUR), updatedAt: T0 });
+  await fx.cardStates.upsert(bob, { contentCardKey: fx.bobCardKey, state: fsrsState(T0 + 1 * HOUR), updatedAt: T0 });
 
-  fixture.reviewLogs.append(alice, {
-    eventId: fixture.aliceEventId,
-    contentCardKey: fixture.aliceCardKey,
-    presentedCardKey: fixture.aliceCardKey,
+  await fx.reviewLogs.append(alice, {
+    eventId: fx.aliceEventId,
+    contentCardKey: fx.aliceCardKey,
+    presentedCardKey: fx.aliceCardKey,
     presentedReleaseId: "r1",
     rating: 3,
     beforeState: null,
@@ -139,10 +141,10 @@ beforeEach(() => {
     reviewedAt: T0 + 1000,
     durationMs: 4200,
   });
-  fixture.reviewLogs.append(bob, {
-    eventId: fixture.bobEventId,
-    contentCardKey: fixture.bobCardKey,
-    presentedCardKey: fixture.bobCardKey,
+  await fx.reviewLogs.append(bob, {
+    eventId: fx.bobEventId,
+    contentCardKey: fx.bobCardKey,
+    presentedCardKey: fx.bobCardKey,
     presentedReleaseId: "r2",
     rating: 4,
     beforeState: null,
@@ -151,29 +153,29 @@ beforeEach(() => {
     durationMs: 3100,
   });
 
-  fixture.studySessions.create(alice, {
-    sessionId: fixture.aliceSessionId,
+  await fx.studySessions.create(alice, {
+    sessionId: fx.aliceSessionId,
     mode: "NEW_WORDS",
     releaseId: "r1",
-    queueSnapshot: { version: 1, release_id: "r1", cards: [{ canonical_card_key: fixture.aliceCardKey, presented_card_key: fixture.aliceCardKey }] },
+    queueSnapshot: queueFor("r1", fx.aliceCardKey),
     position: 0,
     createdAt: T0,
     expiresAt: T0 + 4 * HOUR,
   });
-  fixture.studySessions.create(bob, {
-    sessionId: fixture.bobSessionId,
+  await fx.studySessions.create(bob, {
+    sessionId: fx.bobSessionId,
     mode: "REVIEW",
     releaseId: "r2",
-    queueSnapshot: { version: 1, release_id: "r2", cards: [{ canonical_card_key: fixture.bobCardKey, presented_card_key: fixture.bobCardKey }] },
+    queueSnapshot: queueFor("r2", fx.bobCardKey),
     position: 0,
     createdAt: T0,
     expiresAt: T0 + 4 * HOUR,
   });
 
-  fixture.wordProgress.upsert(alice, { wordKey: fixture.aliceWordKey, stage: "IN_PROGRESS", initialFamiliarity: "UNKNOWN", firstSeenAt: T0, lastSeenAt: T0 });
-  fixture.wordProgress.upsert(bob, { wordKey: fixture.bobWordKey, stage: "IN_PROGRESS", initialFamiliarity: "RECOGNIZABLE", firstSeenAt: T0, lastSeenAt: T0 });
+  await fx.wordProgress.upsert(alice, { wordKey: fx.aliceWordKey, stage: "IN_PROGRESS", initialFamiliarity: "UNKNOWN", firstSeenAt: T0, lastSeenAt: T0 });
+  await fx.wordProgress.upsert(bob, { wordKey: fx.bobWordKey, stage: "IN_PROGRESS", initialFamiliarity: "RECOGNIZABLE", firstSeenAt: T0, lastSeenAt: T0 });
 
-  fixture.settings.upsert(alice, { startUnitKey: "u1", newWordsPerGroup: 8, dailyGoal: 25, timezone: "Asia/Shanghai" });
+  await fx.settings.upsert(alice, { startUnitKey: "u1", newWordsPerGroup: 8, dailyGoal: 25, timezone: "Asia/Shanghai" });
 });
 
 afterEach(() => {
@@ -181,55 +183,131 @@ afterEach(() => {
 });
 
 describe("cross-user isolation", () => {
-  it("never returns another user's card state", () => {
+  it("never returns another user's card state", async () => {
     const { alice, cardStates } = fx;
-    expect(cardStates.get(alice, fx.bobCardKey)).toBeUndefined();
-    const due = cardStates.getDue(alice, T0 + 4 * HOUR, 50);
+    await expect(cardStates.get(alice, fx.bobCardKey)).resolves.toBeUndefined();
+    const due = await cardStates.getDue(alice, T0 + 4 * HOUR, 50);
     expect(due.map((row) => row.contentCardKey)).toEqual([fx.aliceCardKey]);
   });
 
-  it("never returns another user's review log", () => {
+  it("never returns another user's review log", async () => {
     const { alice, reviewLogs } = fx;
-    expect(reviewLogs.get(alice, fx.bobEventId)).toBeUndefined();
-    const recent = reviewLogs.listRecent(alice, 50);
+    await expect(reviewLogs.get(alice, fx.bobEventId)).resolves.toBeUndefined();
+    const recent = await reviewLogs.listRecent(alice, 50);
     expect(recent.map((row) => row.eventId)).toEqual([fx.aliceEventId]);
     // Bob's context cannot read Alice's event either.
-    expect(reviewLogs.get(fx.bob, fx.aliceEventId)).toBeUndefined();
+    await expect(reviewLogs.get(fx.bob, fx.aliceEventId)).resolves.toBeUndefined();
   });
 
-  it("never returns another user's study session", () => {
+  it("never returns another user's study session", async () => {
     const { alice, studySessions } = fx;
-    expect(studySessions.get(alice, fx.bobSessionId)).toBeUndefined();
-    const active = studySessions.listActive(alice, T0 + HOUR);
+    await expect(studySessions.get(alice, fx.bobSessionId)).resolves.toBeUndefined();
+    const active = await studySessions.listActive(alice, T0 + HOUR);
     expect(active.map((row) => row.sessionId)).toEqual([fx.aliceSessionId]);
     // Patching by id under the wrong user context is a no-op.
-    expect(studySessions.patch(alice, fx.bobSessionId, { position: 1 })).toBeUndefined();
-    const bobSession = studySessions.get(fx.bob, fx.bobSessionId);
+    await expect(studySessions.patch(alice, fx.bobSessionId, { position: 1 })).resolves.toBeUndefined();
+    const bobSession = await studySessions.get(fx.bob, fx.bobSessionId);
     expect(bobSession?.position).toBe(0);
   });
 
-  it("never returns another user's auth session", () => {
+  it("never returns another user's auth session", async () => {
     const { alice, authSessions } = fx;
-    expect(authSessions.get(alice, fx.bobAuthSessionId)).toBeUndefined();
-    expect(authSessions.touch(alice, fx.bobAuthSessionId, T0 + 1)).toBe(false);
+    await expect(authSessions.get(alice, fx.bobAuthSessionId)).resolves.toBeUndefined();
+    await expect(authSessions.touch(alice, fx.bobAuthSessionId, T0 + 1)).resolves.toBe(false);
     // Token lookup is the one global auth path; revocation stays user-scoped.
-    expect(authSessions.revoke(alice, fx.bobAuthSessionId, T0 + 1)).toBe(false);
-    const bobSession = authSessions.get(fx.bob, fx.bobAuthSessionId);
+    await expect(authSessions.revoke(alice, fx.bobAuthSessionId, T0 + 1)).resolves.toBe(false);
+    const bobSession = await authSessions.get(fx.bob, fx.bobAuthSessionId);
     expect(bobSession?.revokedAt).toBeNull();
   });
 
-  it("never returns another user's word progress or settings", () => {
+  it("never returns another user's word progress or settings", async () => {
     const { alice, wordProgress, settings } = fx;
-    expect(wordProgress.get(alice, fx.bobWordKey)).toBeUndefined();
-    expect(settings.get(fx.bob)).toBeUndefined();
-    const aliceSettings = settings.get(alice);
+    await expect(wordProgress.get(alice, fx.bobWordKey)).resolves.toBeUndefined();
+    await expect(settings.get(fx.bob)).resolves.toBeUndefined();
+    const aliceSettings = await settings.get(alice);
     expect(aliceSettings?.newWordsPerGroup).toBe(8);
   });
 
-  it("scopes content reads to a release", () => {
+  it("scopes content reads to a release", async () => {
     const { content } = fx;
-    expect(content.getWord("r1", fx.aliceWordKey)?.headword).toBe("abandon");
-    expect(content.getWord("r1", fx.bobWordKey)).toBeUndefined();
-    expect(content.getWord("r2", fx.aliceWordKey)).toBeUndefined();
+    const aliceWord = await content.getWord("r1", fx.aliceWordKey);
+    expect(aliceWord?.headword).toBe("abandon");
+    await expect(content.getWord("r1", fx.bobWordKey)).resolves.toBeUndefined();
+    await expect(content.getWord("r2", fx.aliceWordKey)).resolves.toBeUndefined();
+  });
+});
+
+describe("word_progress introduction lifecycle", () => {
+  it("clears introduced fields when rolling INTRODUCED back to IN_PROGRESS", async () => {
+    const { alice, wordProgress } = fx;
+    const introduced = await wordProgress.markIntroduced(alice, {
+      wordKey: fx.aliceWordKey,
+      introducedReleaseId: "r1",
+      introducedAt: T0 + HOUR,
+    });
+    expect(introduced?.stage).toBe("INTRODUCED");
+    expect(introduced?.introducedReleaseId).toBe("r1");
+
+    // Undo path (spec 8.3): the row must keep satisfying its own CHECK.
+    const rolledBack = await wordProgress.upsert(alice, {
+      wordKey: fx.aliceWordKey,
+      stage: "IN_PROGRESS",
+      initialFamiliarity: "UNKNOWN",
+      firstSeenAt: T0,
+      lastSeenAt: T0 + 2 * HOUR,
+    });
+    expect(rolledBack.stage).toBe("IN_PROGRESS");
+    expect(rolledBack.introducedReleaseId).toBeNull();
+    expect(rolledBack.introducedAt).toBeNull();
+  });
+
+  it("keeps first_seen_at stable across upserts", async () => {
+    const { alice, wordProgress } = fx;
+    await wordProgress.upsert(alice, {
+      wordKey: fx.aliceWordKey,
+      stage: "IN_PROGRESS",
+      initialFamiliarity: "KNOWN",
+      firstSeenAt: T0,
+      lastSeenAt: T0 + HOUR,
+    });
+    const row = await wordProgress.get(alice, fx.aliceWordKey);
+    expect(row?.firstSeenAt).toBe(T0);
+    expect(row?.initialFamiliarity).toBe("KNOWN");
+  });
+});
+
+describe("queue snapshot release consistency", () => {
+  it("rejects a snapshot that targets a different release than the session pins", async () => {
+    const { alice, studySessions } = fx;
+    await expect(
+      studySessions.create(alice, {
+        sessionId: "study-mismatch",
+        mode: "REVIEW",
+        releaseId: "r1",
+        queueSnapshot: queueFor("r2", fx.aliceCardKey),
+        createdAt: T0,
+        expiresAt: T0 + HOUR,
+      }),
+    ).rejects.toThrow(/queue snapshot targets release r2/);
+    await expect(studySessions.get(alice, "study-mismatch")).resolves.toBeUndefined();
+  });
+
+  it("rejects patching a session with a snapshot from another release", async () => {
+    const { alice, studySessions } = fx;
+    await expect(
+      studySessions.patch(alice, fx.aliceSessionId, { queueSnapshot: queueFor("r2", fx.aliceCardKey) }),
+    ).rejects.toThrow(/pins r1/);
+    const unchanged = await studySessions.get(alice, fx.aliceSessionId);
+    expect(unchanged?.queue.release_id).toBe("r1");
+  });
+
+  it("accepts a patch that keeps the pinned release", async () => {
+    const { alice, studySessions } = fx;
+    const patched = await studySessions.patch(alice, fx.aliceSessionId, {
+      queueSnapshot: { ...queueFor("r1", fx.aliceCardKey), patch_event_ids: [fx.aliceEventId] },
+      position: 1,
+    });
+    expect(patched?.position).toBe(1);
+    expect(patched?.queue.patch_event_ids).toEqual([fx.aliceEventId]);
   });
 });

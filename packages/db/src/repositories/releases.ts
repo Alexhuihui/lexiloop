@@ -1,7 +1,8 @@
 import { and, eq, sql } from "drizzle-orm";
+import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { ReleaseStatus } from "@lexiloop/content-schema";
 import { z } from "zod";
-import type { LexiloopDatabase } from "../schema";
+import { schema, type LexiloopDatabase } from "../schema";
 import {
   appMeta,
   contentKeyAlias,
@@ -49,8 +50,8 @@ export interface InsertUnitReportInput {
 export class ReleaseRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
-  create(input: CreateReleaseInput): ContentReleaseRow {
-    const row = this.db
+  async create(input: CreateReleaseInput): Promise<ContentReleaseRow> {
+    const rows = await this.db
       .insert(contentRelease)
       .values({
         releaseId: input.releaseId,
@@ -63,16 +64,16 @@ export class ReleaseRepository {
         activatedAt: null,
         manifestSha256: input.manifestSha256,
       })
-      .returning()
-      .get();
+      .returning();
+    const row = rows[0];
     if (!row) {
       throw new Error(`release insert returned no row (release_id=${input.releaseId})`);
     }
     return row;
   }
 
-  insertUnitReport(releaseId: string, input: InsertUnitReportInput): ReleaseUnitRow {
-    const row = this.db
+  async insertUnitReport(releaseId: string, input: InsertUnitReportInput): Promise<ReleaseUnitRow> {
+    const rows = await this.db
       .insert(releaseUnit)
       .values({
         releaseId,
@@ -86,50 +87,56 @@ export class ReleaseRepository {
         cards: input.cards ?? 0,
         qaSummary: input.qaSummary ?? null,
       })
-      .returning()
-      .get();
+      .returning();
+    const row = rows[0];
     if (!row) {
       throw new Error(`release_unit insert returned no row (unit_key=${input.unitKey})`);
     }
     return row;
   }
 
-  getById(releaseId: string): ContentReleaseRow | undefined {
-    return this.db.select().from(contentRelease).where(eq(contentRelease.releaseId, releaseId)).get();
+  async getById(releaseId: string): Promise<ContentReleaseRow | undefined> {
+    return await this.db.select().from(contentRelease).where(eq(contentRelease.releaseId, releaseId)).get();
   }
 
-  getMeta(): AppMetaRow | undefined {
-    return this.db.select().from(appMeta).where(eq(appMeta.id, 1)).get();
+  async getMeta(): Promise<AppMetaRow | undefined> {
+    return await this.db.select().from(appMeta).where(eq(appMeta.id, 1)).get();
   }
 
   /** The currently ACTIVE release via the app_meta pointer (spec 6.4). */
-  getActive(): ContentReleaseRow | undefined {
-    const meta = this.getMeta();
+  async getActive(): Promise<ContentReleaseRow | undefined> {
+    const meta = await this.getMeta();
     if (!meta?.activeReleaseId) {
       return undefined;
     }
-    return this.getById(meta.activeReleaseId);
+    return await this.getById(meta.activeReleaseId);
   }
 
   /**
    * Points app_meta at `releaseId`, demotes the previous ACTIVE release to
    * RETIRED and promotes the target (READY for first activation, RETIRED for
-   * rollback — spec 11.3). Runs in one local transaction; on D1 the worker
-   * composes the same statements via `batch()`.
+   * rollback — spec 11.3).
+   *
+   * Transaction note (review finding): interactive `transaction()` callbacks
+   * cannot be inferred through the sync/async handle union, so this is the
+   * one isolated sync-typed call. At runtime both drivers implement it
+   * (drizzle's D1 session issues BEGIN/COMMIT); on D1 the worker may
+   * alternatively compose the three statements with `batch()`.
    */
-  setActive(releaseId: string, activatedAt: number): ContentReleaseRow {
-    const target = this.getById(releaseId);
+  async setActive(releaseId: string, activatedAt: number): Promise<ContentReleaseRow> {
+    const target = await this.getById(releaseId);
     if (!target) {
       throw new Error(`setActive: release ${releaseId} does not exist`);
     }
-    const meta = this.getMeta();
+    const meta = await this.getMeta();
     if (meta?.activeReleaseId === releaseId) {
       return target; // already active; keep activated_at stable
     }
     if (target.status !== "READY" && target.status !== "RETIRED") {
       throw new Error(`setActive: release ${releaseId} is ${target.status}, expected READY or RETIRED`);
     }
-    this.db.transaction((tx) => {
+    const txDb = this.db as BetterSQLite3Database<typeof schema>;
+    txDb.transaction((tx) => {
       if (meta?.activeReleaseId) {
         tx.update(contentRelease)
           .set({ status: "RETIRED" })
@@ -145,7 +152,7 @@ export class ReleaseRepository {
         .where(eq(appMeta.id, 1))
         .run();
     });
-    return this.getById(releaseId) ?? target;
+    return (await this.getById(releaseId)) ?? target;
   }
 }
 
@@ -164,13 +171,13 @@ export interface ResolveAliasInput {
 export class AliasRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
-  resolve(input: ResolveAliasInput): string {
+  async resolve(input: ResolveAliasInput): Promise<string> {
     const { releaseId, key } = input;
     let current = key;
     let firstCanonicalKey: string | null = null;
     const visited = new Set<string>([key]);
     for (;;) {
-      const edge = this.db
+      const edge = await this.db
         .select()
         .from(contentKeyAlias)
         .where(and(eq(contentKeyAlias.releaseId, releaseId), eq(contentKeyAlias.fromKey, current)))
@@ -194,8 +201,8 @@ export class AliasRepository {
   }
 
   /** Reads one edge without walking; mostly for verification tooling. */
-  getEdge(releaseId: string, fromKey: string): ContentKeyAliasRow | undefined {
-    return this.db
+  async getEdge(releaseId: string, fromKey: string): Promise<ContentKeyAliasRow | undefined> {
+    return await this.db
       .select()
       .from(contentKeyAlias)
       .where(and(eq(contentKeyAlias.releaseId, releaseId), eq(contentKeyAlias.fromKey, fromKey)))

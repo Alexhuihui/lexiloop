@@ -23,26 +23,40 @@ export interface UpsertWordProgressInput {
   initialFamiliarity: Familiarity | null;
   firstSeenAt: number;
   lastSeenAt: number;
+  /** Required iff stage is INTRODUCED (spec 5.7 rule 5); normally use markIntroduced. */
+  introducedReleaseId?: string;
+  introducedAt?: number;
 }
 
 /**
- * Persistent per-word stage (spec 5.7 rule 5). Stage transitions that depend
- * on grading (INTRODUCED and its rollback) are applied by the worker inside
- * a D1 batch; these methods only store the resulting state.
+ * Persistent per-word stage (spec 5.7 rule 5). The table CHECK requires
+ * introduced_release_id to be set exactly when stage is INTRODUCED, so a
+ * non-INTRODUCED upsert always clears the pair (undo path, spec 8.3) and an
+ * INTRODUCED upsert must carry it. Stage transitions that depend on grading
+ * are applied by the worker inside a D1 batch; these methods only store the
+ * resulting state.
  */
 export class WordProgressRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
-  get(ctx: UserContext, wordKey: string): WordProgressRow | undefined {
-    return this.db
+  async get(ctx: UserContext, wordKey: string): Promise<WordProgressRow | undefined> {
+    return await this.db
       .select()
       .from(wordProgress)
       .where(and(eq(wordProgress.userId, ctx.userId), eq(wordProgress.wordKey, wordKey)))
       .get();
   }
 
-  upsert(ctx: UserContext, input: UpsertWordProgressInput): WordProgressRow {
-    const row = this.db
+  async upsert(ctx: UserContext, input: UpsertWordProgressInput): Promise<WordProgressRow> {
+    const introduced = input.stage === "INTRODUCED";
+    const nextIntroducedReleaseId = introduced ? input.introducedReleaseId : null;
+    const nextIntroducedAt = introduced ? input.introducedAt : null;
+    if (introduced && (nextIntroducedReleaseId === undefined || nextIntroducedAt === undefined)) {
+      throw new Error(
+        `word_progress: stage INTRODUCED requires introducedReleaseId and introducedAt (word_key=${input.wordKey})`,
+      );
+    }
+    const rows = await this.db
       .insert(wordProgress)
       .values({
         userId: ctx.userId,
@@ -50,8 +64,8 @@ export class WordProgressRepository {
         stage: input.stage,
         initialFamiliarity: input.initialFamiliarity,
         firstSeenAt: input.firstSeenAt,
-        introducedReleaseId: null,
-        introducedAt: null,
+        introducedReleaseId: nextIntroducedReleaseId ?? null,
+        introducedAt: nextIntroducedAt ?? null,
         lastSeenAt: input.lastSeenAt,
       })
       .onConflictDoUpdate({
@@ -60,10 +74,14 @@ export class WordProgressRepository {
           stage: input.stage,
           initialFamiliarity: input.initialFamiliarity,
           lastSeenAt: input.lastSeenAt,
+          // Undo path: rolling back to a non-INTRODUCED stage must clear the
+          // introduction so the row keeps satisfying its own CHECK (spec 8.3).
+          introducedReleaseId: nextIntroducedReleaseId ?? null,
+          introducedAt: nextIntroducedAt ?? null,
         },
       })
-      .returning()
-      .get();
+      .returning();
+    const row = rows[0];
     if (!row) {
       throw new Error(`word_progress upsert returned no row (word_key=${input.wordKey})`);
     }
@@ -71,11 +89,11 @@ export class WordProgressRepository {
   }
 
   /** Marks a word INTRODUCED, pinning release and time (spec 5.7 rule 5). */
-  markIntroduced(
+  async markIntroduced(
     ctx: UserContext,
     input: { wordKey: string; introducedReleaseId: string; introducedAt: number },
-  ): WordProgressRow | undefined {
-    return this.db
+  ): Promise<WordProgressRow | undefined> {
+    const rows = await this.db
       .update(wordProgress)
       .set({
         stage: "INTRODUCED",
@@ -84,8 +102,8 @@ export class WordProgressRepository {
         lastSeenAt: input.introducedAt,
       })
       .where(and(eq(wordProgress.userId, ctx.userId), eq(wordProgress.wordKey, input.wordKey)))
-      .returning()
-      .get();
+      .returning();
+    return rows[0];
   }
 }
 
@@ -114,8 +132,8 @@ export interface UpsertCardStateInput {
 export class CardStateRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
-  get(ctx: UserContext, contentCardKey: string): CardStateRecord | undefined {
-    const row = this.db
+  async get(ctx: UserContext, contentCardKey: string): Promise<CardStateRecord | undefined> {
+    const row = await this.db
       .select()
       .from(cardState)
       .where(and(eq(cardState.userId, ctx.userId), eq(cardState.contentCardKey, contentCardKey)))
@@ -123,14 +141,15 @@ export class CardStateRepository {
     return row ? toCardStateRecord(row) : undefined;
   }
 
-  upsert(ctx: UserContext, input: UpsertCardStateInput): CardStateRecord {
+  async upsert(ctx: UserContext, input: UpsertCardStateInput): Promise<CardStateRecord> {
     const state = validateFsrsState(input.state);
-    const row = this.db
+    const blob = JSON.stringify(state);
+    const rows = await this.db
       .insert(cardState)
       .values({
         userId: ctx.userId,
         contentCardKey: input.contentCardKey,
-        fsrsState: JSON.stringify(state),
+        fsrsState: blob,
         due: state.due_at,
         reps: state.reps,
         lapses: state.lapses,
@@ -140,7 +159,7 @@ export class CardStateRepository {
       .onConflictDoUpdate({
         target: [cardState.userId, cardState.contentCardKey],
         set: {
-          fsrsState: JSON.stringify(state),
+          fsrsState: blob,
           due: state.due_at,
           reps: state.reps,
           lapses: state.lapses,
@@ -148,23 +167,23 @@ export class CardStateRepository {
           updatedAt: input.updatedAt,
         },
       })
-      .returning()
-      .get();
+      .returning();
+    const row = rows[0];
     if (!row) {
       throw new Error(`card_state upsert returned no row (content_card_key=${input.contentCardKey})`);
     }
     return toCardStateRecord(row);
   }
 
-  /** Due queue source, ordered by due ascending (spec 6.3). */
-  getDue(ctx: UserContext, asOfMs: number, limit: number): CardStateRecord[] {
-    return this.db
+  /** Due queue source, ordered by due ascending (spec 6.3). Negative or
+   * fractional limits are clamped: a negative limit yields no rows. */
+  async getDue(ctx: UserContext, asOfMs: number, limit: number): Promise<CardStateRecord[]> {
+    return (await this.db
       .select()
       .from(cardState)
       .where(and(eq(cardState.userId, ctx.userId), lte(cardState.due, asOfMs)))
       .orderBy(asc(cardState.due))
-      .limit(limit)
-      .all()
+      .limit(clampLimit(limit)))
       .map(toCardStateRecord);
   }
 }
@@ -224,10 +243,10 @@ export interface AppendReviewInput {
 export class ReviewLogRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
-  append(ctx: UserContext, input: AppendReviewInput): ReviewLogRecord {
+  async append(ctx: UserContext, input: AppendReviewInput): Promise<ReviewLogRecord> {
     const beforeState = input.beforeState === null ? null : JSON.stringify(validateFsrsState(input.beforeState));
     const afterState = JSON.stringify(validateFsrsState(input.afterState));
-    const row = this.db
+    const rows = await this.db
       .insert(reviewLog)
       .values({
         eventId: input.eventId,
@@ -243,16 +262,16 @@ export class ReviewLogRepository {
         durationMs: input.durationMs ?? null,
         undoneAt: null,
       })
-      .returning()
-      .get();
+      .returning();
+    const row = rows[0];
     if (!row) {
       throw new Error(`review_log append returned no row (event_id=${input.eventId})`);
     }
     return toReviewLogRecord(row);
   }
 
-  get(ctx: UserContext, eventId: string): ReviewLogRecord | undefined {
-    const row = this.db
+  async get(ctx: UserContext, eventId: string): Promise<ReviewLogRecord | undefined> {
+    const row = await this.db
       .select()
       .from(reviewLog)
       .where(and(eq(reviewLog.eventId, eventId), eq(reviewLog.userId, ctx.userId)))
@@ -260,30 +279,30 @@ export class ReviewLogRepository {
     return row ? toReviewLogRecord(row) : undefined;
   }
 
-  /** Newest-first history (spec 6.3 index), optionally paged by time. */
-  listRecent(ctx: UserContext, limit: number, beforeMs?: number): ReviewLogRecord[] {
+  /** Newest-first history (spec 6.3 index), optionally paged by time.
+   * Negative or fractional limits are clamped: a negative limit yields no rows. */
+  async listRecent(ctx: UserContext, limit: number, beforeMs?: number): Promise<ReviewLogRecord[]> {
     const condition =
       beforeMs === undefined
         ? eq(reviewLog.userId, ctx.userId)
         : and(eq(reviewLog.userId, ctx.userId), lte(reviewLog.reviewedAt, beforeMs));
-    return this.db
+    const rows = await this.db
       .select()
       .from(reviewLog)
       .where(condition)
       .orderBy(desc(reviewLog.reviewedAt))
-      .limit(limit)
-      .all()
-      .map(toReviewLogRecord);
+      .limit(clampLimit(limit));
+    return rows.map(toReviewLogRecord);
   }
 
   /** Fills undone_at; the log row itself is never deleted (spec 8.3). */
-  markUndone(ctx: UserContext, eventId: string, undoneAt: number): boolean {
-    const result = this.db
+  async markUndone(ctx: UserContext, eventId: string, undoneAt: number): Promise<boolean> {
+    const rows = await this.db
       .update(reviewLog)
       .set({ undoneAt })
       .where(and(eq(reviewLog.eventId, eventId), eq(reviewLog.userId, ctx.userId)))
-      .run();
-    return result.changes > 0;
+      .returning();
+    return rows.length > 0;
   }
 }
 
@@ -350,6 +369,15 @@ export interface PatchStudySessionInput {
   position?: number;
 }
 
+/** Queue snapshots must describe the exact release the row pins (spec 6.4). */
+function requireMatchingRelease(rowReleaseId: string, queueReleaseId: string, sessionId: string): void {
+  if (rowReleaseId !== queueReleaseId) {
+    throw new Error(
+      `study_session ${sessionId}: queue snapshot targets release ${queueReleaseId}, but the session pins ${rowReleaseId}`,
+    );
+  }
+}
+
 /**
  * Fixed-release study sessions (spec 5.7/6.4). Content reads during a session
  * use `releaseId` from this row, never the current active pointer. The 24h
@@ -358,9 +386,10 @@ export interface PatchStudySessionInput {
 export class StudySessionRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
-  create(ctx: UserContext, input: CreateStudySessionInput): StudySessionRecord {
+  async create(ctx: UserContext, input: CreateStudySessionInput): Promise<StudySessionRecord> {
     const queue = validateQueueSnapshot(input.queueSnapshot);
-    const row = this.db
+    requireMatchingRelease(input.releaseId, queue.release_id, input.sessionId);
+    const rows = await this.db
       .insert(studySession)
       .values({
         sessionId: input.sessionId,
@@ -372,16 +401,16 @@ export class StudySessionRepository {
         createdAt: input.createdAt,
         expiresAt: input.expiresAt,
       })
-      .returning()
-      .get();
+      .returning();
+    const row = rows[0];
     if (!row) {
       throw new Error(`study_session insert returned no row (session_id=${input.sessionId})`);
     }
     return toStudySessionRecord(row);
   }
 
-  get(ctx: UserContext, sessionId: string): StudySessionRecord | undefined {
-    const row = this.db
+  async get(ctx: UserContext, sessionId: string): Promise<StudySessionRecord | undefined> {
+    const row = await this.db
       .select()
       .from(studySession)
       .where(and(eq(studySession.sessionId, sessionId), eq(studySession.userId, ctx.userId)))
@@ -390,22 +419,22 @@ export class StudySessionRepository {
   }
 
   /** Unexpired sessions for resuming work (spec 11.2). */
-  listActive(ctx: UserContext, nowMs: number): StudySessionRecord[] {
-    return this.db
+  async listActive(ctx: UserContext, nowMs: number): Promise<StudySessionRecord[]> {
+    const rows = await this.db
       .select()
       .from(studySession)
       .where(and(eq(studySession.userId, ctx.userId), gt(studySession.expiresAt, nowMs)))
-      .orderBy(desc(studySession.createdAt))
-      .all()
-      .map(toStudySessionRecord);
+      .orderBy(desc(studySession.createdAt));
+    return rows.map(toStudySessionRecord);
   }
 
   /**
    * Non-grading progress: queue snapshot rewrites and position advancement
-   * (spec 8.3 PATCH). Grading batches update the position atomically with
+   * (spec 8.3 PATCH). A rewritten snapshot must still describe the session's
+   * pinned release. Grading batches update the position atomically with
    * review_log/card_state writes in the worker.
    */
-  patch(ctx: UserContext, sessionId: string, input: PatchStudySessionInput): StudySessionRecord | undefined {
+  async patch(ctx: UserContext, sessionId: string, input: PatchStudySessionInput): Promise<StudySessionRecord | undefined> {
     const set: { queueSnapshot?: string; position?: number } = {};
     if (input.queueSnapshot !== undefined) {
       set.queueSnapshot = JSON.stringify(validateQueueSnapshot(input.queueSnapshot));
@@ -414,14 +443,21 @@ export class StudySessionRepository {
       set.position = input.position;
     }
     if (Object.keys(set).length === 0) {
-      return this.get(ctx, sessionId);
+      return await this.get(ctx, sessionId);
     }
-    const row = this.db
+    const current = await this.get(ctx, sessionId);
+    if (!current) {
+      return undefined;
+    }
+    if (input.queueSnapshot !== undefined) {
+      requireMatchingRelease(current.releaseId, input.queueSnapshot.release_id, sessionId);
+    }
+    const rows = await this.db
       .update(studySession)
       .set(set)
       .where(and(eq(studySession.sessionId, sessionId), eq(studySession.userId, ctx.userId)))
-      .returning()
-      .get();
+      .returning();
+    const row = rows[0];
     return row ? toStudySessionRecord(row) : undefined;
   }
 }
@@ -448,4 +484,12 @@ function toStudySessionRecord(row: StudySessionRawRow): StudySessionRecord {
     createdAt: row.createdAt,
     expiresAt: row.expiresAt,
   };
+}
+
+/** Review finding: negative or fractional limits collapse to a sane minimum. */
+function clampLimit(limit: number): number {
+  if (!Number.isFinite(limit)) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(limit));
 }
