@@ -1,0 +1,33 @@
+# LexiLoop Worker Wrangler configuration template.
+#
+# Copy this file to `wrangler.toml` (git-ignored) or the matching
+# environment-specific location and replace every `<...>` marker with the real
+# environment-specific value. Real production IDs may also be managed as
+# Cloudflare bindings/dashboard configuration; they never enter Git.
+
+name = "lexiloop-worker"
+main = "../../apps/worker/src/index.ts"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lexiloop"
+database_id = "<D1_DATABASE_ID>"
+
+[[r2_buckets]]
+binding = "AUDIO"
+bucket_name = "<R2_BUCKET_NAME>"
+
+# Login rate limiter (used by the auth session routes).
+[[unsafe.bindings]]
+name = "LOGIN_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+
+[unsafe.bindings.simple]
+limit = 5
+period = 60
+
+# Daily application backup, 03:30 UTC.
+[triggers]
+crons = ["30 3 * * *"]

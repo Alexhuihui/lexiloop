@@ -1,0 +1,19 @@
+{
+  "name": "@lexiloop/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@hono/zod-validator": "0.9.1",
+    "@lexiloop/content-schema": "workspace:*",
+    "@lexiloop/db": "workspace:*",
+    "@lexiloop/domain": "workspace:*",
+    "@lexiloop/fsrs": "workspace:*",
+    "hono": "4.13.7",
+    "zod": "4.5.4"
+  }
+}
