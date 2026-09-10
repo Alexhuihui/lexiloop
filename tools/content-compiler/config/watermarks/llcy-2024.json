@@ -1,7 +1,7 @@
 {
-  "rule_version": 1,
+  "rule_version": 2,
   "book_key": "llcy-2024",
-  "notes": "Candidate watermark regions for the 2024 LLRC 6500 vocabulary scan (single-page portrait rasters, origin top-left, normalized to [0,1]). Regions were calibrated from rendered preview pages 1, 8, 32 and 100: a centered top banner line, a two-line bottom-right promo block, and a bottom footer strip. Page numbers sit left of x=0.15 in the footer band and are genuine content, so they are excluded. No source/book text is stored in this file.",
+  "notes": "Candidate watermark regions for the 2024 LLRC 6500 vocabulary scan (single-page portrait rasters, origin top-left, normalized to [0,1], y from top). v2 applies visual-QA round-1 repairs: (1) top banner band tightened to y<=0.072 (measured watermark bottom <=0.069 on body pages; first body line starts y=0.0736) and x<=0.725 (measured banner right edge 0.7172-0.7178 on body pages), with a cover-only x<=0.72 override to protect the leaf-badge arc art; (2) cover-only exclusion hole over the pale tree-trunk art in the bottom-promo band (trunk bbox x 0.439-0.559, y 0.75-0.854); (3) bottom footer switched to flat background fill that preserves print darker than luminance 180 (measured: genuine footer quote cores 72-170, watermark 190-240; measured on page 32), with a cover-only x-split [0.15-0.365]+[0.62-0.88] sparing the publisher imprint (dark bbox x 0.3765-0.6013, y 0.9036-0.9436). No source/book text is stored in this file.",
   "fill": {
     "default_mode": "selective",
     "inpaint_radius": 3
@@ -11,23 +11,57 @@
     "min_ink_ratio": 0.002,
     "ink_threshold": 12,
     "luminance_split": 140,
-    "dark_text_max_ratio": 0.02
+    "max_chroma_spread": 32,
+    "dark_text_max_ratio": 0.02,
+    "min_chromatic_pixels": 400,
+    "dark_fill_preserve_luminance": 180
   },
   "regions": [
     {
       "kind": "rect",
       "name": "top-banner",
-      "box": [0.2, 0.03, 0.8, 0.085]
+      "box": [0.2, 0.03, 0.725, 0.072],
+      "page_selector": { "kind": "except", "pages": [1] }
+    },
+    {
+      "kind": "rect",
+      "name": "top-banner-cover",
+      "box": [0.2, 0.03, 0.72, 0.072],
+      "page_selector": { "kind": "pages", "pages": [1] }
     },
     {
       "kind": "rect",
       "name": "bottom-promo",
-      "box": [0.46, 0.76, 0.94, 0.875]
+      "box": [0.46, 0.76, 0.94, 0.875],
+      "page_selector": { "kind": "except", "pages": [1] }
+    },
+    {
+      "kind": "rect",
+      "name": "bottom-promo-cover",
+      "box": [0.46, 0.76, 0.94, 0.875],
+      "page_selector": { "kind": "pages", "pages": [1] },
+      "exclude": [[0.435, 0.75, 0.545, 0.885]]
     },
     {
       "kind": "rect",
       "name": "bottom-footer",
-      "box": [0.15, 0.915, 0.88, 0.965]
+      "box": [0.15, 0.915, 0.88, 0.965],
+      "fill_mode": "background",
+      "page_selector": { "kind": "except", "pages": [1] }
+    },
+    {
+      "kind": "rect",
+      "name": "bottom-footer-cover-left",
+      "box": [0.15, 0.915, 0.365, 0.965],
+      "fill_mode": "background",
+      "page_selector": { "kind": "pages", "pages": [1] }
+    },
+    {
+      "kind": "rect",
+      "name": "bottom-footer-cover-right",
+      "box": [0.62, 0.915, 0.88, 0.965],
+      "fill_mode": "background",
+      "page_selector": { "kind": "pages", "pages": [1] }
     }
   ]
 }

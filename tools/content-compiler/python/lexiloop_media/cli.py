@@ -158,8 +158,8 @@ def cmd_clean(args: argparse.Namespace) -> None:
         originals[record.page] = _imread(base_dir / record.image_path)
 
     out_dir = Path(args.out_dir)
-    evidence_images = [originals[record.page] for record in extract_records]
-    confirmed = watermarks.confirm_regions(evidence_images, rule)
+    evidence_pages = [(record.page, originals[record.page]) for record in extract_records]
+    confirmed = watermarks.confirm_regions(evidence_pages, rule)
 
     clean_dir = out_dir / "pages-clean"
     clean_rows: list[dict[str, Any]] = []
@@ -167,7 +167,7 @@ def cmd_clean(args: argparse.Namespace) -> None:
     for record in extract_records:
         original = originals[record.page]
         cleaned, mask = watermarks.clean_watermarks(
-            original, rule, evidence_images=evidence_images
+            original, rule, evidence_pages=evidence_pages, page_number=record.page
         )
         outside = watermarks.changed_pixels_outside(original, cleaned, mask)
         if outside != 0:
@@ -178,7 +178,11 @@ def cmd_clean(args: argparse.Namespace) -> None:
         overlap = watermarks.detect_body_overlap(original, mask, rule.evidence)
         if overlap:
             overlap_pages.append(record.page)
-        active = [region.name for region in rule.regions if confirmed[region.name]]
+        active = [
+            region.name
+            for region in rule.regions
+            if confirmed[region.name] and region.page_selector.matches(record.page)
+        ]
         cleaned_rel = f"pages-clean/page-{record.page:04d}.cleaned.png"
         changed = int(
             np.count_nonzero(np.any(original != cleaned, axis=2))

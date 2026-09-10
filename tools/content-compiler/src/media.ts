@@ -133,6 +133,66 @@ export function createPythonRunner(options: PythonRunnerOptions = {}): SpawnPyth
 
 const hex64 = z.string().regex(HEX64);
 const unit = z.number().min(0).max(1);
+const boxTuple = z.tuple([unit, unit, unit, unit]);
+const fillMode = z.enum(["selective", "background", "inpaint"]);
+
+/** Page scoping for a region (1-based PDF pages). */
+export const PageSelectorSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("all") }),
+  z.object({ kind: z.literal("pages"), pages: z.array(z.number().int().positive()).min(1) }),
+  z.object({ kind: z.literal("except"), pages: z.array(z.number().int().positive()).min(1) }),
+]);
+export type PageSelector = z.infer<typeof PageSelectorSchema>;
+
+export const RectRegionSchema = z.object({
+  kind: z.literal("rect"),
+  name: z.string().min(1),
+  box: boxTuple,
+  fill_mode: fillMode.nullish(),
+  page_selector: PageSelectorSchema.default({ kind: "all" }),
+  /** Normalized rect holes never touched by cleanup. */
+  exclude: z.array(boxTuple).default([]),
+});
+export const PolygonRegionSchema = z.object({
+  kind: z.literal("polygon"),
+  name: z.string().min(1),
+  points: z.array(z.tuple([unit, unit])).min(3),
+  fill_mode: fillMode.nullish(),
+  page_selector: PageSelectorSchema.default({ kind: "all" }),
+  exclude: z.array(boxTuple).default([]),
+});
+export const FillConfigSchema = z.object({
+  default_mode: fillMode.default("selective"),
+  inpaint_radius: z.number().int().min(1).default(3),
+});
+export const EvidenceConfigSchema = z.object({
+  min_page_fraction: z.number().min(0).max(1).default(0.6),
+  min_ink_ratio: z.number().min(0).max(1).default(0.002),
+  ink_threshold: z.number().int().min(0).max(255).default(24),
+  luminance_split: z.number().int().min(0).max(255).default(140),
+  max_chroma_spread: z.number().int().min(0).max(255).default(32),
+  dark_text_max_ratio: z.number().gt(0).max(1).default(0.02),
+  min_chromatic_pixels: z.number().int().min(1).default(400),
+  dark_fill_preserve_luminance: z.number().int().min(0).max(255).default(100),
+});
+export const WatermarkRuleSchema = z.object({
+  rule_version: z.number().int().positive(),
+  book_key: z.string().min(1),
+  notes: z.string().nullish(),
+  fill: FillConfigSchema.default({ default_mode: "selective", inpaint_radius: 3 }),
+  evidence: EvidenceConfigSchema.default({
+    min_page_fraction: 0.6,
+    min_ink_ratio: 0.002,
+    ink_threshold: 24,
+    luminance_split: 140,
+    max_chroma_spread: 32,
+    dark_text_max_ratio: 0.02,
+    min_chromatic_pixels: 400,
+    dark_fill_preserve_luminance: 100,
+  }),
+  regions: z.array(z.union([RectRegionSchema, PolygonRegionSchema])).min(1),
+});
+export type WatermarkRuleConfig = z.infer<typeof WatermarkRuleSchema>;
 
 export const PageRecordSchema = z.object({
   source_sha256: hex64,
@@ -162,26 +222,6 @@ export const CleanRecordSchema = z.object({
   body_overlap_detected: z.boolean(),
 });
 export type CleanRecord = z.infer<typeof CleanRecordSchema>;
-
-export const RectRegionSchema = z.object({
-  kind: z.literal("rect"),
-  name: z.string().min(1),
-  box: z.tuple([unit, unit, unit, unit]),
-  fill_mode: z.enum(["selective", "background", "inpaint"]).nullish(),
-});
-export const PolygonRegionSchema = z.object({
-  kind: z.literal("polygon"),
-  name: z.string().min(1),
-  points: z.array(z.tuple([unit, unit])).min(3),
-  fill_mode: z.enum(["selective", "background", "inpaint"]).nullish(),
-});
-export const WatermarkRuleSchema = z.object({
-  rule_version: z.number().int().positive(),
-  book_key: z.string().min(1),
-  notes: z.string().nullish(),
-  regions: z.array(z.union([RectRegionSchema, PolygonRegionSchema])).min(1),
-});
-export type WatermarkRuleConfig = z.infer<typeof WatermarkRuleSchema>;
 
 /** One row of `qa/packets.jsonl` (written by `media qa-packets`). */
 export const QaPacketSchema = z.object({

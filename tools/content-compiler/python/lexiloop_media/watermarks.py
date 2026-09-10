@@ -31,16 +31,64 @@ import pydantic
 UnitFloat = Annotated[float, pydantic.Field(ge=0.0, le=1.0)]
 FillMode = Literal["selective", "background", "inpaint"]
 
-DEFAULT_RING_RADIUS_PX = 25
+DEFAULT_RING_RADIUS_PX = 24
 
 
-class RectRegion(pydantic.BaseModel):
+class PageSelector(pydantic.BaseModel):
+    """Which PDF pages (1-based) a region applies to.
+
+    ``all`` (default), an explicit ``pages`` list, or ``except`` (every page
+    except the listed ones — used for front-cover overrides).
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    kind: Literal["all", "pages", "except"] = "all"
+    pages: list[int] = pydantic.Field(default_factory=list)
+
+    @pydantic.model_validator(mode="after")
+    def _pages_required(self) -> "PageSelector":
+        if self.kind in ("pages", "except") and not self.pages:
+            raise ValueError(f"page_selector kind {self.kind!r} requires a non-empty pages list")
+        if self.kind == "pages" and any(p < 1 for p in self.pages):
+            raise ValueError("page_selector pages must be 1-based")
+        return self
+
+    def matches(self, page_number: int | None) -> bool:
+        if self.kind == "all" or page_number is None:
+            return True  # no page context: never scope regions away
+        if self.kind == "pages":
+            return page_number in self.pages
+        return page_number not in self.pages
+
+
+class RegionBase(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    name: str = pydantic.Field(min_length=1)
+    fill_mode: FillMode | None = None
+    page_selector: PageSelector = pydantic.Field(default_factory=PageSelector)
+    """Normalized rect holes ``(x0, y0, x1, y1)`` never touched by cleanup."""
+    exclude: list[tuple[UnitFloat, UnitFloat, UnitFloat, UnitFloat]] = pydantic.Field(
+        default_factory=list
+    )
+
+    @pydantic.model_validator(mode="after")
+    def _holes_ordered(self) -> "RegionBase":
+        for x0, y0, x1, y1 in self.exclude:
+            if x1 <= x0 or y1 <= y0:
+                raise ValueError(
+                    f"exclusion hole in {self.name!r} must satisfy x0 < x1 and y0 < y1: "
+                    f"{(x0, y0, x1, y1)}"
+                )
+        return self
+
+
+class RectRegion(RegionBase):
     """Axis-aligned normalized rectangle: ``box = (x0, y0, x1, y1)``."""
 
     kind: Literal["rect"] = "rect"
-    name: str = pydantic.Field(min_length=1)
     box: tuple[UnitFloat, UnitFloat, UnitFloat, UnitFloat]
-    fill_mode: FillMode | None = None
 
     @pydantic.model_validator(mode="after")
     def _box_ordered(self) -> "RectRegion":
@@ -50,13 +98,11 @@ class RectRegion(pydantic.BaseModel):
         return self
 
 
-class PolygonRegion(pydantic.BaseModel):
+class PolygonRegion(RegionBase):
     """Normalized polygon (at least 3 points)."""
 
     kind: Literal["polygon"] = "polygon"
-    name: str = pydantic.Field(min_length=1)
     points: Annotated[list[tuple[UnitFloat, UnitFloat]], pydantic.Field(min_length=3)]
-    fill_mode: FillMode | None = None
 
 
 Region = Annotated[RectRegion | PolygonRegion, pydantic.Field(discriminator="kind")]
@@ -81,6 +127,7 @@ class EvidenceConfig(pydantic.BaseModel):
     max_chroma_spread: int = pydantic.Field(default=32, ge=0, le=255)
     dark_text_max_ratio: float = pydantic.Field(default=0.02, gt=0.0, le=1.0)
     min_chromatic_pixels: int = pydantic.Field(default=400, ge=1)
+    dark_fill_preserve_luminance: int = pydantic.Field(default=100, ge=0, le=255)
 
 
 class WatermarkRule(pydantic.BaseModel):
@@ -109,16 +156,27 @@ def load_rule(path: str | Path) -> WatermarkRule:
 # ---------------------------------------------------------------------------
 
 
-def build_mask(shape: tuple[int, ...], regions: Sequence[RectRegion | PolygonRegion]) -> np.ndarray:
-    """Rasterize normalized regions into a boolean mask of ``shape[:2]``."""
+def build_mask(
+    shape: tuple[int, ...],
+    regions: Sequence[RectRegion | PolygonRegion],
+    page_number: int | None = None,
+) -> np.ndarray:
+    """Rasterize normalized regions into a boolean mask of ``shape[:2]``.
+
+    Regions whose ``page_selector`` does not match ``page_number`` are
+    skipped; each region's ``exclude`` holes are subtracted and are never
+    part of the mask (zero changed pixels inside holes).
+    """
     height, width = int(shape[0]), int(shape[1])
     mask = np.zeros((height, width), dtype=bool)
     for region in regions:
+        if not region.page_selector.matches(page_number):
+            continue
         if isinstance(region, RectRegion):
             x0, y0, x1, y1 = region.box
             col0, col1 = int(x0 * width), int(np.ceil(x1 * width))
             row0, row1 = int(y0 * height), int(np.ceil(y1 * height))
-            mask[row0:max(row1, row0 + 1), col0 : max(col1, col0 + 1)] = True
+            mask[row0 : max(row1, row0 + 1), col0 : max(col1, col0 + 1)] = True
         else:
             points = np.array(
                 [[round(x * width), round(y * height)] for x, y in region.points],
@@ -127,6 +185,10 @@ def build_mask(shape: tuple[int, ...], regions: Sequence[RectRegion | PolygonReg
             polygon = np.zeros((height, width), dtype=np.uint8)
             cv2.fillPoly(polygon, [points], 1)
             mask |= polygon.astype(bool)
+        for hx0, hy0, hx1, hy1 in region.exclude:
+            hcol0, hcol1 = int(hx0 * width), int(np.ceil(hx1 * width))
+            hrow0, hrow1 = int(hy0 * height), int(np.ceil(hy1 * height))
+            mask[hrow0 : max(hrow1, hrow0 + 1), hcol0 : max(hcol1, hcol0 + 1)] = False
     return mask
 
 
@@ -167,21 +229,26 @@ def _ink_ratio(image: np.ndarray, region_mask: np.ndarray, evidence: EvidenceCon
 
 
 def confirm_regions(
-    images: Sequence[np.ndarray],
+    evidence_pages: Sequence[tuple[int | None, np.ndarray]],
     rule: WatermarkRule,
 ) -> dict[str, bool]:
-    """Cross-page evidence per region: ink present on >= min_page_fraction pages."""
-    if not images:
-        return {region.name: False for region in rule.regions}
+    """Cross-page evidence per region: ink present on >= min_page_fraction
+    of the pages the region applies to (per its ``page_selector``)."""
     evidence = rule.evidence
     confirmed: dict[str, bool] = {}
     for region in rule.regions:
+        matched = [
+            image for page_number, image in evidence_pages if region.page_selector.matches(page_number)
+        ]
+        if not matched:
+            confirmed[region.name] = False
+            continue
         pages_with_ink = 0
-        for image in images:
+        for image in matched:
             region_mask = build_mask(image.shape[:2], [region])
             if _ink_ratio(image, region_mask, evidence) >= evidence.min_ink_ratio:
                 pages_with_ink += 1
-        confirmed[region.name] = (pages_with_ink / len(images)) >= evidence.min_page_fraction
+        confirmed[region.name] = (pages_with_ink / len(matched)) >= evidence.min_page_fraction
     return confirmed
 
 
@@ -223,8 +290,15 @@ def _fill_region(
     radius = rule.fill.inpaint_radius
     evidence = rule.evidence
     if mode == "background":
+        # Flat paper fill: every pixel becomes the ring-estimated background
+        # except near-black print (genuine body text is preserved even when
+        # the band is declared background-fill; only light/mid remnants and
+        # paper noise are flattened).
         background = _background_color(original, region_mask)
-        cleaned[region_mask] = background
+        gray_region = _gray_of(original)
+        preserve = region_mask & (gray_region < evidence.dark_fill_preserve_luminance)
+        fill_mask = region_mask & ~preserve
+        cleaned[fill_mask] = background
         return
 
     gray = _gray_of(original)
@@ -267,21 +341,27 @@ def _fill_region(
 def clean_watermarks(
     image: np.ndarray,
     rule: WatermarkRule,
-    evidence_images: Sequence[np.ndarray] | None = None,
+    evidence_pages: Sequence[tuple[int | None, np.ndarray]] | None = None,
+    page_number: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clean one page image; return ``(cleaned, mask)``.
 
-    ``evidence_images`` is the pool of page images used for cross-page
-    confirmation (defaults to just this page). Only confirmed regions enter
-    the mask, and only masked pixels are ever modified.
+    ``evidence_pages`` is the pool of ``(page_number, image)`` pairs used for
+    cross-page confirmation (defaults to just this page). Only regions whose
+    ``page_selector`` matches ``page_number`` enter the mask, exclusion holes
+    are subtracted, and only masked pixels are ever modified.
     """
-    pool = list(evidence_images) if evidence_images else [image]
+    pool = list(evidence_pages) if evidence_pages else [(page_number, image)]
     confirmed = confirm_regions(pool, rule)
-    active = [region for region in rule.regions if confirmed[region.name]]
-    mask = build_mask(image.shape[:2], active)
+    active = [
+        region
+        for region in rule.regions
+        if confirmed[region.name] and region.page_selector.matches(page_number)
+    ]
+    mask = build_mask(image.shape[:2], active, page_number)
     cleaned = image.copy()
     for region in active:
-        region_mask = build_mask(image.shape[:2], [region])
+        region_mask = build_mask(image.shape[:2], [region], page_number)
         mode = region.fill_mode or rule.fill.default_mode
         _fill_region(cleaned, image, region_mask, mode, rule)
     return cleaned, mask

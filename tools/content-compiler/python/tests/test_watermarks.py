@@ -17,6 +17,7 @@ import pytest
 from lexiloop_media.watermarks import (
     EvidenceConfig,
     FillConfig,
+    PageSelector,
     PolygonRegion,
     RectRegion,
     WatermarkRule,
@@ -83,21 +84,36 @@ def test_mask_bounds_are_normalized_and_inside_union_of_regions() -> None:
 def test_confirm_regions_requires_cross_page_repetition(scan_page, rule) -> None:
     blank = np.full_like(scan_page, 255)
     # Watermark present on 2 of 3 pages.
-    confirmed = confirm_regions([scan_page, scan_page, blank], rule)
+    confirmed = confirm_regions([(1, scan_page), (2, scan_page), (3, blank)], rule)
     assert confirmed.keys() == {r.name for r in rule.regions}
+    assert all(confirmed.values())
     # With a 0.99 threshold the missing third page vetoes every region...
     strict = rule.model_copy(
         update={"evidence": EvidenceConfig(min_page_fraction=0.99)},
         deep=True,
     )
-    assert not any(confirm_regions([scan_page, scan_page, blank], strict).values())
+    assert not any(confirm_regions([(1, scan_page), (2, scan_page), (3, blank)], strict).values())
     # ...and a fully watermarked set confirms every region at any threshold.
-    assert all(confirm_regions([scan_page, scan_page, scan_page], strict).values())
+    assert all(confirm_regions([(1, scan_page), (2, scan_page), (3, scan_page)], strict).values())
+
+
+def test_confirm_regions_only_counts_selector_matched_pages(scan_page, rule) -> None:
+    cover_rule = rule.model_copy(deep=True)
+    cover_rule.regions[0].page_selector = PageSelector(kind="pages", pages=[1])
+    blank = np.full_like(scan_page, 255)
+    # Page 1 (the only matched page) has ink -> confirmed even though the
+    # other pool pages are blank and would drag a global ratio down.
+    confirmed = confirm_regions([(1, scan_page), (2, blank), (3, blank)], cover_rule)
+    assert confirmed["top-banner"] is True
+    # ...but the matched page must itself carry the watermark ink.
+    assert confirm_regions([(1, blank), (2, scan_page), (3, scan_page)], cover_rule)[
+        "top-banner"
+    ] is False
 
 
 def test_regions_without_ink_are_not_confirmed(scan_page, rule) -> None:
     blank = np.full_like(scan_page, 255)
-    confirmed = confirm_regions([blank, blank], rule)
+    confirmed = confirm_regions([(1, blank), (2, blank)], rule)
     assert not any(confirmed.values())
 
 
@@ -144,9 +160,71 @@ def test_unconfirmed_regions_mean_no_changes(scan_page, rule) -> None:
     )
     # The watermark is missing on the second page, so with a unanimity
     # threshold no region is confirmed and nothing may change at all.
-    cleaned, mask = clean_watermarks(scan_page, vetoed, evidence_images=[scan_page, blank])
+    cleaned, mask = clean_watermarks(
+        scan_page, vetoed, evidence_pages=[(1, scan_page), (2, blank)], page_number=1
+    )
     assert not mask.any()
     assert np.array_equal(cleaned, scan_page)
+
+
+def test_page_selector_scopes_cleanup_to_selected_pages(scan_page, rule) -> None:
+    # Region applies only to page 2: page 1 must be untouched, page 2 cleaned.
+    scoped = rule.model_copy(deep=True)
+    for region in scoped.regions:
+        region.page_selector = PageSelector(kind="pages", pages=[2])
+
+    cleaned_page1, mask_page1 = clean_watermarks(scan_page, scoped, page_number=1)
+    assert not mask_page1.any()
+    assert np.array_equal(cleaned_page1, scan_page)
+
+    cleaned_page2, mask_page2 = clean_watermarks(scan_page, scoped, page_number=2)
+    assert mask_page2.any()
+    assert np.any(cleaned_page2 != scan_page)
+
+    # "except" scoping: cover-only exclusion of page 1 behaves identically.
+    except_rule = rule.model_copy(deep=True)
+    for region in except_rule.regions:
+        region.page_selector = PageSelector(kind="except", pages=[1])
+    cleaned_cover, mask_cover = clean_watermarks(scan_page, except_rule, page_number=1)
+    assert not mask_cover.any()
+    assert np.array_equal(cleaned_cover, scan_page)
+
+
+def test_exclusion_holes_are_never_changed(scan_page, rule) -> None:
+    hole = (0.25, 0.03, 0.75, 0.069)  # covers the whole fixture banner
+    holed = rule.model_copy(deep=True)
+    holed.regions[0].exclude = [hole]
+    cleaned, mask = clean_watermarks(scan_page, holed, page_number=1)
+
+    hole_mask = build_mask(scan_page.shape[:2], [RectRegion(name="hole", box=hole)])
+    changed = np.any(scan_page != cleaned, axis=2)
+    # Zero changed pixels inside the hole, and the hole is not in the mask.
+    assert int(np.count_nonzero(changed & hole_mask)) == 0
+    assert not (mask & hole_mask).any()
+    # Cleanup still happened elsewhere (other regions remain active).
+    assert int(np.count_nonzero(changed)) > 0
+    assert changed_pixels_outside(scan_page, cleaned, mask) == 0
+
+
+def test_background_fill_preserves_near_black_print() -> None:
+    # The footer repair uses flat background fill: light watermark remnants
+    # and the orphaned speck are flattened, near-black genuine text survives.
+    image = np.full((200, 200, 3), 255, dtype=np.uint8)
+    image[20:30, 10:180] = (205, 205, 205)  # watermark remnant strip
+    image[40:50, 10:120] = (30, 30, 30)  # genuine near-black print
+    image[60:64, 130:150] = (150, 150, 150)  # orphaned mid-gray speck
+    rule = WatermarkRule(
+        rule_version=2,
+        book_key="footer-case",
+        fill=FillConfig(default_mode="background"),
+        evidence=EvidenceConfig(),
+        regions=[RectRegion(name="footer", box=(0.0, 0.0, 1.0, 0.5))],
+    )
+    cleaned, mask = clean_watermarks(image, rule, page_number=32)
+    assert changed_pixels_outside(image, cleaned, mask) == 0
+    assert np.array_equal(cleaned[40:50, 10:120], image[40:50, 10:120])  # print kept
+    assert _ink_pixels(cleaned[20:30, 10:180]) == 0  # remnant flattened
+    assert _ink_pixels(cleaned[60:64, 130:150]) == 0  # speck flattened
 
 
 def test_selective_fill_preserves_dark_text_inside_region() -> None:
