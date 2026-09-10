@@ -33,7 +33,7 @@
  * stage implementations (tasks 5-10).
  */
 import { randomUUID } from "node:crypto";
-import { mkdir, open, rm, stat } from "node:fs/promises";
+import { mkdir, open, readFile, rm, stat, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { ZodError } from "zod";
 import type { LedgerStore } from "./ledger";
@@ -180,7 +180,7 @@ export class PipelineLockError extends Error {
 
 export interface WorkLock {
   path: string;
-  /** Idempotent; removes the lockfile. */
+  /** Idempotent; removes the lockfile when it is still the one we created. */
   release(): Promise<void>;
 }
 
@@ -189,15 +189,30 @@ export interface WorkLock {
  * exclusive "wx" flag, so concurrent acquirers cannot both win. An existing
  * lock always refuses: below the TTL it is reported as an active run, past
  * the TTL as stale. Stale locks are never removed automatically.
+ *
+ * The payload carries a random ownership token: `release()` only removes the
+ * lockfile when it still contains our token, so a lock that was replaced by
+ * another writer is never deleted by us. If writing the payload fails after
+ * exclusive creation, the just-created (empty) lock is removed before the
+ * error propagates, so a failed acquisition never leaves a phantom lock.
  */
 export async function acquireWorkLock(options: {
   directory: string;
   ttlMs?: number;
+  /** Injectable payload writer; exists so tests can force a write failure. */
+  writePayload?: (handle: FileHandle, payload: string) => Promise<void>;
 }): Promise<WorkLock> {
   const ttlMs = options.ttlMs ?? DEFAULT_LOCK_TTL_MS;
+  const writePayload =
+    options.writePayload ?? ((handle, payload) => handle.writeFile(payload, "utf8"));
   await mkdir(options.directory, { recursive: true });
   const lockPath = path.join(options.directory, LOCK_FILE_NAME);
-  const payload = `${JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() })}\n`;
+  const token = randomUUID();
+  const payload = `${JSON.stringify({
+    pid: process.pid,
+    token,
+    acquired_at: new Date().toISOString(),
+  })}\n`;
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     let handle;
@@ -216,17 +231,28 @@ export async function acquireWorkLock(options: {
       continue;
     }
     try {
-      await handle.writeFile(payload, "utf8");
-    } finally {
+      await writePayload(handle, payload);
+    } catch (err) {
       await handle.close();
+      // Never leave the empty exclusive lock behind on a failed write.
+      await rm(lockPath, { force: true });
+      throw err;
     }
+    await handle.close();
     let released = false;
     return {
       path: lockPath,
       release: async () => {
         if (released) return;
         released = true;
-        await rm(lockPath, { force: true });
+        let owned: boolean;
+        try {
+          const raw = await readFile(lockPath, "utf8");
+          owned = (JSON.parse(raw) as { token?: string }).token === token;
+        } catch {
+          owned = false; // Vanished or unreadable: nothing of ours to remove.
+        }
+        if (owned) await rm(lockPath, { force: true });
       },
     };
   }

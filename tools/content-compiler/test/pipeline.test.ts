@@ -604,6 +604,54 @@ describe("work lock", () => {
     });
     expect(followUp.status).toBe("COMPLETED");
   });
+
+  it("release removes the lockfile only when it still holds our ownership token", async () => {
+    const lockDir = await mkdtemp(path.join(tmpdir(), "lexiloop-lock-token-"));
+    tempDirs.push(lockDir);
+    const lockPath = path.join(lockDir, "compile.lock");
+    const held = await acquireWorkLock({ directory: lockDir });
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toHaveProperty("token");
+
+    // A foreign writer replaced the lock payload after we acquired it.
+    const foreign = `${JSON.stringify({ pid: 999999, token: "not-ours" })}\n`;
+    await writeFile(lockPath, foreign, "utf8");
+
+    await held.release();
+    // Our release must not delete the foreign lock.
+    expect(await readFile(lockPath, "utf8")).toBe(foreign);
+
+    // Releasing the foreign holder's own view: a fresh acquirer is still
+    // refused while the foreign lock exists.
+    await expect(acquireWorkLock({ directory: lockDir })).rejects.toThrow(PipelineLockError);
+    await rm(lockPath, { force: true });
+  });
+
+  it("removes the just-created lock when the payload write fails", async () => {
+    const lockDir = await mkdtemp(path.join(tmpdir(), "lexiloop-lock-writefail-"));
+    tempDirs.push(lockDir);
+    await expect(
+      acquireWorkLock({
+        directory: lockDir,
+        writePayload: async () => {
+          throw new Error("disk full");
+        },
+      }),
+    ).rejects.toThrow(/disk full/);
+    // The exclusive lock was created, so the failed write must not leave an
+    // empty lock behind — the next acquisition has to succeed cleanly.
+    await expect(readdir(lockDir)).resolves.not.toContain("compile.lock");
+    const held = await acquireWorkLock({ directory: lockDir });
+    await held.release();
+  });
+
+  it("release is a no-op when the lockfile already vanished", async () => {
+    const lockDir = await mkdtemp(path.join(tmpdir(), "lexiloop-lock-gone-"));
+    tempDirs.push(lockDir);
+    const held = await acquireWorkLock({ directory: lockDir });
+    await rm(path.join(lockDir, "compile.lock"), { force: true });
+    await expect(held.release()).resolves.toBeUndefined();
+    await expect(held.release()).resolves.toBeUndefined(); // idempotent
+  });
 });
 
 // ---------------------------------------------------------------------------

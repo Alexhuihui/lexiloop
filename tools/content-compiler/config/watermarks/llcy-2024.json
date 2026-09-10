@@ -1,0 +1,33 @@
+{
+  "rule_version": 1,
+  "book_key": "llcy-2024",
+  "notes": "Candidate watermark regions for the 2024 LLRC 6500 vocabulary scan (single-page portrait rasters, origin top-left, normalized to [0,1]). Regions were calibrated from rendered preview pages 1, 8, 32 and 100: a centered top banner line, a two-line bottom-right promo block, and a bottom footer strip. Page numbers sit left of x=0.15 in the footer band and are genuine content, so they are excluded. No source/book text is stored in this file.",
+  "fill": {
+    "default_mode": "selective",
+    "inpaint_radius": 3
+  },
+  "evidence": {
+    "min_page_fraction": 0.6,
+    "min_ink_ratio": 0.002,
+    "ink_threshold": 12,
+    "luminance_split": 140,
+    "dark_text_max_ratio": 0.02
+  },
+  "regions": [
+    {
+      "kind": "rect",
+      "name": "top-banner",
+      "box": [0.2, 0.03, 0.8, 0.085]
+    },
+    {
+      "kind": "rect",
+      "name": "bottom-promo",
+      "box": [0.46, 0.76, 0.94, 0.875]
+    },
+    {
+      "kind": "rect",
+      "name": "bottom-footer",
+      "box": [0.15, 0.915, 0.88, 0.965]
+    }
+  ]
+}
