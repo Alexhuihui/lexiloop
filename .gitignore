@@ -1,0 +1,38 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Source material and private generated content
+*.pdf
+.lexiloop-private/
+artifacts/releases/
+artifacts/backups/
+
+# Temporary design and inspection artifacts
+.superpowers/
+tmp/
+
+# JavaScript / TypeScript
+node_modules/
+dist/
+.vite/
+coverage/
+playwright-report/
+test-results/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Cloudflare local state
+.wrangler/
+.dev.vars
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
