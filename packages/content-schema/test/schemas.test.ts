@@ -292,9 +292,21 @@ describe("source entities (spec 5.4/5.5 provenance)", () => {
     expect(example).toMatchObject({ origin: "exam", target_span: [4, 13] });
   });
 
-  it("rejects examples with inverted spans or unknown origins", () => {
+  it("rejects examples with empty or inverted spans or unknown origins", () => {
+    // Span semantics: half-open [start, end) and non-empty (end > start).
+    expect(() => Example.parse({ ...makeExample(), target_span: [4, 4] })).toThrow();
     expect(() => Example.parse({ ...makeExample(), target_span: [13, 4] })).toThrow();
     expect(() => Example.parse({ ...makeExample(), origin: "wikipedia" })).toThrow();
+  });
+
+  it("rejects uppercase digests and out-of-range confidences", () => {
+    expect(() =>
+      SourceBlock.parse({
+        ...makeSourceBlock(),
+        source_pdf_sha256: makeProvenance().source_pdf_sha256.toUpperCase(),
+      }),
+    ).toThrow();
+    expect(() => SourceBlock.parse({ ...makeSourceBlock(), structure_confidence: -0.1 })).toThrow();
   });
 
   it("parses a lexical relation and rejects unknown relation types", () => {
@@ -356,6 +368,11 @@ describe("agent protocol (spec 5.6)", () => {
         sourcePatch: { headword: "changed" },
         generated: {},
       }),
+    ).toThrow();
+    // Same output but fully valid apart from the injected sourcePatch key, so
+    // the rejection is attributable to strict-object key rejection alone.
+    expect(() =>
+      AgentGenerationOutput.parse({ ...makeGenerationOutput(), sourcePatch: { headword: "changed" } }),
     ).toThrow();
   });
 
@@ -450,5 +467,21 @@ describe("unit validation and release manifest (spec 5.1/5.6/5.9)", () => {
       ReleaseManifest.parse({ ...makeManifest(), files: [without(makeManifest().files[0]!, "sha256")] }),
     ).toThrow();
     expect(() => ReleaseManifest.parse({ ...makeManifest(), units: [] })).toThrow();
+  });
+
+  it("rejects manifests whose totals disagree with the declared units", () => {
+    expect(() =>
+      ReleaseManifest.parse({ ...makeManifest(), totals: { ...makeManifest().totals, words: 31 } }),
+    ).toThrow();
+    // Every total is consistent except units_blocked: the units array holds a
+    // BLOCKED unit, so only the totals invariant can be at fault here.
+    const unit = makeManifest().units[0]!;
+    expect(() =>
+      ReleaseManifest.parse({
+        ...makeManifest(),
+        units: [unit, { ...unit, unit_key: "u02", status: "BLOCKED" }],
+        totals: { ...makeManifest().totals, units: 2, units_blocked: 0, words: 60, cards: 160 },
+      }),
+    ).toThrow();
   });
 });

@@ -32,6 +32,16 @@ describe("stableKey", () => {
     expect(stableKey(baseInput)).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  it("matches the frozen golden digest for the canonical llcy-2024 word key", () => {
+    // Frozen at Task 2 (commit 1ce7d96). This pins the exact canonical JSON
+    // serialization (sorted key order, separators, escaping, NFC). Any change
+    // re-keys every content entity and silently severs user learning state,
+    // so it must fail loudly here instead.
+    expect(stableKey({ book: "llcy-2024", unit: "u01", type: "word", ordinal: 3, slug: "abandon" })).toBe(
+      "9a0f18ada558d783a3a0b13ed152bc2b0120c427c1cad75e15aa4fc0bf391e3d",
+    );
+  });
+
   it("normalizes Unicode: NFC and NFD slugs collide", () => {
     const nfc = "caf\u00e9"; // U+00E9 precomposed
     const nfd = "cafe\u0301"; // e + U+0301 combining acute

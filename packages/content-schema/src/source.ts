@@ -153,7 +153,7 @@ export const Phrase = z.strictObject({
 
 export const ExampleOrigin = z.enum(["exam", "textbook"]);
 
-/** Half-open character span [start, end) of the target word inside the sentence. */
+/** Half-open, non-empty character span [start, end) with end > start. */
 export const TargetSpan = z
   .tuple([z.number().int().min(0), z.number().int().min(0)])
   .superRefine(([start, end], ctx) => {

@@ -141,4 +141,25 @@ export const ReleaseManifest = z.strictObject({
   }),
   files: z.array(ManifestFile).min(1),
   gates: z.array(GateResult).min(1),
+}).superRefine((manifest, ctx) => {
+  // Totals must agree with the declared units so a manifest can never claim
+  // scope that contradicts its own unit list (spec 5.6/17: no partial units).
+  const passed = manifest.units.filter((unit) => unit.status === "PASSED").length;
+  const blocked = manifest.units.filter((unit) => unit.status === "BLOCKED").length;
+  const sumOf = (key: "words" | "cards"): number =>
+    manifest.units.reduce((acc, unit) => acc + unit.counts[key], 0);
+  const expectTotal = (key: "units" | "units_passed" | "units_blocked" | "words" | "cards", expected: number): void => {
+    if (manifest.totals[key] !== expected) {
+      ctx.addIssue({
+        code: "custom",
+        message: `totals.${key} (${manifest.totals[key]}) must equal ${expected} derived from the units array`,
+        path: ["totals", key],
+      });
+    }
+  };
+  expectTotal("units", manifest.units.length);
+  expectTotal("units_passed", passed);
+  expectTotal("units_blocked", blocked);
+  expectTotal("words", sumOf("words"));
+  expectTotal("cards", sumOf("cards"));
 });
