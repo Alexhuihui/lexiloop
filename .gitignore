@@ -11,6 +11,7 @@ artifacts/backups/
 
 # Temporary design and inspection artifacts
 .superpowers/
+.worktrees/
 tmp/
 
 # JavaScript / TypeScript
@@ -35,4 +36,3 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
-
