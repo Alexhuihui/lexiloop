@@ -45,6 +45,12 @@ def fixture_pdf_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def render_fallback_pdf_path() -> Path:
+    """4-page fixture hitting every embedded-extraction bail-out."""
+    return make_fixture.build_render_fallback_fixture()
+
+
+@pytest.fixture(scope="session")
 def extracted(fixture_pdf_path: Path, tmp_path_factory: pytest.TempPathFactory) -> dict:
     """Extract both fixture pages once; expose records and page images."""
     out_dir = tmp_path_factory.mktemp("extracted")

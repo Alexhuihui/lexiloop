@@ -21,6 +21,7 @@ from lexiloop_media.watermarks import (
     PolygonRegion,
     RectRegion,
     WatermarkRule,
+    active_regions_for,
     assert_change_confined,
     build_mask,
     changed_pixels_outside,
@@ -160,8 +161,12 @@ def test_unconfirmed_regions_mean_no_changes(scan_page, rule) -> None:
     )
     # The watermark is missing on the second page, so with a unanimity
     # threshold no region is confirmed and nothing may change at all.
+    confirmed = confirm_regions([(1, scan_page), (2, blank)], vetoed)
     cleaned, mask = clean_watermarks(
-        scan_page, vetoed, evidence_pages=[(1, scan_page), (2, blank)], page_number=1
+        scan_page,
+        vetoed,
+        active_regions=active_regions_for(confirmed, vetoed, 1),
+        page_number=1,
     )
     assert not mask.any()
     assert np.array_equal(cleaned, scan_page)

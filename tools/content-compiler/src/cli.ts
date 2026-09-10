@@ -16,11 +16,14 @@ import { pathToFileURL } from "node:url";
 import { createFileLedger, ledgerDirectory, type LedgerStore } from "./ledger";
 import {
   createPythonRunner,
+  extractSpawnArgs,
+  cleanSpawnArgs,
+  validateCleanArtifacts,
+  validateExtractArtifacts,
   fileExists,
   readJsonl,
   sha256File,
   workDirectory,
-  CleanRecordSchema,
   DEFAULT_RULE_PATH,
   MediaOutputInvalidError,
   MediaSpawnError,
@@ -309,42 +312,10 @@ async function executeMediaExtract(
       dpi: options.dpi ? Number.parseInt(options.dpi, 10) : 300,
     });
     await withWorkLock(deps, workDir, async () => {
-      await runPython([
-        "extract",
-        "--source", mediaConfig.sourcePath,
-        "--pages", mediaConfig.pages.join(","),
-        "--out-dir", workDir,
-        "--dpi", String(mediaConfig.dpi),
-      ]);
+      await runPython(extractSpawnArgs(mediaConfig, workDir));
       // Validate the JSONL artifact on disk before advancing the ledger.
-      const pagesJsonlPath = path.join(workDir, "pages.jsonl");
-      const records = await readJsonl(pagesJsonlPath, PageRecordSchema);
-      if (records.length !== mediaConfig.pages.length) {
-        throw new MediaOutputInvalidError(
-          pagesJsonlPath,
-          `expected ${mediaConfig.pages.length} record(s), got ${records.length}`,
-        );
-      }
+      const records = await validateExtractArtifacts(workDir, sourceHash, mediaConfig.pages);
       for (const record of records) {
-        if (record.source_sha256 !== sourceHash) {
-          throw new MediaOutputInvalidError(
-            pagesJsonlPath,
-            `page ${record.page}: source hash mismatch`,
-          );
-        }
-        const imagePath = path.join(workDir, record.image_path);
-        if (!(await fileExists(imagePath))) {
-          throw new MediaOutputInvalidError(
-            pagesJsonlPath,
-            `page ${record.page}: image file missing: ${record.image_path}`,
-          );
-        }
-        if ((await sha256File(imagePath)) !== record.image_sha256) {
-          throw new MediaOutputInvalidError(
-            pagesJsonlPath,
-            `page ${record.page}: image hash mismatch`,
-          );
-        }
         deps.writeLine(
           `page ${record.page} ${record.method} ${record.width_px}x${record.height_px} ` +
             `${record.image_sha256.slice(0, 12)}`,
@@ -353,6 +324,7 @@ async function executeMediaExtract(
       await recordMediaStage(deps, {
         stage: createImageExtractStage({
           privateRoot: path.resolve(options.privateRoot ?? path.join(deps.workRoot, "..")),
+          runPython,
         }),
         sourceHash,
         mediaConfig,
@@ -368,7 +340,7 @@ async function executeMediaExtract(
           })),
         },
       });
-      deps.writeLine(`media extract OK (${records.length} page(s)) -> ${pagesJsonlPath}`);
+      deps.writeLine(`media extract OK (${records.length} page(s)) -> ${path.join(workDir, "pages.jsonl")}`);
     });
   } catch (err) {
     mediaFailure(deps, "extract", err);
@@ -387,35 +359,19 @@ async function executeMediaClean(
     const rule = options.rule ?? DEFAULT_RULE_PATH;
     const rulePath = path.isAbsolute(rule) ? rule : path.join(REPO_ROOT, rule);
     await withWorkLock(deps, workDir, async () => {
-      await runPython([
-        "clean",
-        "--pages-jsonl", path.join(workDir, "pages.jsonl"),
-        "--rule", rulePath,
-        "--out-dir", workDir,
-      ]);
+      await runPython(cleanSpawnArgs(rulePath, workDir));
+      // Expected pages come from the upstream extract artifact.
+      const extractRecords = await readJsonl(
+        path.join(workDir, "pages.jsonl"),
+        PageRecordSchema,
+      );
       // Validate the JSONL artifact on disk before advancing the ledger.
-      const cleanJsonlPath = path.join(workDir, "clean.jsonl");
-      const records = await readJsonl(cleanJsonlPath, CleanRecordSchema);
+      const records = await validateCleanArtifacts(
+        workDir,
+        sourceHash,
+        extractRecords.map((record) => record.page),
+      );
       for (const record of records) {
-        if (record.source_sha256 !== sourceHash) {
-          throw new MediaOutputInvalidError(
-            cleanJsonlPath,
-            `page ${record.page}: source hash mismatch`,
-          );
-        }
-        const cleanedPath = path.join(workDir, record.cleaned_image_path);
-        if (!(await fileExists(cleanedPath))) {
-          throw new MediaOutputInvalidError(
-            cleanJsonlPath,
-            `page ${record.page}: cleaned image missing: ${record.cleaned_image_path}`,
-          );
-        }
-        if ((await sha256File(cleanedPath)) !== record.cleaned_image_sha256) {
-          throw new MediaOutputInvalidError(
-            cleanJsonlPath,
-            `page ${record.page}: cleaned image hash mismatch`,
-          );
-        }
         deps.writeLine(
           `page ${record.page} cleaned regions=[${record.region_names.join(",")}] ` +
             `changed=${record.changed_pixels} mask_bounds=[${(record.mask_bounds ?? []).map((v) => v.toFixed(3)).join(",")}]` +
@@ -433,6 +389,7 @@ async function executeMediaClean(
         stage: createWatermarkCleanStage({
           privateRoot: path.resolve(options.privateRoot ?? path.join(deps.workRoot, "..")),
           rulePath,
+          runPython,
         }),
         sourceHash,
         // Matches pipeline config when --source is provided; with only a
@@ -457,7 +414,7 @@ async function executeMediaClean(
           body_overlap_pages: overlapPages,
         },
       });
-      deps.writeLine(`media clean OK (${records.length} page(s)) -> ${cleanJsonlPath}`);
+      deps.writeLine(`media clean OK (${records.length} page(s)) -> ${path.join(workDir, "clean.jsonl")}`);
     });
   } catch (err) {
     mediaFailure(deps, "clean", err);
@@ -477,12 +434,14 @@ async function executeMediaQaPackets(
     if (options.pages) {
       args.push("--pages", parsePageList(options.pages).join(","));
     }
-    await runPython(args);
-    const packets = await readJsonl(path.join(qaDir, "packets.jsonl"), QaPacketSchema);
-    for (const packet of packets) {
-      deps.writeLine(`qa packet page ${packet.page} -> ${packet.packet_json}`);
-    }
-    deps.writeLine(`media qa-packets OK (${packets.length} packet(s)) -> ${qaDir}`);
+    await withWorkLock(deps, workDir, async () => {
+      await runPython(args);
+      const packets = await readJsonl(path.join(qaDir, "packets.jsonl"), QaPacketSchema);
+      for (const packet of packets) {
+        deps.writeLine(`qa packet page ${packet.page} -> ${packet.packet_json}`);
+      }
+      deps.writeLine(`media qa-packets OK (${packets.length} packet(s)) -> ${qaDir}`);
+    });
   } catch (err) {
     mediaFailure(deps, "qa-packets", err);
   }

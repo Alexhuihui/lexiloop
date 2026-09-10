@@ -143,6 +143,30 @@ class WatermarkRule(pydantic.BaseModel):
     regions: Annotated[list[Region], pydantic.Field(min_length=1)]
 
 
+class CleanRecord(pydantic.BaseModel):
+    """One line of ``clean.jsonl`` (paths relative to its own directory).
+
+    Mirrored by the TypeScript ``CleanRecordSchema``; the per-page
+    ``changed_pixels_outside`` value is always 0 (the cleaner fails closed
+    otherwise, so a non-zero value can never be recorded).
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    source_sha256: str = pydantic.Field(pattern=r"^[0-9a-f]{64}$")
+    page: int = pydantic.Field(ge=1)
+    rule_version: int = pydantic.Field(ge=1)
+    original_image_path: str = pydantic.Field(min_length=1)
+    original_image_sha256: str = pydantic.Field(pattern=r"^[0-9a-f]{64}$")
+    cleaned_image_path: str = pydantic.Field(min_length=1)
+    mask_bounds: tuple[UnitFloat, UnitFloat, UnitFloat, UnitFloat] | None = None
+    region_names: list[str]
+    changed_pixels: int = pydantic.Field(ge=0)
+    changed_pixels_outside: Literal[0]
+    body_overlap_detected: bool
+    cleaned_image_sha256: str = pydantic.Field(pattern=r"^[0-9a-f]{64}$")
+
+
 def load_rule(path: str | Path) -> WatermarkRule:
     """Load and schema-validate a versioned watermark rule file."""
     rule_path = Path(path)
@@ -228,28 +252,50 @@ def _ink_ratio(image: np.ndarray, region_mask: np.ndarray, evidence: EvidenceCon
     return float(np.count_nonzero(ink)) / region_pixels
 
 
+def region_has_ink(
+    image: np.ndarray,
+    region: RectRegion | PolygonRegion,
+    evidence: EvidenceConfig,
+) -> bool:
+    """Whether one page shows watermark-strength ink inside one region."""
+    region_mask = build_mask(image.shape[:2], [region])
+    return _ink_ratio(image, region_mask, evidence) >= evidence.min_ink_ratio
+
+
 def confirm_regions(
     evidence_pages: Sequence[tuple[int | None, np.ndarray]],
     rule: WatermarkRule,
 ) -> dict[str, bool]:
     """Cross-page evidence per region: ink present on >= min_page_fraction
     of the pages the region applies to (per its ``page_selector``)."""
-    evidence = rule.evidence
     confirmed: dict[str, bool] = {}
     for region in rule.regions:
         matched = [
-            image for page_number, image in evidence_pages if region.page_selector.matches(page_number)
+            image
+            for page_number, image in evidence_pages
+            if region.page_selector.matches(page_number)
         ]
         if not matched:
             confirmed[region.name] = False
             continue
-        pages_with_ink = 0
-        for image in matched:
-            region_mask = build_mask(image.shape[:2], [region])
-            if _ink_ratio(image, region_mask, evidence) >= evidence.min_ink_ratio:
-                pages_with_ink += 1
-        confirmed[region.name] = (pages_with_ink / len(matched)) >= evidence.min_page_fraction
+        pages_with_ink = sum(
+            1 for image in matched if region_has_ink(image, region, rule.evidence)
+        )
+        confirmed[region.name] = (pages_with_ink / len(matched)) >= rule.evidence.min_page_fraction
     return confirmed
+
+
+def active_regions_for(
+    confirmed: dict[str, bool],
+    rule: WatermarkRule,
+    page_number: int | None,
+) -> list[RectRegion | PolygonRegion]:
+    """Confirmed regions whose page selector matches ``page_number``."""
+    return [
+        region
+        for region in rule.regions
+        if confirmed.get(region.name, False) and region.page_selector.matches(page_number)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -341,26 +387,24 @@ def _fill_region(
 def clean_watermarks(
     image: np.ndarray,
     rule: WatermarkRule,
-    evidence_pages: Sequence[tuple[int | None, np.ndarray]] | None = None,
+    active_regions: Sequence[RectRegion | PolygonRegion] | None = None,
     page_number: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clean one page image; return ``(cleaned, mask)``.
 
-    ``evidence_pages`` is the pool of ``(page_number, image)`` pairs used for
-    cross-page confirmation (defaults to just this page). Only regions whose
+    ``active_regions`` are the precomputed, confirmed regions for this page
+    (``active_regions_for``); callers that stream large runs hoist the
+    cross-page confirmation and pass the result here. When omitted, regions
+    are confirmed against this page alone. Only regions whose
     ``page_selector`` matches ``page_number`` enter the mask, exclusion holes
     are subtracted, and only masked pixels are ever modified.
     """
-    pool = list(evidence_pages) if evidence_pages else [(page_number, image)]
-    confirmed = confirm_regions(pool, rule)
-    active = [
-        region
-        for region in rule.regions
-        if confirmed[region.name] and region.page_selector.matches(page_number)
-    ]
-    mask = build_mask(image.shape[:2], active, page_number)
+    if active_regions is None:
+        confirmed = confirm_regions([(page_number, image)], rule)
+        active_regions = active_regions_for(confirmed, rule, page_number)
+    mask = build_mask(image.shape[:2], active_regions, page_number)
     cleaned = image.copy()
-    for region in active:
+    for region in active_regions:
         region_mask = build_mask(image.shape[:2], [region], page_number)
         mode = region.fill_mode or rule.fill.default_mode
         _fill_region(cleaned, image, region_mask, mode, rule)

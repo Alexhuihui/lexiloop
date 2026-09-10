@@ -89,7 +89,11 @@ export function createPythonRunner(options: PythonRunnerOptions = {}): SpawnPyth
     return await new Promise<{ stdout: string }>((resolvePromise, rejectPromise) => {
       let stdout = "";
       let stderr = "";
-      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
       child.stdout.on("data", (chunk: Buffer) => {
         stdout += chunk.toString("utf8");
       });
@@ -109,19 +113,44 @@ export function createPythonRunner(options: PythonRunnerOptions = {}): SpawnPyth
       });
       child.on("close", (code) => {
         clearTimeout(timer);
+        if (timedOut) {
+          rejectPromise(
+            new MediaSpawnError(
+              "MEDIA_TIMEOUT",
+              `lexiloop_media ${args[0] ?? "?"} timed out after ${timeoutMs}ms`,
+              code,
+              stderr,
+            ),
+          );
+          return;
+        }
         if (code === 0) {
           resolvePromise({ stdout });
           return;
         }
-        const tail = stderr.trim().split("\n").slice(-4).join("\n");
-        rejectPromise(
-          new MediaSpawnError(
-            "MEDIA_WORKER_FAILED",
-            `lexiloop_media ${args[0] ?? "?"} exited with code ${code}\n${tail}`,
-            code,
-            stderr,
-          ),
-        );
+        // The worker reports machine-readable errors as single-line JSON on
+        // stderr: surface its stable error code instead of burying it in a
+        // message tail.
+        let errorCode = "MEDIA_WORKER_FAILED";
+        let errorMessage = "";
+        const stderrLines = stderr.trim().split("\n").filter((line) => line.length > 0);
+        for (let index = stderrLines.length - 1; index >= 0; index -= 1) {
+          try {
+            const parsed = JSON.parse(stderrLines[index]!) as { error?: unknown; message?: unknown };
+            if (typeof parsed.error === "string" && parsed.error.length > 0) {
+              errorCode = parsed.error;
+              errorMessage = typeof parsed.message === "string" ? parsed.message : "";
+              break;
+            }
+          } catch {
+            // not a JSON line; keep scanning backwards
+          }
+        }
+        if (!errorMessage) {
+          errorMessage = `lexiloop_media ${args[0] ?? "?"} exited with code ${code}\n` +
+            stderrLines.slice(-4).join("\n");
+        }
+        rejectPromise(new MediaSpawnError(errorCode, errorMessage, code, stderr));
       });
     });
   };
@@ -296,7 +325,16 @@ export async function readJsonl<Schema extends z.ZodType>(
   path: string,
   schema: Schema,
 ): Promise<z.output<Schema>[]> {
-  return parseJsonl(path, await readFile(path, "utf8"), schema);
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new MediaOutputInvalidError(path, "file not found");
+    }
+    throw err;
+  }
+  return parseJsonl(path, text, schema);
 }
 
 /** Streaming SHA-256 of a file (hex). */
@@ -326,4 +364,129 @@ export function workDirectory(privateRoot: string, sourceHash: string): string {
     throw new Error(`Invalid source hash ${JSON.stringify(sourceHash)}`);
   }
   return join(resolve(privateRoot), "work", sourceHash);
+}
+
+// ---------------------------------------------------------------------------
+// Shared spawn arguments + artifact validation (used by CLI and stages)
+// ---------------------------------------------------------------------------
+
+/** Argument array for `lexiloop_media extract` on a per-source work dir. */
+export function extractSpawnArgs(media: MediaStageConfig, workDir: string): string[] {
+  return [
+    "extract",
+    "--source", resolve(media.sourcePath),
+    "--pages", media.pages.join(","),
+    "--out-dir", workDir,
+    "--dpi", String(media.dpi),
+  ];
+}
+
+/** Argument array for `lexiloop_media clean` on a per-source work dir. */
+export function cleanSpawnArgs(rulePath: string, workDir: string): string[] {
+  return [
+    "clean",
+    "--pages-jsonl", join(workDir, "pages.jsonl"),
+    "--rule", resolve(rulePath),
+    "--out-dir", workDir,
+  ];
+}
+
+function assertSortedPagesMatch(
+  artifactPath: string,
+  actual: number[],
+  expected: readonly number[],
+): void {
+  const sortedActual = [...actual].sort((a, b) => a - b);
+  const sortedExpected = [...expected].sort((a, b) => a - b);
+  if (
+    sortedActual.length !== sortedExpected.length ||
+    sortedActual.some((page, index) => page !== sortedExpected[index])
+  ) {
+    throw new MediaOutputInvalidError(
+      artifactPath,
+      `expected page(s) [${sortedExpected.join(",")}], got [${sortedActual.join(",")}]`,
+    );
+  }
+}
+
+/**
+ * Validate `pages.jsonl` and every referenced image against the request:
+ * schema, page set/order-free membership, source hash, file existence, and
+ * image hashes. Throws `MediaOutputInvalidError` on any mismatch.
+ */
+export async function validateExtractArtifacts(
+  workDir: string,
+  sourceHash: string,
+  expectedPages: readonly number[],
+): Promise<PageRecord[]> {
+  const pagesJsonlPath = join(workDir, "pages.jsonl");
+  const records = await readJsonl(pagesJsonlPath, PageRecordSchema);
+  assertSortedPagesMatch(
+    pagesJsonlPath,
+    records.map((record) => record.page),
+    expectedPages,
+  );
+  for (const record of records) {
+    if (record.source_sha256 !== sourceHash) {
+      throw new MediaOutputInvalidError(
+        pagesJsonlPath,
+        `page ${record.page}: source hash mismatch`,
+      );
+    }
+    const imagePath = join(workDir, record.image_path);
+    if (!(await fileExists(imagePath))) {
+      throw new MediaOutputInvalidError(
+        pagesJsonlPath,
+        `page ${record.page}: image file missing: ${record.image_path}`,
+      );
+    }
+    if ((await sha256File(imagePath)) !== record.image_sha256) {
+      throw new MediaOutputInvalidError(
+        pagesJsonlPath,
+        `page ${record.page}: image hash mismatch`,
+      );
+    }
+  }
+  return records;
+}
+
+/**
+ * Validate `clean.jsonl` and every cleaned image: schema (including
+ * `changed_pixels_outside == 0`), page set, source hash, file existence,
+ * and cleaned image hashes. Throws `MediaOutputInvalidError`.
+ */
+export async function validateCleanArtifacts(
+  workDir: string,
+  sourceHash: string,
+  expectedPages: readonly number[],
+): Promise<CleanRecord[]> {
+  const cleanJsonlPath = join(workDir, "clean.jsonl");
+  const records = await readJsonl(cleanJsonlPath, CleanRecordSchema);
+  assertSortedPagesMatch(
+    cleanJsonlPath,
+    records.map((record) => record.page),
+    expectedPages,
+  );
+  for (const record of records) {
+    if (record.source_sha256 !== sourceHash) {
+      throw new MediaOutputInvalidError(
+        cleanJsonlPath,
+        `page ${record.page}: source hash mismatch`,
+      );
+    }
+    const cleanedPath = join(workDir, record.cleaned_image_path);
+    if (!(await fileExists(cleanedPath))) {
+      throw new MediaOutputInvalidError(
+        cleanJsonlPath,
+        `page ${record.page}: cleaned image missing: ${record.cleaned_image_path}`,
+      );
+    }
+    if ((await sha256File(cleanedPath)) !== record.cleaned_image_sha256) {
+      throw new MediaOutputInvalidError(
+        cleanJsonlPath,
+        `page ${record.page}: cleaned image hash mismatch`,
+      );
+    }
+  }
+  return records;
 }

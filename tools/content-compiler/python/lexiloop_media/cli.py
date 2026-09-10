@@ -153,21 +153,39 @@ def cmd_clean(args: argparse.Namespace) -> None:
     if not extract_records:
         _fail("PAGES_JSONL_EMPTY", f"no page records in {pages_jsonl}")
 
-    originals: dict[int, np.ndarray] = {}
+    # Pass 1 — streaming cross-page evidence: hold one page in memory at a
+    # time and accumulate per-region ink counts, so a full 440-page run never
+    # materializes the whole page-image pool. This matches
+    # watermarks.confirm_regions exactly (same helper, same thresholds).
+    matched = {region.name: 0 for region in rule.regions}
+    with_ink = {region.name: 0 for region in rule.regions}
     for record in extract_records:
-        originals[record.page] = _imread(base_dir / record.image_path)
+        image = _imread(base_dir / record.image_path)
+        for region in rule.regions:
+            if not region.page_selector.matches(record.page):
+                continue
+            matched[region.name] += 1
+            if watermarks.region_has_ink(image, region, rule.evidence):
+                with_ink[region.name] += 1
+        del image
+    confirmed = {
+        name: matched[name] > 0
+        and (with_ink[name] / matched[name]) >= rule.evidence.min_page_fraction
+        for name in matched
+    }
 
     out_dir = Path(args.out_dir)
-    evidence_pages = [(record.page, originals[record.page]) for record in extract_records]
-    confirmed = watermarks.confirm_regions(evidence_pages, rule)
-
     clean_dir = out_dir / "pages-clean"
+
+    # Pass 2 — clean page by page with only the current page in memory; the
+    # cross-page confirmation is computed once and reused for every page.
     clean_rows: list[dict[str, Any]] = []
     overlap_pages: list[int] = []
     for record in extract_records:
-        original = originals[record.page]
+        original = _imread(base_dir / record.image_path)
+        active = watermarks.active_regions_for(confirmed, rule, record.page)
         cleaned, mask = watermarks.clean_watermarks(
-            original, rule, evidence_pages=evidence_pages, page_number=record.page
+            original, rule, active_regions=active, page_number=record.page
         )
         outside = watermarks.changed_pixels_outside(original, cleaned, mask)
         if outside != 0:
@@ -178,34 +196,25 @@ def cmd_clean(args: argparse.Namespace) -> None:
         overlap = watermarks.detect_body_overlap(original, mask, rule.evidence)
         if overlap:
             overlap_pages.append(record.page)
-        active = [
-            region.name
-            for region in rule.regions
-            if confirmed[region.name] and region.page_selector.matches(record.page)
-        ]
         cleaned_rel = f"pages-clean/page-{record.page:04d}.cleaned.png"
-        changed = int(
-            np.count_nonzero(np.any(original != cleaned, axis=2))
-        )
-        clean_rows.append(
-            {
-                "source_sha256": record.source_sha256,
-                "page": record.page,
-                "rule_version": rule.rule_version,
-                "original_image_path": record.image_path,
-                "original_image_sha256": record.image_sha256,
-                "cleaned_image_path": cleaned_rel,
-                "mask_bounds": list(watermarks.mask_bounds(mask)) if mask.any() else None,
-                "region_names": active,
-                "changed_pixels": changed,
-                "changed_pixels_outside": outside,
-                "body_overlap_detected": overlap,
-            }
-        )
+        changed = int(np.count_nonzero(np.any(original != cleaned, axis=2)))
         _imwrite(out_dir / cleaned_rel, cleaned)
-
-    for row in clean_rows:
-        row["cleaned_image_sha256"] = pdf_images.sha256_file(out_dir / str(row["cleaned_image_path"]))
+        row = watermarks.CleanRecord(
+            source_sha256=record.source_sha256,
+            page=record.page,
+            rule_version=rule.rule_version,
+            original_image_path=record.image_path,
+            original_image_sha256=record.image_sha256,
+            cleaned_image_path=cleaned_rel,
+            mask_bounds=list(watermarks.mask_bounds(mask)) if mask.any() else None,
+            region_names=[region.name for region in active],
+            changed_pixels=changed,
+            changed_pixels_outside=outside,
+            body_overlap_detected=overlap,
+            cleaned_image_sha256=pdf_images.sha256_file(out_dir / cleaned_rel),
+        ).model_dump()
+        clean_rows.append(row)
+        del original, cleaned
 
     pdf_images.write_jsonl(out_dir / "clean.jsonl", clean_rows)
     _emit(
@@ -292,6 +301,13 @@ def cmd_qa_packets(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def cmd_selftest_sleep(args: argparse.Namespace) -> None:
+    """Bridge liveness/timeout probe: emits nothing, sleeps, exits 0."""
+    import time
+
+    time.sleep(args.seconds)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lexiloop_media",
@@ -319,6 +335,13 @@ def build_parser() -> argparse.ArgumentParser:
     qa.add_argument("--pages", default="", help="optional comma-separated page filter")
     qa.add_argument("--out-dir", required=True, help="QA packet output directory")
     qa.set_defaults(func=cmd_qa_packets)
+
+    sleep = sub.add_parser(
+        "selftest-sleep",
+        help="bridge test hook: sleep for --seconds then exit 0 (timeout probes)",
+    )
+    sleep.add_argument("--seconds", type=float, default=1.0)
+    sleep.set_defaults(func=cmd_selftest_sleep)
 
     return parser
 

@@ -12,12 +12,14 @@ import { hashJson, hashString, StageError, type AnyStage, type StageRunContext }
 import {
   DEFAULT_RULE_PATH,
   MediaOutputInvalidError,
+  MediaSpawnError,
   MediaStageConfigSchema,
-  PageRecordSchema,
-  CleanRecordSchema,
-  fileExists,
-  readJsonl,
+  cleanSpawnArgs,
+  createPythonRunner,
+  extractSpawnArgs,
   sha256File,
+  validateCleanArtifacts,
+  validateExtractArtifacts,
   type SpawnPythonFn,
 } from "./media";
 import path from "node:path";
@@ -136,10 +138,26 @@ export interface MediaStageOptions {
    * `<private-root>/work/<source-hash>/` and stay out of git.
    */
   privateRoot: string;
-  /** Python runner; injectable for tests (argument-array spawn in prod). */
-  runPython?: SpawnPythonFn;
+  /**
+   * Python runner (argument-array spawn). REQUIRED so a media stage can
+   * never silently "pass" by validating stale artifacts without actually
+   * running the worker; production wiring resolves a real runner via
+   * `resolveMediaStageOptions`, tests inject stubs.
+   */
+  runPython: SpawnPythonFn;
   /** Watermark rule for WATERMARK_CLEAN. */
   rulePath?: string;
+}
+
+/** Fill defaults for optional media wiring; the runner is never optional. */
+export function resolveMediaStageOptions(
+  options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string } = {},
+): MediaStageOptions {
+  return {
+    privateRoot: options.privateRoot ?? DEFAULT_PRIVATE_ROOT,
+    runPython: options.runPython ?? createPythonRunner(),
+    ...(options.rulePath !== undefined ? { rulePath: options.rulePath } : {}),
+  };
 }
 
 function mediaConfig(ctx: StageRunContext): { sourcePath: string; pages: number[]; dpi: number } {
@@ -165,11 +183,10 @@ function toSpawnError(err: unknown): StageError {
   if (err instanceof MediaOutputInvalidError) {
     return new StageError("MEDIA_OUTPUT_INVALID", err.message);
   }
-  if (err instanceof Error && err.name === "MediaSpawnError") {
-    return new StageError(
-      "MEDIA_WORKER_FAILED",
-      err.message,
-    );
+  // MediaSpawnError carries the worker's stable error code (parsed from the
+  // worker's JSON stderr line, e.g. RULE_NOT_FOUND, MEDIA_TIMEOUT).
+  if (err instanceof MediaSpawnError) {
+    return new StageError(err.code, err.message);
   }
   const message = err instanceof Error ? err.message : String(err);
   return new StageError("STAGE_UNEXPECTED_ERROR", message);
@@ -182,7 +199,7 @@ function toSpawnError(err: unknown): StageError {
  * the pipeline may advance.
  */
 export function createImageExtractStage(options: MediaStageOptions): AnyStage {
-  const runPython = options.runPython;
+  const { runPython } = options;
   const configVersion = "1";
   return {
     name: "IMAGE_EXTRACT",
@@ -201,51 +218,18 @@ export function createImageExtractStage(options: MediaStageOptions): AnyStage {
       try {
         const media = mediaConfig(ctx);
         const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
-        if (runPython) {
-          await runPython([
-            "extract",
-            "--source", path.resolve(media.sourcePath),
-            "--pages", media.pages.join(","),
-            "--out-dir", workDir,
-            "--dpi", String(media.dpi),
-          ]);
-        }
-        const pagesJsonlPath = path.join(workDir, "pages.jsonl");
-        const records = await readJsonl(pagesJsonlPath, PageRecordSchema);
-        const summary = [];
-        for (const record of records) {
-          const imagePath = path.join(workDir, record.image_path);
-          if (!(await fileExists(imagePath))) {
-            throw new MediaOutputInvalidError(
-              pagesJsonlPath,
-              `page ${record.page}: image file missing: ${record.image_path}`,
-            );
-          }
-          const actualSha = await sha256File(imagePath);
-          if (actualSha !== record.image_sha256) {
-            throw new MediaOutputInvalidError(
-              pagesJsonlPath,
-              `page ${record.page}: image hash mismatch (${record.image_path})`,
-            );
-          }
-          summary.push({
+        await runPython(extractSpawnArgs(media, workDir));
+        const records = await validateExtractArtifacts(workDir, ctx.sourceHash, media.pages);
+        return {
+          source_sha256: ctx.sourceHash,
+          pages_jsonl: "pages.jsonl",
+          pages: records.map((record) => ({
             page: record.page,
             method: record.method,
             width_px: record.width_px,
             height_px: record.height_px,
             image_sha256: record.image_sha256,
-          });
-        }
-        if (new Set(summary.map((p) => p.page)).size !== media.pages.length) {
-          throw new MediaOutputInvalidError(
-            pagesJsonlPath,
-            `expected ${media.pages.length} page(s), got ${summary.length}`,
-          );
-        }
-        return {
-          source_sha256: ctx.sourceHash,
-          pages_jsonl: "pages.jsonl",
-          pages: summary,
+          })),
         } satisfies ImageExtractOutput;
       } catch (err) {
         throw toSpawnError(err);
@@ -262,7 +246,7 @@ export function createImageExtractStage(options: MediaStageOptions): AnyStage {
  * reported in `body_overlap_pages` for the agent repair loop (spec 5.3).
  */
 export function createWatermarkCleanStage(options: MediaStageOptions): AnyStage {
-  const runPython = options.runPython;
+  const { runPython } = options;
   const rulePath = options.rulePath ?? DEFAULT_RULE_PATH;
   const configVersion = "1";
   return {
@@ -283,60 +267,24 @@ export function createWatermarkCleanStage(options: MediaStageOptions): AnyStage 
       try {
         const media = mediaConfig(ctx);
         const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
-        if (runPython) {
-          await runPython([
-            "clean",
-            "--pages-jsonl", path.join(workDir, "pages.jsonl"),
-            "--rule", path.resolve(rulePath),
-            "--out-dir", workDir,
-          ]);
-        }
-        const cleanJsonlPath = path.join(workDir, "clean.jsonl");
-        const records = await readJsonl(cleanJsonlPath, CleanRecordSchema);
-        const pages = [];
+        await runPython(cleanSpawnArgs(rulePath, workDir));
+        const records = await validateCleanArtifacts(workDir, ctx.sourceHash, media.pages);
         const bodyOverlapPages: number[] = [];
         for (const record of records) {
-          if (record.source_sha256 !== ctx.sourceHash) {
-            throw new MediaOutputInvalidError(
-              cleanJsonlPath,
-              `page ${record.page}: source hash mismatch`,
-            );
-          }
-          const cleanedPath = path.join(workDir, record.cleaned_image_path);
-          if (!(await fileExists(cleanedPath))) {
-            throw new MediaOutputInvalidError(
-              cleanJsonlPath,
-              `page ${record.page}: cleaned image missing: ${record.cleaned_image_path}`,
-            );
-          }
-          const actualSha = await sha256File(cleanedPath);
-          if (actualSha !== record.cleaned_image_sha256) {
-            throw new MediaOutputInvalidError(
-              cleanJsonlPath,
-              `page ${record.page}: cleaned image hash mismatch`,
-            );
-          }
           if (record.body_overlap_detected) bodyOverlapPages.push(record.page);
-          pages.push({
+        }
+        return {
+          source_sha256: ctx.sourceHash,
+          rule_version: records[0]!.rule_version,
+          clean_jsonl: "clean.jsonl",
+          pages: records.map((record) => ({
             page: record.page,
             cleaned_image_sha256: record.cleaned_image_sha256,
             mask_bounds: record.mask_bounds,
             region_names: record.region_names,
             changed_pixels: record.changed_pixels,
             body_overlap_detected: record.body_overlap_detected,
-          });
-        }
-        if (pages.length !== media.pages.length) {
-          throw new MediaOutputInvalidError(
-            cleanJsonlPath,
-            `expected ${media.pages.length} cleaned page(s), got ${pages.length}`,
-          );
-        }
-        return {
-          source_sha256: ctx.sourceHash,
-          rule_version: records[0]!.rule_version,
-          clean_jsonl: "clean.jsonl",
-          pages,
+          })),
           body_overlap_pages: bodyOverlapPages,
         } satisfies WatermarkCleanOutput;
       } catch (err) {
@@ -353,11 +301,10 @@ export function createWatermarkCleanStage(options: MediaStageOptions): AnyStage 
 export function getProductionStages(
   options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string } = {},
 ): AnyStage[] {
-  const mediaOptions: MediaStageOptions = {
-    privateRoot: options.privateRoot ?? DEFAULT_PRIVATE_ROOT,
-    runPython: options.runPython,
-    rulePath: options.rulePath,
-  };
+  // resolveMediaStageOptions always provides a real argument-array runner,
+  // so production wiring can never construct media stages that would
+  // "validate" stale artifacts without spawning the worker.
+  const mediaOptions: MediaStageOptions = resolveMediaStageOptions(options);
   const mediaStages: Partial<Record<ProductionStageName, AnyStage>> = {
     IMAGE_EXTRACT: createImageExtractStage(mediaOptions),
     WATERMARK_CLEAN: createWatermarkCleanStage(mediaOptions),

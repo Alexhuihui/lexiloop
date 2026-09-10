@@ -9,9 +9,11 @@
  * CJK/space paths survive the argument-array round trip.
  */
 import { createHash } from "node:crypto";
+import { execFile as execFileCb } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { buildCli, type CliDeps } from "../src/cli";
@@ -20,10 +22,17 @@ import {
   DEFAULT_RULE_PATH,
   MediaOutputInvalidError,
   MediaSpawnError,
+  MediaStageConfigSchema,
+  REPO_ROOT,
   WatermarkRuleSchema,
+  cleanSpawnArgs,
   createPythonRunner,
+  extractSpawnArgs,
   parseJsonl,
+  readJsonl,
   sha256File,
+  validateCleanArtifacts,
+  validateExtractArtifacts,
   workDirectory,
 } from "../src/media";
 import { createFileLedger, ledgerDirectory } from "../src/ledger";
@@ -32,9 +41,12 @@ import { runPipeline } from "../src/pipeline";
 import {
   createImageExtractStage,
   createWatermarkCleanStage,
+  resolveMediaStageOptions,
 } from "../src/stage-registry";
 import type { SpawnPythonFn } from "../src/media";
 import type { AnyStage } from "../src/stage";
+
+const execFile = promisify(execFileCb);
 
 const tempDirs: string[] = [];
 
@@ -211,6 +223,81 @@ describe("media bridge", () => {
       name: "MediaSpawnError",
     });
   }, 120_000);
+
+  it("reports worker timeouts with the configured duration", async () => {
+    const runPython = createPythonRunner({ timeoutMs: 300 });
+    await expect(runPython(["selftest-sleep", "--seconds", "5"])).rejects.toMatchObject({
+      code: "MEDIA_TIMEOUT",
+      message: expect.stringContaining("timed out after 300ms"),
+    });
+  }, 30_000);
+
+  it("surfaces the worker's JSON error code from stderr instead of a generic code", async () => {
+    const dir = await makeTempDir("lexiloop-stderr-json-");
+    const runPython = createPythonRunner();
+    await expect(runPython(cleanSpawnArgs(DEFAULT_RULE_PATH, dir))).rejects.toMatchObject({
+      code: "PAGES_JSONL_NOT_FOUND",
+      name: "MediaSpawnError",
+    });
+  }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// Production wiring (spec 5.3): a media stage always has a real runner
+// ---------------------------------------------------------------------------
+
+describe("media stage wiring", () => {
+  it("resolveMediaStageOptions always provides a python runner", () => {
+    const defaults = resolveMediaStageOptions({});
+    expect(typeof defaults.runPython).toBe("function");
+    expect(defaults.privateRoot).toBe(".lexiloop-private");
+
+    const injected = resolveMediaStageOptions({
+      runPython: async () => ({ stdout: "" }),
+      privateRoot: "/tmp/priv",
+      rulePath: "/tmp/rule.json",
+    });
+    expect(injected.privateRoot).toBe("/tmp/priv");
+    expect(injected.rulePath).toBe("/tmp/rule.json");
+    // The injected stub wins over the default runner.
+    expect(typeof injected.runPython).toBe("function");
+  });
+
+  it("spawns the module for the clean round-trip of a real fixture run", async () => {
+    // Build the synthetic scan fixture (paths printed by the script).
+    const { stdout } = await execFile(
+      "uv",
+      ["run", "python", "tests/fixtures/media/make_fixture.py"],
+      { cwd: REPO_ROOT },
+    );
+    const fixturePath = stdout.trim().split("\n")[0]!.trim();
+
+    const privateRoot = await makeTempDir("lexiloop-roundtrip-");
+    const sourceHash = await sha256File(fixturePath);
+    const workDir = workDirectory(privateRoot, sourceHash);
+    const media = MediaStageConfigSchema.parse({ sourcePath: fixturePath, pages: [1, 2] });
+    const runPython = createPythonRunner();
+
+    // Real extract + clean through the exact argument builders the stages use.
+    await runPython(extractSpawnArgs(media, workDir));
+    await runPython(cleanSpawnArgs(DEFAULT_RULE_PATH, workDir));
+
+    const extractRecords = await validateExtractArtifacts(workDir, sourceHash, media.pages);
+    expect(extractRecords.map((r) => r.page)).toEqual([1, 2]);
+    const cleanRecords = await validateCleanArtifacts(
+      workDir,
+      sourceHash,
+      extractRecords.map((r) => r.page),
+    );
+    expect(cleanRecords.map((r) => r.page)).toEqual([1, 2]);
+    expect(
+      cleanRecords.every((r) => r.changed_pixels_outside === 0 && r.changed_pixels > 0),
+    ).toBe(true);
+
+    // The raw artifact parses directly against the Zod CleanRecord schema.
+    const rows = await readJsonl(path.join(workDir, "clean.jsonl"), CleanRecordSchema);
+    expect(rows).toEqual(cleanRecords);
+  }, 180_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -250,6 +337,15 @@ describe("IMAGE_EXTRACT stage", () => {
       config: mediaStageConfig(path.join("/source", AWKWARD_NAME)),
     });
     expect(rerun.results[0]).toMatchObject({ status: "SKIPPED" });
+  });
+
+  it("fails closed on duplicated page records", async () => {
+    const privateRoot = await makeTempDir("lexiloop-media-dup-");
+    const workDir = workDirectory(privateRoot, SOURCE_HASH);
+    await seedExtractArtifacts(workDir, [1, 1]); // duplicated page record
+    await expect(
+      validateExtractArtifacts(workDir, SOURCE_HASH, [1, 2]),
+    ).rejects.toMatchObject({ code: "MEDIA_OUTPUT_INVALID" });
   });
 
   it("fails closed with MEDIA_OUTPUT_INVALID when an image hash mismatches", async () => {

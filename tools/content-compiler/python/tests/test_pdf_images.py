@@ -142,6 +142,57 @@ def test_extract_rejects_duplicate_pages(fixture_pdf_path: Path, tmp_path: Path)
 
 
 # ---------------------------------------------------------------------------
+# Automatic render fallback (every embedded-extraction bail-out)
+# ---------------------------------------------------------------------------
+
+
+def test_render_fallback_rotated_page(render_fallback_pdf_path: Path, tmp_path: Path) -> None:
+    (record,) = pdf_images.extract_pages(render_fallback_pdf_path, [1], tmp_path)
+    assert record.page == 1
+    assert record.method == "rendered"
+    assert record.dpi == 300
+    assert record.ext == "png"
+    assert _sha256_file(tmp_path / record.image_path) == record.image_sha256
+
+
+def test_render_fallback_tiled_half_page_images(
+    render_fallback_pdf_path: Path, tmp_path: Path
+) -> None:
+    (record,) = pdf_images.extract_pages(render_fallback_pdf_path, [2], tmp_path)
+    assert record.page == 2
+    assert record.method == "rendered"  # two ~50% images: no >=98% dominant
+
+
+def test_render_fallback_transparent_smask_image(
+    render_fallback_pdf_path: Path, tmp_path: Path
+) -> None:
+    (record,) = pdf_images.extract_pages(render_fallback_pdf_path, [3], tmp_path)
+    assert record.page == 3
+    assert record.method == "rendered"  # image carries a soft mask
+
+
+def test_render_fallback_cmyk_colorspace(render_fallback_pdf_path: Path, tmp_path: Path) -> None:
+    (record,) = pdf_images.extract_pages(render_fallback_pdf_path, [4], tmp_path)
+    assert record.page == 4
+    assert record.method == "rendered"  # DeviceCMYK separation
+
+
+def test_render_fallback_preserves_page_count_order_and_hashes(
+    render_fallback_pdf_path: Path, tmp_path: Path
+) -> None:
+    records = pdf_images.extract_pages(render_fallback_pdf_path, [4, 3, 2, 1], tmp_path)
+    assert [record.page for record in records] == [4, 3, 2, 1]  # requested order
+    assert all(record.method == "rendered" for record in records)
+    hashes = {record.image_sha256 for record in records}
+    assert len(hashes) == 4  # distinct rasters
+    for record in records:
+        assert (tmp_path / record.image_path).is_file()
+        assert _sha256_file(tmp_path / record.image_path) == record.image_sha256
+    jsonl_rows = pdf_images.read_jsonl(tmp_path / "pages.jsonl")
+    assert [row["page"] for row in jsonl_rows] == [4, 3, 2, 1]
+
+
+# ---------------------------------------------------------------------------
 # No PDF writer anywhere (spec: never reassemble a PDF from source material)
 # ---------------------------------------------------------------------------
 
