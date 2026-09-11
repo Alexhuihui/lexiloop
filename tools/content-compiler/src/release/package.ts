@@ -53,9 +53,10 @@ import {
   SEMANTIC_QUEUE_DIR,
   WorkPacketError,
 } from "../agents/work-packets";
+import { loadQueue, VISUAL_OCR_QUEUE_DIR } from "../agents/visual-ocr";
 import { COMPILER_ROOT, DEFAULT_RULE_PATH, fileExists, MediaOutputInvalidError, readJsonl, sha256File } from "../media";
 import { DEFAULT_OCR_CONFIG_PATH } from "../ocr-adapter";
-import { hashJson, StageError, type AnyStage } from "../stage";
+import { hashJson, StageError, type AnyStage, type StageRunContext } from "../stage";
 import type { LedgerEntry } from "../ledger";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -451,6 +452,153 @@ async function collectExplanations(
   return explanations;
 }
 
+/** SHA-256 of a packaging input artifact; "missing" before a compile exists. */
+async function artifactSha(filePath: string): Promise<string> {
+  try {
+    return await sha256File(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    throw err;
+  }
+}
+
+/**
+ * Freshness gate: the recorded ledger outputs of STRUCTURE_NORMALIZE,
+ * CARD_GENERATE, and AUDIO_VALIDATE are deterministic functions of the
+ * packaged artifacts, so recomputing them from the current disk state must
+ * reproduce the stored hashes exactly. Any post-pass edit — normalized
+ * content, cards, audio manifest, or the inspection artifact — fails the
+ * release closed with RELEASE_INPUT_STALE instead of shipping unvalidated
+ * content under PASSED gates (spec 5.2: changed inputs must re-run).
+ */
+async function assertFreshArtifacts(input: {
+  ctx: StageRunContext;
+  workDir: string;
+  entries: Map<string, LedgerEntry>;
+  content: ParsedContent;
+  cards: Array<z.output<typeof CardDefinition>>;
+  audioRows: ReturnType<typeof loadAudioManifest> extends Promise<infer T> ? T : never;
+  ttsConfig: ReturnType<typeof readTtsConfig> extends Promise<infer T> ? T : never;
+  workloads: Awaited<ReturnType<typeof loadUnitWorkloads>>;
+  cardRulesVersion: string;
+}): Promise<void> {
+  const { ctx, workDir, entries, content, cards, audioRows, ttsConfig, workloads, cardRulesVersion } = input;
+
+  const assertLedgerOutput = (stage: string, reconstructed: unknown): void => {
+    const entry = entries.get(stage)!;
+    const recorded = entry.output_hash ?? "";
+    const recomputed = hashJson(reconstructed);
+    if (recomputed !== recorded) {
+      throw new StageError(
+        "RELEASE_INPUT_STALE",
+        `${stage} artifacts changed on disk after the stage passed ` +
+          `(ledger output ${recorded.slice(0, 12)} != recomputed ${recomputed.slice(0, 12)}); ` +
+          "re-run the pipeline before packaging",
+      );
+    }
+  };
+
+  // STRUCTURE_NORMALIZE: bytes + counts + per-unit page spans + corrections.
+  const firstPage = new Map<string, number>();
+  const lastPage = new Map<string, number>();
+  const unitByWord = new Map(content.words.map((word) => [word.word_key, word.unit_key]));
+  const touch = (unitKey: string | undefined, page: number): void => {
+    if (!unitKey) return;
+    const current = lastPage.get(unitKey);
+    if (current === undefined || page > current) lastPage.set(unitKey, page);
+  };
+  for (const unit of content.units) {
+    firstPage.set(unit.unit_key, unit.page_number);
+    lastPage.set(unit.unit_key, unit.page_number);
+  }
+  for (const word of content.words) touch(word.unit_key, word.page_number);
+  for (const sense of content.senses) touch(unitByWord.get(sense.word_key), sense.page_number);
+  for (const phrase of content.phrases) touch(unitByWord.get(phrase.word_key), phrase.page_number);
+  for (const example of content.examples) touch(unitByWord.get(example.word_key), example.page_number);
+  const unitBoundaries = [...content.units]
+    .sort((a, b) => a.unit_order - b.unit_order || (a.unit_key < b.unit_key ? -1 : 1))
+    .map((unit) => ({
+      unit_key: unit.unit_key,
+      unit_order: unit.unit_order,
+      title: unit.title,
+      first_page: firstPage.get(unit.unit_key)!,
+      last_page: lastPage.get(unit.unit_key)!,
+    }));
+  let resolvedPackets: number;
+  try {
+    const visualEntries = await loadQueue(path.join(workDir, VISUAL_OCR_QUEUE_DIR));
+    resolvedPackets = visualEntries.filter((entry) => entry.status === "resolved" && entry.result !== undefined).length;
+  } catch {
+    // A missing/corrupt queue after the pass counts as drift: 0 recorded
+    // corrections can never disagree with an intact no-review compile, and
+    // any recorded corrections make the reconstruction mismatch below.
+    resolvedPackets = 0;
+  }
+  assertLedgerOutput(
+    "STRUCTURE_NORMALIZE",
+    {
+      source_sha256: ctx.sourceHash,
+      normalized_jsonl: "normalized.jsonl",
+      normalized_jsonl_sha256: await artifactSha(path.join(workDir, "normalized.jsonl")),
+      counts: {
+        units: content.units.length,
+        words: content.words.length,
+        senses: content.senses.length,
+        phrases: content.phrases.length,
+        examples: content.examples.length,
+      },
+      unit_boundaries: unitBoundaries,
+      resolved_packets: resolvedPackets,
+    },
+  );
+
+  // CARD_GENERATE: cards bytes + per-unit/type counts under the same rules.
+  const cardsByType: Record<string, number> = {
+    WORD_MEANING: 0,
+    CONTEXT_MEANING: 0,
+    PHRASE: 0,
+    SENSE_DISCRIMINATION: 0,
+  };
+  const cardsByUnit = new Map<string, number>();
+  for (const card of cards) {
+    cardsByType[card.card_type] = (cardsByType[card.card_type] ?? 0) + 1;
+    cardsByUnit.set(card.unit_key, (cardsByUnit.get(card.unit_key) ?? 0) + 1);
+  }
+  const cardUnits = workloads.map((workload) => ({
+    unit_key: workload.unitKey,
+    words: workload.source.words.length,
+    cards: cardsByUnit.get(workload.unitKey) ?? 0,
+  }));
+  assertLedgerOutput(
+    "CARD_GENERATE",
+    {
+      source_sha256: ctx.sourceHash,
+      cards_jsonl: "cards.jsonl",
+      cards_jsonl_sha256: await artifactSha(path.join(workDir, "cards.jsonl")),
+      card_rules_version: cardRulesVersion,
+      counts: {
+        units: cardUnits.length,
+        words: cardUnits.reduce((acc, unit) => acc + unit.words, 0),
+        cards: cards.length,
+        by_type: cardsByType,
+      },
+      units: cardUnits,
+    },
+  );
+
+  // AUDIO_VALIDATE: the inspection artifact is the validated packaging input.
+  assertLedgerOutput(
+    "AUDIO_VALIDATE",
+    {
+      source_sha256: ctx.sourceHash,
+      audio_inspection: "audio/inspection.jsonl",
+      audio_inspection_sha256: await artifactSha(path.join(workDir, "audio", "inspection.jsonl")),
+      synthesis_config_version: ttsConfig.synthesis_config_version,
+      counts: { checked: audioRows.length, failed: 0 },
+    },
+  );
+}
+
 /**
  * RELEASE_PACKAGE. See the module doc for the bundle contract and the
  * fail-closed preconditions.
@@ -463,20 +611,33 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
   const ocrConfigPath = options.ocrConfigPath ?? DEFAULT_OCR_CONFIG_PATH;
   const privateRoot = path.resolve(options.privateRoot);
 
+  // The stage's own resume hash folds the packaged artifacts: after any work
+  // directory edit the CLI/pipeline re-runs the stage instead of skipping,
+  // and the freshness gate below refuses the stale inputs.
+  const artifactHashes = async (workDir: string): Promise<Record<string, string>> => ({
+    normalized_jsonl_sha256: await artifactSha(path.join(workDir, "normalized.jsonl")),
+    cards_jsonl_sha256: await artifactSha(path.join(workDir, "cards.jsonl")),
+    audio_manifest_sha256: await artifactSha(path.join(workDir, "audio", "manifest.jsonl")),
+    audio_inspection_sha256: await artifactSha(path.join(workDir, "audio", "inspection.jsonl")),
+  });
+
   return {
     name: RELEASE_PACKAGE_STAGE,
     configVersion,
     inputSchema: z.unknown(),
     outputSchema: ReleasePackageOutputSchema,
-    computeInputHash: (ctx) =>
-      hashJson({
+    computeInputHash: async (ctx) => {
+      const workDir = workDirectoryFor(privateRoot, ctx.sourceHash);
+      return hashJson({
         stage: RELEASE_PACKAGE_STAGE,
         configVersion,
         sourceHash: ctx.sourceHash,
         metadata: options.metadata ?? null,
         previous_release_id: options.previousReleaseId ?? null,
+        artifacts: await artifactHashes(workDir),
         upstream: ctx.upstream?.outputHash ?? null,
-      }),
+      });
+    },
     run: async (_input, ctx) => {
       // -- 1. Every one of the 13 stages must have a PASSED ledger entry.
       // (The 12 predecessors: this stage's own entry is written afterwards.)
@@ -596,6 +757,22 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
         }
       }
 
+      // -- 5b. Freshness gate: refuse a work directory edited after the ----
+      // pipeline passed (stale disk artifacts vs recorded ledger outputs).
+      const cardsVersionConfig = await readJsonConfig(cardsConfigPath, "RELEASE_CONFIG_INVALID", "card rules config");
+      const cardRulesVersion = requireStringField(cardsVersionConfig, "card_rules_version", "RELEASE_CONFIG_INVALID", "card rules config");
+      await assertFreshArtifacts({
+        ctx,
+        workDir,
+        entries,
+        content,
+        cards,
+        audioRows,
+        ttsConfig,
+        workloads,
+        cardRulesVersion,
+      });
+
       // -- 6. Release id: content-derived, deterministic, immutable. --------
       const normalizedSha = await sha256File(path.join(workDir, "normalized.jsonl"));
       const cardsSha = await sha256File(path.join(workDir, "cards.jsonl"));
@@ -674,7 +851,6 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
       const metadata = options.metadata ?? DEFAULT_RELEASE_METADATA;
       const watermarkConfig = await readJsonConfig(watermarkRulePath, "RELEASE_CONFIG_INVALID", "watermark rule");
       const ocrVersionConfig = await readJsonConfig(ocrConfigPath, "RELEASE_CONFIG_INVALID", "OCR config");
-      const cardsVersionConfig = await readJsonConfig(cardsConfigPath, "RELEASE_CONFIG_INVALID", "card rules config");
       const watermarkVersion = watermarkConfig["rule_version"];
       const ocrVersion = ocrVersionConfig["config_version"];
       if (typeof watermarkVersion !== "number" || typeof ocrVersion !== "number") {
@@ -761,7 +937,7 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
           watermark_rules_version: String(watermarkVersion),
           ocr_config_version: String(ocrVersion),
           prompt_version: metadata.prompt_version,
-          card_rules_version: requireStringField(cardsVersionConfig, "card_rules_version", "RELEASE_CONFIG_INVALID", "card rules config"),
+          card_rules_version: cardRulesVersion,
           synthesis_config_version: ttsConfig.synthesis_config_version,
         },
         model_config: {

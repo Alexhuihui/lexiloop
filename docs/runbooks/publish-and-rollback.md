@@ -40,7 +40,10 @@ pnpm compiler release verify --bundle .lexiloop-private/releases/<release-id>
 
 `release package` runs the same `RELEASE_PACKAGE` stage as the pipeline and
 therefore refuses to run unless all 13 stage ledger entries are PASSED with
-matching upstream provenance (a stale run is refused), every target Unit's
+matching upstream provenance and the packaged artifacts (normalized content,
+cards, audio manifest, inspection) still hash to the recorded ledger outputs
+(a stale or hand-edited work directory is refused with RELEASE_INPUT_STALE),
+every target Unit's
 deterministic validation report is PASSED (a BLOCKED unit can never enter a
 release), and 100% of the audio manifest's assets exist with matching hashes
 and gate results. The bundle contains exactly:
@@ -94,6 +97,11 @@ pnpm compiler release rollback --release <retired-release-id>
 
 Guarantees:
 
+- **Alias conflicts are caught at activation.** Declared edges are validated
+  against the union of already-stored migrations, so a second activation that
+  would make any key ambiguous (one-to-many/many-to-one across releases,
+  cycles, drifting canonical roots) fails with the alias rejection — never
+  post-activation.
 - **Inactive import.** `stage` never writes `app_meta`; the release is
   readable/verifiable in D1 while the previous release keeps serving.
 - **Pre-activation checks (spec 17).** `smoke` verifies release_unit totals

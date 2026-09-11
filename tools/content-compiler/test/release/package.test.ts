@@ -611,6 +611,34 @@ describe("RELEASE_PACKAGE bundle (spec 5.9)", () => {
     await expect(readdir(releasesDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("refuses a work directory edited after the pipeline passed (RELEASE_INPUT_STALE)", async () => {
+    // Normalized content edit (bytes no longer hash to the recorded output).
+    const tampered = await makeReleaseFixture();
+    const normalizedFile = path.join(tampered.workDir, "normalized.jsonl");
+    await writeFile(
+      normalizedFile,
+      (await readFile(normalizedFile, "utf8")).replace('"ocr_confidence":0.98', '"ocr_confidence":0.97'),
+      "utf8",
+    );
+    await expect(tampered.stage.run(undefined, tampered.ctx)).rejects.toMatchObject({
+      code: "RELEASE_INPUT_STALE",
+    });
+    await expect(readdir(path.join(tampered.privateRoot, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    // Cards edit (still schema-valid, but no longer what CARD_GENERATE hashed).
+    const tamperedCards = await makeReleaseFixture();
+    const cardsFile = path.join(tamperedCards.workDir, "cards.jsonl");
+    await writeFile(
+      cardsFile,
+      (await readFile(cardsFile, "utf8")).replace('"template_version":"v1"', '"template_version":"v9"'),
+      "utf8",
+    );
+    await expect(tamperedCards.stage.run(undefined, tamperedCards.ctx)).rejects.toMatchObject({
+      code: "RELEASE_INPUT_STALE",
+    });
+    await expect(readdir(path.join(tamperedCards.privateRoot, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("refuses stale packaging provenance with RELEASE_PROVENANCE_INVALID", async () => {
     const fixture = await makeReleaseFixture();
     // The upstream hash no longer matches the AUDIO_VALIDATE ledger output.
@@ -1110,6 +1138,45 @@ describe("release publish lifecycle (D1/R2)", () => {
     env.cleanup();
   });
 
+  it("rejects cross-activation alias fan-out against stored edges before importing", async () => {
+    const env = createDb();
+    await seedReadyRelease(env, "rel-2", "k2");
+    await seedReadyRelease(env, "rel-3", "k2");
+    env.sqlite
+      .prepare("INSERT INTO word (release_id, word_key, unit_key, headword, phonetic, tier, source_order, provenance_json) VALUES ('rel-3', 'k4', 'u1', 'k4', NULL, 'core', 2, '{}')")
+      .run();
+    env.sqlite
+      .prepare("INSERT INTO word (release_id, word_key, unit_key, headword, phonetic, tier, source_order, provenance_json) VALUES ('rel-3', 'k3', 'u1', 'k3', NULL, 'core', 3, '{}')")
+      .run();
+    // Stored by an earlier activation: rel-2 already renames k2 -> k3.
+    env.sqlite
+      .prepare("INSERT INTO content_key_alias (release_id, from_key, to_key, edge_type, canonical_key, created_at) VALUES ('rel-2', 'k2', 'k3', 'RENAME', 'k3', ?)")
+      .run(NOW_MS);
+    const releases = new ReleaseRepository(env.db);
+
+    // One-to-many across activations: k2 already migrates to k3.
+    const fanOut = [
+      { entity_type: "word", from_release_id: "rel-3", from_key: "k2", to_release_id: "rel-3", to_key: "k4", canonical_key: "k4" },
+    ];
+    await expect(activateRelease({ db: env.db, releaseId: "rel-3", aliases: fanOut, now: NOW_MS })).rejects.toMatchObject({
+      code: "ALIAS_ONE_TO_MANY",
+    });
+
+    // Many-to-one across activations: k3 is already a migration target.
+    const fanIn = [
+      { entity_type: "word", from_release_id: "rel-3", from_key: "k4", to_release_id: "rel-3", to_key: "k3", canonical_key: "k3" },
+    ];
+    await expect(activateRelease({ db: env.db, releaseId: "rel-3", aliases: fanIn, now: NOW_MS })).rejects.toMatchObject({
+      code: "ALIAS_MANY_TO_ONE",
+    });
+
+    // Both rejections leave the pointer, statuses, and stored aliases untouched.
+    expect((await releases.getMeta())?.activeReleaseId ?? null).toBeNull();
+    expect((await releases.getById("rel-3"))?.status).toBe("READY");
+    expect(env.sqlite.prepare("SELECT COUNT(*) AS n FROM content_key_alias").get()).toMatchObject({ n: 1 });
+    env.cleanup();
+  });
+
   it("rolls the whole batch back when an alias row violates the schema", async () => {
     const env = createDb();
     await seedReadyRelease(env, "rel-a", "w-a");
@@ -1348,6 +1415,30 @@ describe("cli: release", () => {
     expect(harness.exitCode).toBe(1);
 
     env.cleanup();
+  });
+
+  it("release package refuses a work directory edited after it packaged (CLI path)", async () => {
+    const fixture = await makeReleaseFixture();
+    const harness = makeHarness({ ledger: fixture.ledger });
+    const packageArgs = ["release", "package", "--source-hash", SOURCE_HASH, "--private-root", fixture.privateRoot];
+
+    await harness.cli.parseAsync(packageArgs, { from: "user" });
+    expect(harness.out.join("\n")).toContain("release package OK");
+    expect(await readdir(path.join(fixture.privateRoot, "releases"))).toHaveLength(1);
+
+    // Edit a packaged artifact after the PASSED gate: the CLI must refuse.
+    const cardsFile = path.join(fixture.workDir, "cards.jsonl");
+    await writeFile(
+      cardsFile,
+      (await readFile(cardsFile, "utf8")).replace('"template_version":"v1"', '"template_version":"v9"'),
+      "utf8",
+    );
+    harness.out.length = 0;
+    await harness.cli.parseAsync(packageArgs, { from: "user" });
+    expect(harness.out.join("\n")).toContain("release package failed");
+    expect(harness.out.join("\n")).toContain("RELEASE_INPUT_STALE");
+    // No second bundle was written for the tampered content.
+    expect(await readdir(path.join(fixture.privateRoot, "releases"))).toHaveLength(1);
   });
 
   it("fails closed when the D1/R2 dependencies are not configured", async () => {
