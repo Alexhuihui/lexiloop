@@ -93,6 +93,14 @@ async function assertAliasEndsExist(db: LexiloopDatabase, graph: AliasGraph): Pr
  * closure through stored edges) with the same rules: at most one successor
  * and one predecessor per key, no cycles, and every walk terminating at the
  * single declared canonical root.
+ *
+ * Supersession: a declared edge whose (from_release_id, from_key, to_key)
+ * exactly matches a stored edge replaces it in the union — `activateBatch`
+ * upserts the refresh, so a chained rename may refresh the canonical root of
+ * an earlier migration (k2→k3 canonical k3, later k3→k4 with the k2 edge
+ * redeclared to canonical k4). A redeclaration under a DIFFERENT declaring
+ * release does not supersede: both rows would coexist and leave `resolve`
+ * ambiguous, so the stale stored canonical stays in the union and rejects.
  */
 async function assertNoCrossActivationConflicts(db: LexiloopDatabase, graph: AliasGraph): Promise<void> {
   const stored = (await db.select().from(contentKeyAlias)) as Array<{
@@ -123,11 +131,14 @@ async function assertNoCrossActivationConflicts(db: LexiloopDatabase, graph: Ali
     }
   }
   // (from, to, canonical) union: relevant stored edges + the declared batch.
+  const supersededByBatch = new Set(
+    graph.edges.map((edge) => `${edge.from_release_id}\u0000${edge.from_key}\u0000${edge.to_key}`),
+  );
   const union: Array<{ from: string; to: string; canonical: string; origin: string }> = [];
   for (const row of stored) {
-    if (reached.has(row.fromKey)) {
-      union.push({ from: row.fromKey, to: row.toKey, canonical: row.canonicalKey, origin: `stored(${row.releaseId})` });
-    }
+    if (!reached.has(row.fromKey)) continue;
+    if (supersededByBatch.has(`${row.releaseId}\u0000${row.fromKey}\u0000${row.toKey}`)) continue;
+    union.push({ from: row.fromKey, to: row.toKey, canonical: row.canonicalKey, origin: `stored(${row.releaseId})` });
   }
   for (const edge of graph.edges) {
     union.push({ from: edge.from_key, to: edge.to_key, canonical: edge.canonical_key, origin: "declared" });

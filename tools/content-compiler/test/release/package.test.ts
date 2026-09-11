@@ -1177,6 +1177,81 @@ describe("release publish lifecycle (D1/R2)", () => {
     env.cleanup();
   });
 
+  it("refreshes a chain root by redeclaring an edge in a later activation", async () => {
+    const seedWord = (releaseId: string, wordKey: string, sourceOrder: number): void => {
+      env.sqlite
+        .prepare("INSERT INTO word (release_id, word_key, unit_key, headword, phonetic, tier, source_order, provenance_json) VALUES (?, ?, 'u1', ?, NULL, 'core', ?, '{}')")
+        .run(releaseId, wordKey, wordKey, sourceOrder);
+    };
+    const env = createDb();
+    // rel-2 introduces k2 -> k3 (canonical k3) and becomes ACTIVE.
+    await seedReadyRelease(env, "rel-2", "k2");
+    seedWord("rel-2", "k3", 2);
+    const releases = new ReleaseRepository(env.db);
+    const chainBatch = [
+      { entity_type: "word", from_release_id: "rel-2", from_key: "k2", to_release_id: "rel-2", to_key: "k3", canonical_key: "k3" },
+    ];
+    await activateRelease({ db: env.db, releaseId: "rel-2", aliases: chainBatch, now: NOW_MS });
+    expect((await releases.getMeta())?.activeReleaseId).toBe("rel-2");
+
+    // State under the future canonical root k4 (outside the first component).
+    env.sqlite
+      .prepare("INSERT INTO app_user (user_id, normalized_username, password_salt, password_verifier, created_at) VALUES ('u1', 'u1', 's', 'v', ?)")
+      .run(NOW_MS);
+    env.sqlite
+      .prepare("INSERT INTO word_progress (user_id, word_key, stage, first_seen_at, last_seen_at) VALUES ('u1', 'k4', 'IN_PROGRESS', ?, ?)")
+      .run(NOW_MS, NOW_MS);
+
+    // rel-3 extends the chain k3 -> k4 and redeclares the k2 edge (same
+    // declaring release) to refresh the chain root to k4.
+    await seedReadyRelease(env, "rel-3", "k3");
+    seedWord("rel-3", "k4", 2);
+    const before = await snapshotUserState(env);
+    const refreshBatch = [
+      { entity_type: "word", from_release_id: "rel-3", from_key: "k3", to_release_id: "rel-3", to_key: "k4", canonical_key: "k4" },
+      { entity_type: "word", from_release_id: "rel-2", from_key: "k2", to_release_id: "rel-2", to_key: "k3", canonical_key: "k4" },
+    ];
+    const activated = await activateRelease({ db: env.db, releaseId: "rel-3", aliases: refreshBatch, now: NOW_MS });
+    expect(activated.aliasesImported).toBe(2);
+    expect((await releases.getMeta())?.activeReleaseId).toBe("rel-3");
+    expect(await snapshotUserState(env)).toBe(before);
+
+    // The refreshed chain resolves k2 -> k4 from every release's rows.
+    const aliases = new AliasRepository(env.db);
+    await expect(aliases.resolve({ releaseId: "rel-2", key: "k2" })).resolves.toBe("k4");
+    await expect(aliases.resolve({ releaseId: "rel-3", key: "k2" })).resolves.toBe("k4");
+    await expect(aliases.resolve({ releaseId: "rel-3", key: "k3" })).resolves.toBe("k4");
+    // The redeclaration refreshed the stored row in place (no ambiguity).
+    expect(env.sqlite.prepare("SELECT COUNT(*) AS n FROM content_key_alias WHERE from_key = 'k2'").get())
+      .toMatchObject({ n: 1 });
+
+    // The rollback dance with the refreshed chain stays consistent: rel-2
+    // re-activates, then rel-3, and the refreshed canonicals still resolve.
+    await rollbackRelease({ db: env.db, releaseId: "rel-2", now: NOW_MS });
+    expect((await releases.getMeta())?.activeReleaseId).toBe("rel-2");
+    await rollbackRelease({ db: env.db, releaseId: "rel-3", now: NOW_MS });
+    expect((await releases.getMeta())?.activeReleaseId).toBe("rel-3");
+    await expect(aliases.resolve({ releaseId: "rel-2", key: "k2" })).resolves.toBe("k4");
+    expect(await snapshotUserState(env)).toBe(before);
+
+    // The refreshed union still rejects a genuine conflict: a third release
+    // declaring a second outgoing edge for k2 fails the activation.
+    await seedReadyRelease(env, "rel-4", "k2");
+    seedWord("rel-4", "k5", 2);
+    await expect(
+      activateRelease({
+        db: env.db,
+        releaseId: "rel-4",
+        aliases: [
+          { entity_type: "word", from_release_id: "rel-4", from_key: "k2", to_release_id: "rel-4", to_key: "k5", canonical_key: "k5" },
+        ],
+        now: NOW_MS,
+      }),
+    ).rejects.toMatchObject({ code: "ALIAS_ONE_TO_MANY" });
+    expect((await releases.getMeta())?.activeReleaseId).toBe("rel-3");
+    env.cleanup();
+  });
+
   it("rolls the whole batch back when an alias row violates the schema", async () => {
     const env = createDb();
     await seedReadyRelease(env, "rel-a", "w-a");
