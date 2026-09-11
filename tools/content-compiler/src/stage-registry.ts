@@ -452,11 +452,13 @@ function packetForReview(review: NormalizeOutput["fieldReviews"][number]) {
 
 /**
  * STRUCTURE_NORMALIZE: recovers book/Unit/word/sense/phrase/example records
- * from the validated OCR blocks. Critical fields that fail deterministic
+ * from the validated OCR blocks. Three fail-closed gates guard the artifact:
+ * word entries referencing a unit with no matched banner fail the stage
+ * BLOCKED (DANGLING_UNIT_REFERENCE); critical fields that fail deterministic
  * acceptance become visual-OCR packets and fail the stage with
  * VISUAL_PACKETS_PENDING until every packet is resolved; a field that
  * exhausts its repair budget (or is BLOCKed) fails the stage BLOCKED —
- * neither path can be bypassed by any flag.
+ * no path can be bypassed by any flag.
  */
 export function createStructureNormalizeStage(options: MediaStageOptions): AnyStage {
   const configVersion = "1";
@@ -498,6 +500,29 @@ export function createStructureNormalizeStage(options: MediaStageOptions): AnySt
           }));
 
         const normalized = segmentStructure(blocks, LLCY_2024_NORMALIZE_CONFIG, corrections);
+
+        // Fail closed on a structurally invalid book: word entries recovered
+        // before any unit banner matched would reference a synthetic unit that
+        // has no Unit record. Never emit dangling word/unit references — unit
+        // detection must be calibrated, not bypassed.
+        const knownUnits = new Set(normalized.units.map((unit) => unit.unit_key));
+        const danglingUnits = [
+          ...new Set(normalized.words.map((word) => word.unit_key)),
+        ].filter((unitKey) => !knownUnits.has(unitKey));
+        if (danglingUnits.length > 0) {
+          const danglingWords = normalized.words.filter((word) =>
+            danglingUnits.includes(word.unit_key),
+          );
+          const first = danglingWords[0]!;
+          throw new StageError(
+            "DANGLING_UNIT_REFERENCE",
+            `${danglingWords.length} word(s) reference unit(s) with no matched banner ` +
+              `[${danglingUnits.join(",")}] (first: "${first.headword}" on page ` +
+              `${first.page_number}); calibrate unit_title_patterns instead of emitting a ` +
+              `book with dangling references`,
+            { blocked: true },
+          );
+        }
 
         if (normalized.blockedFields.length > 0) {
           // Terminal: a BLOCKED unit must never reach the release stage.

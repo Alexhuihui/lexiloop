@@ -248,8 +248,10 @@ function startUnit(state: WalkState, block: PreprocessedBlock): void {
 
 function startWord(state: WalkState, block: PreprocessedBlock, match: RegExpMatchArray): void {
   const [headword, phoneticWithDelims, rest] = [match[1]!, match[2]!, match[3]!];
-  // Content before the first unit title (front matter, strays) lands in a
-  // synthetic "u0" bucket so the entry is never silently dropped.
+  // Content before the first unit title lands in a synthetic "u0" bucket so
+  // segmentation stays total; the STRUCTURE_NORMALIZE stage fails closed
+  // (DANGLING_UNIT_REFERENCE) if such a book is ever emitted, so real runs
+  // can never silently publish word entries without their Unit record.
   const unitKey = state.currentUnit?.unit_key ?? "u0";
 
   const headwordText = headword.trim();

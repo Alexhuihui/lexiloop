@@ -696,13 +696,11 @@ describe("LAYOUT_OCR + STRUCTURE_NORMALIZE stages", () => {
     }));
   }
 
-  async function makeStages() {
-    await seedCleanArtifacts();
+  function makeStagesWithRows(rows: Array<{ page: number; text: string; confidence: number }>) {
     const options: MediaStageOptions = {
       privateRoot: workDir,
       runPython: async () => {
         // Emulate `lexiloop_media ocr`: write ocr.jsonl + per-page raw files.
-        const rows = ocrRows() as Array<{ page: number; text: string }>;
         await mkdir(path.join(sourceDir, "ocr-raw"), { recursive: true });
         for (const page of [1, 2]) {
           const texts = rows.filter((row) => row.page === page).map((row) => row.text);
@@ -721,6 +719,12 @@ describe("LAYOUT_OCR + STRUCTURE_NORMALIZE stages", () => {
       },
     };
     return [createLayoutOcrStage(options), createStructureNormalizeStage(options)];
+  }
+
+  async function makeStages() {
+    await seedCleanArtifacts();
+    const rows = ocrRows() as Array<{ page: number; text: string; confidence: number }>;
+    return makeStagesWithRows(rows);
   }
 
   function pipelineConfig() {
@@ -789,5 +793,37 @@ describe("LAYOUT_OCR + STRUCTURE_NORMALIZE stages", () => {
     const report = await runLedger([createLayoutOcrStage(options)]);
     expect(report.status).toBe("FAILED");
     expect(report.results[0]!.error_code).toBe("MEDIA_OUTPUT_INVALID");
+  });
+
+  it("fails BLOCKED when words reference a unit that no banner emitted", async () => {
+    await seedCleanArtifacts();
+    // Word entries without any unit-title block: the synthetic fallback unit
+    // would dangle, so the stage must fail closed instead of emitting a
+    // structurally invalid book (review finding: unit detection fails open).
+    const rows = (
+      ocrRows() as Array<{ page: number; text: string; confidence: number }>
+    ).filter((row) => !row.text.startsWith("Unit"));
+    expect(rows.length).toBeGreaterThan(0);
+    const stages = await makeStagesWithRows(rows);
+
+    const first = await runLedger(stages);
+    expect(first.status).toBe("BLOCKED");
+    expect(first.results.map((r) => r.status)).toEqual(["PASSED", "BLOCKED"]);
+    expect(first.results[1]!.error_code).toBe("DANGLING_UNIT_REFERENCE");
+
+    const ledger = createFileLedger({ directory: path.join(workDir, "ledger") });
+    const normalize = await ledger.load("STRUCTURE_NORMALIZE");
+    expect(normalize!.status).toBe("BLOCKED");
+    expect(normalize!.error_code).toBe("DANGLING_UNIT_REFERENCE");
+    // No normalized artifact may exist for a structurally invalid book.
+    await expect(
+      readFile(path.join(sourceDir, "normalized.jsonl"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    // Terminal: the ledger BLOCKED status stops any further run from advancing.
+    const second = await runLedger(stages);
+    expect(second.status).toBe("BLOCKED");
+    expect(second.results.map((r) => r.status)).toEqual(["SKIPPED", "BLOCKED"]);
+    expect(second.results[1]!.error_code).toBe("DANGLING_UNIT_REFERENCE");
   });
 });
