@@ -4,8 +4,11 @@
  * Declares the 13 production stage names in exact compile order plus their
  * dependency edges. Stages land task by task: IMAGE_EXTRACT and
  * WATERMARK_CLEAN call the versioned Python media workers (spec 5.3) through
- * `src/media.ts`; every other stage is still an unimplemented, fail-closed
- * handler. The names, order, and dependencies declared here are final.
+ * `src/media.ts`; LAYOUT_OCR runs the PP-StructureV3 worker and
+ * STRUCTURE_NORMALIZE recovers records deterministically, gating on
+ * visual-OCR review packets (spec 5.4). Every other stage is still an
+ * unimplemented, fail-closed handler. The names, order, and dependencies
+ * declared here are final.
  */
 import { z } from "zod";
 import { hashJson, hashString, StageError, type AnyStage, type StageRunContext } from "./stage";
@@ -22,6 +25,24 @@ import {
   validateExtractArtifacts,
   type SpawnPythonFn,
 } from "./media";
+import {
+  DEFAULT_OCR_CONFIG_PATH,
+  ocrJsonlHash,
+  ocrSpawnArgs,
+  toNormalizeInputBlocks,
+  validateOcrArtifacts,
+} from "./ocr-adapter";
+import { assignReadingOrder } from "./normalize/reading-order";
+import { LLCY_2024_NORMALIZE_CONFIG } from "./normalize/config";
+import { segmentStructure, type NormalizeOutput } from "./normalize/segmentation";
+import {
+  VISUAL_OCR_PROMPT_VERSION,
+  enqueuePackets,
+  loadQueue,
+  unresolvedUnitKeys,
+  VISUAL_OCR_QUEUE_DIR,
+} from "./agents/visual-ocr";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export const PRODUCTION_STAGE_NAMES = [
@@ -147,16 +168,19 @@ export interface MediaStageOptions {
   runPython: SpawnPythonFn;
   /** Watermark rule for WATERMARK_CLEAN. */
   rulePath?: string;
+  /** Versioned PP-StructureV3 config for LAYOUT_OCR. */
+  ocrConfigPath?: string;
 }
 
 /** Fill defaults for optional media wiring; the runner is never optional. */
 export function resolveMediaStageOptions(
-  options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string } = {},
+  options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string; ocrConfigPath?: string } = {},
 ): MediaStageOptions {
   return {
     privateRoot: options.privateRoot ?? DEFAULT_PRIVATE_ROOT,
     runPython: options.runPython ?? createPythonRunner(),
     ...(options.rulePath !== undefined ? { rulePath: options.rulePath } : {}),
+    ...(options.ocrConfigPath !== undefined ? { ocrConfigPath: options.ocrConfigPath } : {}),
   };
 }
 
@@ -294,20 +318,263 @@ export function createWatermarkCleanStage(options: MediaStageOptions): AnyStage 
   };
 }
 
+// ---------------------------------------------------------------------------
+// Layout OCR + structure normalization stages (spec 5.4)
+// ---------------------------------------------------------------------------
+
+export const LayoutOcrOutputSchema = z.object({
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Relative to the per-source work directory. */
+  ocr_jsonl: z.literal("ocr.jsonl"),
+  /** SHA-256 of the validated OCR JSONL artifact. */
+  ocr_jsonl_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  pipeline: z.string().min(1),
+  pipeline_version: z.string().min(1),
+  model_version: z.string().min(1),
+  config_version: z.number().int().positive(),
+  block_count: z.number().int().nonnegative(),
+  pages: z
+    .array(
+      z.object({
+        page: z.number().int().positive(),
+        block_count: z.number().int().nonnegative(),
+      }),
+    )
+    .min(1),
+});
+export type LayoutOcrOutput = z.output<typeof LayoutOcrOutputSchema>;
+
+export const NormalizedEntityRowSchema = z.looseObject({
+  entity_type: z.enum(["book", "unit", "word", "sense", "phrase", "example"]),
+});
+export type NormalizedEntityRow = z.output<typeof NormalizedEntityRowSchema>;
+
+export const StructureNormalizeOutputSchema = z.object({
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Relative to the per-source work directory. */
+  normalized_jsonl: z.literal("normalized.jsonl"),
+  /** SHA-256 of the written entity rows (provenance-bearing records). */
+  normalized_jsonl_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  counts: z.object({
+    units: z.number().int().nonnegative(),
+    words: z.number().int().nonnegative(),
+    senses: z.number().int().nonnegative(),
+    phrases: z.number().int().nonnegative(),
+    examples: z.number().int().nonnegative(),
+  }),
+  unit_boundaries: z.array(
+    z.object({
+      unit_key: z.string().min(1),
+      unit_order: z.number().int().positive(),
+      title: z.string().min(1),
+      first_page: z.number().int().positive(),
+      last_page: z.number().int().positive(),
+    }),
+  ),
+  /** Packets resolved by visual-agent decisions folded into this run. */
+  resolved_packets: z.number().int().nonnegative(),
+});
+export type StructureNormalizeOutput = z.output<typeof StructureNormalizeOutputSchema>;
+
+/**
+ * LAYOUT_OCR: runs the versioned PP-StructureV3 worker over every cleaned
+ * page image, then validates `ocr.jsonl` — schema, source/page-image hash
+ * chain, and the private raw-text evidence — before the ledger may advance.
+ */
+export function createLayoutOcrStage(options: MediaStageOptions): AnyStage {
+  const { runPython } = options;
+  const ocrConfigPath = options.ocrConfigPath ?? DEFAULT_OCR_CONFIG_PATH;
+  const configVersion = "1";
+  return {
+    name: "LAYOUT_OCR",
+    configVersion,
+    inputSchema: z.unknown(),
+    outputSchema: LayoutOcrOutputSchema,
+    computeInputHash: async (ctx) =>
+      hashJson({
+        stage: "LAYOUT_OCR",
+        configVersion,
+        sourceHash: ctx.sourceHash,
+        media: ctx.config.media ?? null,
+        ocr_config_sha256: await sha256File(ocrConfigPath),
+        upstream: ctx.upstream?.outputHash ?? null,
+      }),
+    run: async (_input, ctx) => {
+      try {
+        const media = mediaConfig(ctx);
+        const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
+        await runPython(ocrSpawnArgs(ocrConfigPath, workDir));
+        // The OCR chain is anchored in the cleaned pages: validate both.
+        const cleanRecords = await validateCleanArtifacts(workDir, ctx.sourceHash, media.pages);
+        const records = await validateOcrArtifacts(workDir, ctx.sourceHash, cleanRecords);
+        const blockCounts = new Map<number, number>();
+        for (const record of records) {
+          blockCounts.set(record.page, (blockCounts.get(record.page) ?? 0) + 1);
+        }
+        const first = records[0]!;
+        return {
+          source_sha256: ctx.sourceHash,
+          ocr_jsonl: "ocr.jsonl",
+          ocr_jsonl_sha256: await ocrJsonlHash(workDir),
+          pipeline: first.pipeline,
+          pipeline_version: first.pipeline_version,
+          model_version: first.model_version,
+          config_version: first.config_version,
+          block_count: records.length,
+          pages: [...blockCounts.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([page, blockCount]) => ({ page, block_count: blockCount })),
+        } satisfies LayoutOcrOutput;
+      } catch (err) {
+        throw toSpawnError(err);
+      }
+    },
+  };
+}
+
+/** Build the strict packet for one field review (spec 5.4/5.6). */
+function packetForReview(review: NormalizeOutput["fieldReviews"][number]) {
+  return {
+    role: "visual_ocr" as const,
+    packet_id: review.packet_id,
+    unit_key: review.unit_key,
+    prompt_version: VISUAL_OCR_PROMPT_VERSION,
+    round: review.round,
+    field: review.field,
+    page_number: review.page_number,
+    page_image_sha256: review.page_image_sha256,
+    bbox: review.bbox,
+    current_text: review.current_text,
+    ocr_confidence: review.ocr_confidence,
+    evidence_codes: review.evidence_codes,
+  };
+}
+
+/**
+ * STRUCTURE_NORMALIZE: recovers book/Unit/word/sense/phrase/example records
+ * from the validated OCR blocks. Critical fields that fail deterministic
+ * acceptance become visual-OCR packets and fail the stage with
+ * VISUAL_PACKETS_PENDING until every packet is resolved; a field that
+ * exhausts its repair budget (or is BLOCKed) fails the stage BLOCKED —
+ * neither path can be bypassed by any flag.
+ */
+export function createStructureNormalizeStage(options: MediaStageOptions): AnyStage {
+  const configVersion = "1";
+  return {
+    name: "STRUCTURE_NORMALIZE",
+    configVersion,
+    inputSchema: z.unknown(),
+    outputSchema: StructureNormalizeOutputSchema,
+    computeInputHash: (ctx) =>
+      hashJson({
+        stage: "STRUCTURE_NORMALIZE",
+        configVersion,
+        sourceHash: ctx.sourceHash,
+        media: ctx.config.media ?? null,
+        normalize_config: LLCY_2024_NORMALIZE_CONFIG,
+        upstream: ctx.upstream?.outputHash ?? null,
+      }),
+    run: async (_input, ctx) => {
+      try {
+        const media = mediaConfig(ctx);
+        const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
+        const cleanRecords = await validateCleanArtifacts(workDir, ctx.sourceHash, media.pages);
+        const records = await validateOcrArtifacts(workDir, ctx.sourceHash, cleanRecords);
+        const blocks = assignReadingOrder(toNormalizeInputBlocks(records));
+
+        // Fold resolved visual decisions (separate provenance records) in.
+        const queueDir = path.join(workDir, VISUAL_OCR_QUEUE_DIR);
+        const entries = await loadQueue(queueDir);
+        const corrections = entries
+          .filter((entry) => entry.status === "resolved" && entry.result !== undefined)
+          .map((entry) => ({
+            packet_id: entry.result!.packet_id,
+            verdict: entry.result!.verdict,
+            ...(entry.result!.corrected_text !== undefined
+              ? { corrected_text: entry.result!.corrected_text }
+              : {}),
+            agent_run_id: entry.result!.agent_run_id,
+            round: entry.packet.round,
+          }));
+
+        const normalized = segmentStructure(blocks, LLCY_2024_NORMALIZE_CONFIG, corrections);
+
+        if (normalized.blockedFields.length > 0) {
+          // Terminal: a BLOCKED unit must never reach the release stage.
+          throw new StageError(
+            "VISUAL_FIELD_BLOCKED",
+            `${normalized.blockedFields.length} critical field(s) exhausted visual review ` +
+              `(units: ${[...new Set(normalized.blockedFields.map((f) => f.unit_key))].join(",")})`,
+            { blocked: true },
+          );
+        }
+        if (normalized.fieldReviews.length > 0) {
+          await enqueuePackets(queueDir, normalized.fieldReviews.map(packetForReview));
+          const pending = await loadQueue(queueDir);
+          const units = unresolvedUnitKeys(pending);
+          throw new StageError(
+            "VISUAL_PACKETS_PENDING",
+            `${normalized.fieldReviews.length} critical field(s) await visual review; ` +
+              `${pending.filter((entry) => entry.status === "pending").length} packet(s) pending` +
+              (units.length > 0 ? ` (blocking units: ${units.join(",")})` : ""),
+          );
+        }
+
+        const rows: NormalizedEntityRow[] = [
+          { entity_type: "book", ...normalized.book },
+          ...normalized.units.map((unit) => ({ entity_type: "unit" as const, ...unit })),
+          ...normalized.words.map((word) => ({ entity_type: "word" as const, ...word })),
+          ...normalized.senses.map((sense) => ({ entity_type: "sense" as const, ...sense })),
+          ...normalized.phrases.map((phrase) => ({ entity_type: "phrase" as const, ...phrase })),
+          ...normalized.examples.map((example) => ({
+            entity_type: "example" as const,
+            ...example,
+          })),
+        ];
+        const normalizedJsonlPath = path.join(workDir, "normalized.jsonl");
+        await mkdir(path.dirname(normalizedJsonlPath), { recursive: true });
+        await writeFile(
+          normalizedJsonlPath,
+          rows.map((row) => JSON.stringify(row)).join("\n") + "\n",
+          "utf8",
+        );
+        return {
+          source_sha256: ctx.sourceHash,
+          normalized_jsonl: "normalized.jsonl",
+          normalized_jsonl_sha256: await sha256File(normalizedJsonlPath),
+          counts: {
+            units: normalized.units.length,
+            words: normalized.words.length,
+            senses: normalized.senses.length,
+            phrases: normalized.phrases.length,
+            examples: normalized.examples.length,
+          },
+          unit_boundaries: normalized.unitBoundaries,
+          resolved_packets: corrections.length,
+        } satisfies StructureNormalizeOutput;
+      } catch (err) {
+        throw toSpawnError(err);
+      }
+    },
+  };
+}
+
 /**
  * The 13 production stages in compile order. SOURCE_FINGERPRINT and the
- * stages from LAYOUT_OCR onward are still fail-closed placeholders.
+ * stages from AGENT_ENRICH onward are still fail-closed placeholders.
  */
 export function getProductionStages(
-  options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string } = {},
+  options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string; ocrConfigPath?: string } = {},
 ): AnyStage[] {
   // resolveMediaStageOptions always provides a real argument-array runner,
   // so production wiring can never construct media stages that would
   // "validate" stale artifacts without spawning the worker.
   const mediaOptions: MediaStageOptions = resolveMediaStageOptions(options);
-  const mediaStages: Partial<Record<ProductionStageName, AnyStage>> = {
+  const stages: Partial<Record<ProductionStageName, AnyStage>> = {
     IMAGE_EXTRACT: createImageExtractStage(mediaOptions),
     WATERMARK_CLEAN: createWatermarkCleanStage(mediaOptions),
+    LAYOUT_OCR: createLayoutOcrStage(mediaOptions),
+    STRUCTURE_NORMALIZE: createStructureNormalizeStage(mediaOptions),
   };
-  return PRODUCTION_STAGE_NAMES.map((name) => mediaStages[name] ?? unimplementedStage(name));
+  return PRODUCTION_STAGE_NAMES.map((name) => stages[name] ?? unimplementedStage(name));
 }

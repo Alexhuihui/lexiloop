@@ -14,9 +14,13 @@ dependencies = [
 
 [project.optional-dependencies]
 # PaddleOCR is heavy and only needed for OCR media workers; install it with
-# `uv sync --extra ocr`. Kept out of the default env on purpose.
+# `uv sync --extra ocr`. Kept out of the default env on purpose. paddleocr 3.x
+# does not pull the Paddle framework itself nor the PP-StructureV3 pipeline
+# deps, so pin paddlepaddle (CPU build) and the matching paddlex[ocr] extra.
 ocr = [
     "paddleocr>=3.0",
+    "paddlepaddle>=3.0",
+    "paddlex[ocr]>=3.0",
 ]
 
 [dependency-groups]

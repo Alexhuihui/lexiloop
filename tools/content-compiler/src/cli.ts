@@ -11,6 +11,7 @@
  * and the root `pnpm compiler` script both run `tsx src/cli.ts`.
  */
 import { Command, CommanderError } from "commander";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createFileLedger, ledgerDirectory, type LedgerStore } from "./ledger";
@@ -50,6 +51,13 @@ import {
   RELEASE_STAGE,
   getProductionStages,
 } from "./stage-registry";
+import {
+  VISUAL_OCR_QUEUE_DIR,
+  ingestResult,
+  loadQueue,
+  queueStatus,
+  unresolvedUnitKeys,
+} from "./agents/visual-ocr";
 import { hashJson, type AnyStage, type StageRunContext } from "./stage";
 
 export const DEFAULT_WORK_ROOT = path.join(".lexiloop-private", "work");
@@ -447,6 +455,88 @@ async function executeMediaQaPackets(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Agent packet queues (spec 5.6): agents visual-ocr packets|ingest|status
+//
+// The queue lives under `<work-dir>/agent-queue/visual-ocr/` and is consumed
+// by externally-dispatched visual agents. Ingestion validates every response
+// (packet hash, source hash, distinct agent run) and stores corrections as
+// separate provenance records; it never mutates raw OCR evidence.
+// ---------------------------------------------------------------------------
+
+interface AgentQueueOptions {
+  sourceHash: string;
+  privateRoot?: string;
+}
+
+function visualOcrQueueDirFor(deps: CliDeps, options: AgentQueueOptions): string {
+  return path.join(workDirFor(deps, options.privateRoot, options.sourceHash), VISUAL_OCR_QUEUE_DIR);
+}
+
+function agentFailure(deps: CliDeps, command: string, err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  deps.writeLine(`agents visual-ocr ${command} failed: ${message}`);
+  deps.exit?.(1);
+}
+
+async function executeVisualOcrPackets(
+  deps: CliDeps,
+  options: AgentQueueOptions,
+): Promise<void> {
+  try {
+    const queueDir = visualOcrQueueDirFor(deps, options);
+    const entries = await loadQueue(queueDir);
+    for (const entry of entries) {
+      deps.writeLine(
+        `${entry.packet.packet_id} ${entry.status} round=${entry.packet.round} ` +
+          `field=${entry.packet.field} page=${entry.packet.page_number} ` +
+          `conf=${entry.packet.ocr_confidence.toFixed(2)}`,
+      );
+    }
+    deps.writeLine(`agents visual-ocr packets OK (${entries.length} packet(s)) -> ${queueDir}`);
+  } catch (err) {
+    agentFailure(deps, "packets", err);
+  }
+}
+
+async function executeVisualOcrIngest(
+  deps: CliDeps,
+  options: AgentQueueOptions & { result: string },
+): Promise<void> {
+  try {
+    const queueDir = visualOcrQueueDirFor(deps, options);
+    const raw = await readFile(options.result, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`--result is not valid JSON: ${options.result}`);
+    }
+    const entry = await ingestResult(queueDir, options.sourceHash, parsed);
+    deps.writeLine(`agents visual-ocr ingest OK ${entry.packet.packet_id} ${entry.status}`);
+  } catch (err) {
+    agentFailure(deps, "ingest", err);
+  }
+}
+
+async function executeVisualOcrStatus(
+  deps: CliDeps,
+  options: AgentQueueOptions,
+): Promise<void> {
+  try {
+    const queueDir = visualOcrQueueDirFor(deps, options);
+    const status = await queueStatus(queueDir);
+    deps.writeLine(
+      `packets total=${status.total} pending=${status.pending} ` +
+        `resolved=${status.resolved} blocked=${status.blocked}`,
+    );
+    const units = unresolvedUnitKeys(await loadQueue(queueDir));
+    deps.writeLine(units.length > 0 ? `blocking units: ${units.join(",")}` : "no blocking units");
+  } catch (err) {
+    agentFailure(deps, "status", err);
+  }
+}
+
 export function buildCli(deps: CliDeps): Command {
   const program = new Command();
   program
@@ -526,6 +616,43 @@ export function buildCli(deps: CliDeps): Command {
     .action(async (options) => {
       await executeMediaQaPackets(deps, options);
     });
+
+  const agents = program
+    .command("agents")
+    .description("externally-dispatched agent packet queues (spec 5.6)");
+  const visualOcr = agents
+    .command("visual-ocr")
+    .description("visual OCR review of critical fields (headword/phonetic)");
+  const queueSourceOption = (command: Command): Command =>
+    command
+      .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
+      .option("--private-root <dir>", "private root holding work/<source-hash> directories");
+
+  queueSourceOption(
+    visualOcr
+      .command("packets")
+      .description("list review packets and their resolution status"),
+  ).action(async (options: AgentQueueOptions) => {
+    await executeVisualOcrPackets(deps, options);
+  });
+
+  queueSourceOption(
+    visualOcr
+      .command("ingest")
+      .description("validate and store one strict agent result JSON"),
+  )
+    .requiredOption("--result <path>", "path to the agent result JSON file")
+    .action(async (options: AgentQueueOptions & { result: string }) => {
+      await executeVisualOcrIngest(deps, options);
+    });
+
+  queueSourceOption(
+    visualOcr
+      .command("status")
+      .description("queue counts and units blocked pending review"),
+  ).action(async (options: AgentQueueOptions) => {
+    await executeVisualOcrStatus(deps, options);
+  });
 
   return program;
 }

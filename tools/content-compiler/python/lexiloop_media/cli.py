@@ -20,6 +20,7 @@ from typing import Any, NoReturn, Sequence
 import cv2
 import numpy as np
 
+from lexiloop_media import ocr as ocr_worker
 from lexiloop_media import pdf_images, watermarks
 from lexiloop_media.watermarks import WatermarkRule
 
@@ -335,6 +336,12 @@ def build_parser() -> argparse.ArgumentParser:
     qa.add_argument("--pages", default="", help="optional comma-separated page filter")
     qa.add_argument("--out-dir", required=True, help="QA packet output directory")
     qa.set_defaults(func=cmd_qa_packets)
+
+    # Layout OCR (PP-StructureV3) over the cleaned page images; the command
+    # body lives in lexiloop_media.ocr so it stays importable/patchable
+    # separately from the shared CLI (contract tests monkeypatch the engine
+    # hook there).
+    ocr_worker.add_ocr_subparser(sub)
 
     sleep = sub.add_parser(
         "selftest-sleep",

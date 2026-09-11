@@ -1,0 +1,24 @@
+{
+  "config_version": 1,
+  "pipeline": "PP-StructureV3",
+  "pipeline_version": "3.7.0",
+  "model_version": "PP-StructureV3/PP-OCRv5_server@3.0.0",
+  "device": "cpu",
+  "engine_params": {
+    "use_doc_orientation_classify": false,
+    "use_doc_unwarping": false,
+    "use_textline_orientation": true,
+    "use_seal_recognition": false,
+    "use_table_recognition": false,
+    "use_formula_recognition": false,
+    "use_chart_recognition": false,
+    "use_region_detection": false,
+    "text_detection_model_name": "PP-OCRv5_server_det",
+    "text_recognition_model_name": "PP-OCRv5_server_rec",
+    "text_det_limit_side_len": 1920,
+    "text_det_limit_type": "max",
+    "layout_threshold": 0.5,
+    "layout_nms": true
+  },
+  "notes": "Layout OCR is locked to PP-StructureV3 (design doc 5.4). The scanned source pages are already cropped/cleaned, so document orientation/unwarp classification is disabled; textline orientation stays on because entry numbers (019) and CJK glosses share lines. engine_params are passed verbatim to the PPStructureV3 constructor; every emitted OCR block records model_version + config_version for provenance."
+}

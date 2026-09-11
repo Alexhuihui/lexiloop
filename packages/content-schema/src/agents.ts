@@ -1,6 +1,17 @@
 import { z } from "zod";
 import { Explanation, GeneratedProvenance } from "./generated";
-import { Example, LexicalRelation, LogicalKey, Phrase, Sense, Unit, Word } from "./source";
+import {
+  Confidence,
+  Example,
+  LexicalRelation,
+  LogicalKey,
+  NormalizedBbox,
+  Phrase,
+  Sense,
+  Sha256Hex,
+  Unit,
+  Word,
+} from "./source";
 
 /**
  * Compile-time agent protocol contracts (spec 5.6).
@@ -114,3 +125,68 @@ export const AgentWorkPacket = z.discriminatedUnion("role", [
   ReviewWorkPacket,
   RepairWorkPacket,
 ]);
+
+// ---------------------------------------------------------------------------
+// Visual OCR agent protocol (spec 5.4/5.6)
+//
+// When the normalizer meets a critical field (headword/phonetic) it cannot
+// accept deterministically (low OCR confidence or an OCR-confusion pattern),
+// it must never guess: the field is routed to an externally-dispatched visual
+// agent as a packet bound to the exact page region. The agent answers with a
+// strict result; corrections are stored as separate provenance records and
+// raw OCR evidence is never mutated.
+// ---------------------------------------------------------------------------
+
+/** Critical source fields that route to visual review when untrusted. */
+export const VisualOcrField = z.enum(["headword", "phonetic"]);
+
+/**
+ * One review request for a single critical field. `bbox` + `page_image_sha256`
+ * let the agent crop the exact region; `packet_id` embeds the round so a
+ * re-review after a rejected repair is a distinct packet.
+ */
+export const VisualOcrPacket = z.strictObject({
+  role: z.literal("visual_ocr"),
+  packet_id: z.string().min(1),
+  unit_key: LogicalKey,
+  /** Versioned review prompt; changes here invalidate in-flight packets. */
+  prompt_version: z.string().min(1),
+  /** Repair round: 1 = initial review, up to MAX (three) rounds total. */
+  round: z.number().int().min(1),
+  field: VisualOcrField,
+  page_number: z.number().int().min(1),
+  page_image_sha256: Sha256Hex,
+  bbox: NormalizedBbox,
+  /** The OCR text under review (never rewritten by ingestion). */
+  current_text: z.string().min(1),
+  ocr_confidence: Confidence,
+  /** Structured evidence for why the field needs review, e.g.
+   *  LOW_CONFIDENCE_CRITICAL_FIELD or OCR_CONFUSION_DIGIT_IN_PHONETIC. */
+  evidence_codes: z.array(IssueCode).min(1),
+});
+/** Value + type share the name so callers can both parse and annotate. */
+export type VisualOcrPacket = z.output<typeof VisualOcrPacket>;
+
+/** Verdict of the visual OCR agent for one packet (reuses the review verdicts). */
+export const VisualOcrVerdict = ReviewVerdict;
+
+/**
+ * Strict response for one packet. A REPAIR must carry the corrected
+ * normalized text (and optionally the corrected bbox); PASS and BLOCK must
+ * not carry corrections — an agent cannot half-affirm a field.
+ */
+export const VisualOcrResult = z.strictObject({
+  packet_id: z.string().min(1),
+  /** SHA-256 of the packet this result answers (tamper detection). */
+  packet_hash: Sha256Hex,
+  source_hash: Sha256Hex,
+  /** Must be distinct across the whole queue (no batch rubber-stamping). */
+  agent_run_id: z.string().min(1),
+  verdict: VisualOcrVerdict,
+  corrected_text: z.string().min(1).optional(),
+  corrected_bbox: NormalizedBbox.optional(),
+  evidence_codes: z.array(IssueCode).min(1),
+  reviewed_at: z.string().min(1),
+});
+/** Value + type share the name so callers can both parse and annotate. */
+export type VisualOcrResult = z.output<typeof VisualOcrResult>;
