@@ -1028,6 +1028,60 @@ describe("POST /api/reviews/:eventId/undo", () => {
     expect((outcome.json as ErrorCode).code).toBe("REVIEW_UNDO_NOT_LATEST");
   });
 
+  it("undoes deterministically when two grades of one card share a millisecond", async () => {
+    const created = await createSession(fx.bobAuth, "NEW_WORDS");
+    fx.clock.now = T0;
+    const first = await grade(fx.bobAuth, {
+      event_id: "evt-tie-first",
+      session_id: created.body.session_id,
+      card_key: "k-wm-1",
+      rating: 3,
+    });
+    expect(first.status).toBe(200);
+    // Test-only rewind: re-present the SAME card and grade it again within
+    // the SAME millisecond, so both events tie on reviewed_at and insertion
+    // order must decide which one is "latest".
+    fx.env.sqlite
+      .prepare("UPDATE study_session SET position = 0 WHERE session_id = ?")
+      .run(created.body.session_id);
+    const second = await grade(fx.bobAuth, {
+      event_id: "evt-tie-second",
+      session_id: created.body.session_id,
+      card_key: "k-wm-1",
+      rating: 2,
+    });
+    expect(second.status).toBe(200);
+    expect(second.body.before_state).toEqual(first.body.after_state);
+    expect(second.body.reviewed_at).toBe(first.body.reviewed_at);
+
+    // The effectively-OLDER tied event is not undoable: its "first grade"
+    // deletion would silently drop the second grade's scheduling state.
+    const olderFirst = await undo(fx.bobAuth, "evt-tie-first");
+    expect(olderFirst.status).toBe(409);
+    expect((olderFirst.json as ErrorCode).code).toBe("REVIEW_UNDO_NOT_LATEST");
+
+    // Undoing the truly-latest event restores the first grade's state...
+    const outcome = await undo(fx.bobAuth, "evt-tie-second");
+    expect(outcome.status).toBe(200);
+    const restored = cardStateRow(fx.bob.userId, "k-wm-1")!;
+    expect(JSON.parse(restored.fsrs_state as string)).toEqual(first.body.after_state);
+    // ...the tied log row remains un-undone and intact...
+    const tied = fx.env.sqlite
+      .prepare("SELECT * FROM review_log WHERE event_id = ?")
+      .get("evt-tie-first") as Record<string, unknown>;
+    expect(tied.undone_at).toBeNull();
+    expect(tied.after_state).toBeTruthy();
+    // ...and the position rewound exactly once (grade, rewind, grade, undo).
+    const resumed = await getSession(fx.bobAuth, created.body.session_id);
+    expect(resumed.body.position).toBe(0);
+
+    // The chain stays consistent: the first grade is now the latest
+    // un-undone event, and undoing it deletes the state it created.
+    const chained = await undo(fx.bobAuth, "evt-tie-first");
+    expect(chained.status).toBe(200);
+    expect(cardStateRow(fx.bob.userId, "k-wm-1")).toBeUndefined();
+  });
+
   it("rejects a second undo of the same event and unknown events", async () => {
     const created = await createSession(fx.bobAuth, "NEW_WORDS");
     const graded = await gradePositions(fx.bobAuth, created.body.session_id, 0, 0);

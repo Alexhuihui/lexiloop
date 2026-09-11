@@ -42,10 +42,14 @@ export async function undoReview(
   if (record.undoneAt !== null) {
     throw new StudyHttpError(409, "REVIEW_EVENT_UNDONE", "Review event has already been undone");
   }
-  // Latest-only (spec 8.3): card_state reflects this event's after_state, so
-  // restoring/deleting it is exact; an older event would corrupt the chain.
-  const latest = (await service.reviewLogs.listRecent(ctx, 1))[0];
-  if (latest && record.reviewedAt < latest.reviewedAt) {
+  // Latest-only (spec 8.3), with a total order: the newest un-undone event,
+  // insertion order (rowid) breaking reviewed_at ties. The undo target must
+  // BE that event — card_state reflects its after_state, so restoring/
+  // deleting it is exact; an effectively-older tied event would corrupt the
+  // newer event's chain (a same-millisecond first-grade undo would delete
+  // the state the newer grade wrote).
+  const latest = await service.reviewLogs.getLatestUnUndone(ctx);
+  if (!latest || latest.eventId !== record.eventId) {
     throw new StudyHttpError(409, "REVIEW_UNDO_NOT_LATEST", "Only the latest review event can be undone");
   }
   if (!record.sessionId) {

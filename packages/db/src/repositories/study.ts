@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gt, isNull, lte, sql } from "drizzle-orm";
 import {
   parseFsrsState,
   parseQueueSnapshot,
@@ -276,6 +276,25 @@ export class ReviewLogRepository {
       .from(reviewLog)
       .where(and(eq(reviewLog.eventId, eventId), eq(reviewLog.userId, ctx.userId)))
       .get();
+    return row ? toReviewLogRecord(row) : undefined;
+  }
+
+  /**
+   * The user's single undoable event (spec 8.3): the newest UN-undone review,
+   * with insertion order (`rowid`) breaking `reviewed_at` ties so exactly ONE
+   * event is ever "latest". Ties on the same millisecond are real (two grades
+   * inside one clock tick), and letting an effectively-older tied event be
+   * undone first could delete a newer event's card_state — so the tiebreak is
+   * a total order, not an implementation detail.
+   */
+  async getLatestUnUndone(ctx: UserContext): Promise<ReviewLogRecord | undefined> {
+    const rows = await this.db
+      .select()
+      .from(reviewLog)
+      .where(and(eq(reviewLog.userId, ctx.userId), isNull(reviewLog.undoneAt)))
+      .orderBy(desc(reviewLog.reviewedAt), desc(sql`rowid`))
+      .limit(1);
+    const row = rows[0];
     return row ? toReviewLogRecord(row) : undefined;
   }
 
