@@ -40,7 +40,13 @@ const AUDIO_BYTES = new Uint8Array([
 ]);
 const AUDIO_SHA256 = createHash("sha256").update(AUDIO_BYTES).digest("hex");
 
-/** R2 fake with the range semantics the audio route relies on. */
+/**
+ * R2 fake modeling the documented binding semantics: `head` reports the
+ * object size, `get` without options serves the full object, and a ranged
+ * `get` returns NULL when the range is out of bounds or selects no bytes
+ * (real R2 does not document out-of-bounds ranged reads — it must never be
+ * asked for one; the route resolves the size through head() first).
+ */
 class FakeR2Bucket {
   public operations = 0;
   private readonly objects = new Map<string, Uint8Array>();
@@ -50,6 +56,7 @@ class FakeR2Bucket {
   }
 
   async head(key: string): Promise<{ size: number } | null> {
+    this.operations += 1;
     const bytes = this.objects.get(key);
     return bytes ? { size: bytes.length } : null;
   }
@@ -65,17 +72,21 @@ class FakeR2Bucket {
     this.operations += 1;
     const bytes = this.objects.get(key);
     if (!bytes) return null;
+    const range = options?.range;
     let start = 0;
     let end = bytes.length - 1;
-    const range = options?.range;
     if (range) {
       if (range.suffix !== undefined) {
+        if (range.suffix <= 0) return null;
         start = Math.max(0, bytes.length - range.suffix);
       } else {
-        start = Math.min(range.offset ?? 0, bytes.length);
+        start = range.offset ?? 0;
+        // Out-of-bounds start: real R2 answers null, never an empty object.
+        if (start >= bytes.length) return null;
         end = range.length !== undefined ? start + range.length - 1 : bytes.length - 1;
       }
       end = Math.min(end, bytes.length - 1);
+      if (start > end) return null; // selects no bytes -> null
     }
     const slice = bytes.subarray(start, end + 1);
     const copy = new Uint8Array(slice);
@@ -307,9 +318,22 @@ describe("GET /api/audio streaming, ETag, and ranges", () => {
     expect(malformed.status).toBe(200);
     expect(new Uint8Array(await malformed.arrayBuffer())).toEqual(AUDIO_BYTES);
 
+    // The 416 comes from the head()-resolved size BEFORE any ranged get: no
+    // out-of-bounds get is ever issued (and the fake would answer null).
+    const opsBefore = fx.bucket.operations;
     const unsatisfiable = await getAudio(WORD_ASSET_KEY, { range: "bytes=999-" });
     expect(unsatisfiable.status).toBe(416);
     expect(unsatisfiable.headers.get("content-range")).toBe(`bytes */${AUDIO_BYTES.length}`);
     expect(((await unsatisfiable.json()) as { code: string }).code).toBe("CONTENT_RANGE_NOT_SATISFIABLE");
+    expect(fx.bucket.operations).toBe(opsBefore + 1);
+  });
+
+  it("answers 404 for a ranged request when the object is truly absent", async () => {
+    const opsBefore = fx.bucket.operations;
+    const res = await getAudio(GONE_ASSET_KEY, { range: "bytes=0-3" });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { code: string }).code).toBe("CONTENT_AUDIO_OBJECT_MISSING");
+    // Only the head ran; no ranged get against a missing object.
+    expect(fx.bucket.operations).toBe(opsBefore + 1);
   });
 });
