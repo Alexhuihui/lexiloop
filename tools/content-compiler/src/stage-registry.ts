@@ -27,6 +27,8 @@ import {
   cleanSpawnArgs,
   createPythonRunner,
   extractSpawnArgs,
+  fileExists,
+  readJsonl,
   sha256File,
   validateCleanArtifacts,
   validateExtractArtifacts,
@@ -74,6 +76,29 @@ import {
 } from "@lexiloop/domain";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  AUDIO_DIR,
+  AUDIO_INSPECTION,
+  AUDIO_MANIFEST,
+  AudioInspectionRowSchema,
+  loadAudioManifest,
+  withWavInfoComment,
+  writeAudioManifest,
+  type AudioManifestRow,
+} from "./tts/cache";
+import {
+  DEFAULT_TTS_CONFIG_PATH,
+  buildTtsPlan,
+  collectTtsItems,
+  readTtsConfig,
+} from "./tts/plan";
+import { createMiMoTtsProvider } from "./tts/mimo";
+import {
+  resolveTtsApiKey,
+  TtsProviderError,
+  type TtsFetchFn,
+  type TtsProvider,
+} from "./tts/provider";
 
 /** Value type of the validation report (the schema export is value-only). */
 type UnitValidationReportT = z.output<typeof UnitValidationReportSchema>;
@@ -1161,13 +1186,494 @@ export function createCardGenerateStage(options: CardGenerateStageOptions): AnyS
   };
 }
 
+// ---------------------------------------------------------------------------
+// TTS synthesis + deterministic audio validation (spec 5.8): TTS_SYNTHESIZE,
+// AUDIO_VALIDATE
+//
+// V1 pre-generates audio for every headword and every example sentence of
+// every target unit through the replaceable TtsProvider seam (default Xiaomi
+// MiMo `mimo-v2.5-tts`, preset English voice). Assets are content-addressed
+// under the private work directory with the same key layout as R2
+// (`audio/<hash-prefix>/<hash>.wav`); the cache key is the hash of provider +
+// model + voice + normalized text + synthesis config version, so ANY
+// synthesis-parameter change produces new keys and re-runs the audio gate.
+//
+// Both stages REQUIRE a matching CARD_GENERATE output hash (ledger entry
+// PASSED, upstream provenance equal to it, and cards.jsonl bytes folded into
+// the input hash) — audio never precedes deterministic card generation.
+// AUDIO_VALIDATE runs the deterministic Python gate (ffprobe/soundfile only:
+// no ASR, no audio read-back) and produces the only input RELEASE_PACKAGE
+// accepts. Neither stage ever sees the API key's value in logs or artifacts.
+// ---------------------------------------------------------------------------
+
+/** Default versioned TTS synthesis config (spec 5.8). */
+export { DEFAULT_TTS_CONFIG_PATH };
+
+export const TtsSynthesizeOutputSchema = z.object({
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Relative to the per-source work directory. */
+  audio_manifest: z.literal(AUDIO_MANIFEST),
+  /** SHA-256 of the manifest artifact (sorted rows; deterministic). */
+  audio_manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  synthesis_config_version: z.string().min(1),
+  counts: z.object({
+    /** Content records covered (headwords + examples). */
+    items: z.number().int().nonnegative(),
+    /** Unique normalized texts = provider calls on a cold cache. */
+    unique_texts: z.number().int().nonnegative(),
+    cache_hits: z.number().int().nonnegative(),
+    synthesized: z.number().int().nonnegative(),
+  }),
+  /** Characters across unique normalized texts. */
+  characters: z.number().int().nonnegative(),
+  assets: z
+    .array(
+      z.object({
+        cache_key: z.string().regex(/^[0-9a-f]{64}$/),
+        object_key: z.string().min(1),
+        text_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+        text_chars: z.number().int().positive(),
+        min_seconds: z.number().nonnegative(),
+        max_seconds: z.number().positive(),
+        sha256: z.string().regex(/^[0-9a-f]{64}$/),
+        bytes: z.number().int().positive(),
+      }),
+    )
+    .min(1),
+});
+export type TtsSynthesizeOutput = z.output<typeof TtsSynthesizeOutputSchema>;
+
+export const AudioValidateOutputSchema = z.object({
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Relative to the per-source work directory. */
+  audio_inspection: z.literal(AUDIO_INSPECTION),
+  /** SHA-256 of the inspection artifact consumed by RELEASE_PACKAGE. */
+  audio_inspection_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  synthesis_config_version: z.string().min(1),
+  counts: z.object({
+    checked: z.number().int().positive(),
+    /** The stage only passes when every asset passed every check. */
+    failed: z.literal(0),
+  }),
+});
+export type AudioValidateOutput = z.output<typeof AudioValidateOutputSchema>;
+
+const TTS_CONFIG_VERSION = "1";
+
+/** Options shared by both TTS stages. */
+export interface TtsStageOptions {
+  /** Private root holding per-source work directories. */
+  privateRoot: string;
+  /** Versioned synthesis config; defaults to `config/tts/mimo-v2.5.json`. */
+  ttsConfigPath?: string;
+}
+
+/** Options for the TTS_SYNTHESIZE stage. */
+export interface TtsSynthesizeStageOptions extends TtsStageOptions {
+  /** Injectable HTTP boundary (tests); defaults to global fetch. */
+  fetchFn?: TtsFetchFn;
+  /**
+   * API key. Undefined resolves `MIMO_API_KEY`/legacy `mimo-key` from the
+   * local env at run time; null forces the fail-closed no-key behavior in
+   * tests. The value is never logged and never lands in any artifact.
+   */
+  apiKey?: string | null;
+  /** Injectable backoff sleep (tests). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Provider retry budget override (tests); defaults to the config value. */
+  maxRetries?: number;
+  /** Cap on unique texts synthesized (smoke runs); folds into the input hash. */
+  limit?: number;
+}
+
+/** Options for the AUDIO_VALIDATE stage. */
+export interface AudioValidateStageOptions extends TtsStageOptions {
+  /**
+   * Runner for the Python audio gate (argument-array spawn). REQUIRED so the
+   * gate can never "pass" by validating stale artifacts without actually
+   * running the worker; production wiring resolves a real runner, tests
+   * inject stubs.
+   */
+  runPython: SpawnPythonFn;
+}
+
 /**
- * The 13 production stages in compile order. SOURCE_FINGERPRINT,
- * TTS_SYNTHESIZE, AUDIO_VALIDATE, and RELEASE_PACKAGE are still fail-closed
- * placeholders; the four semantic agent gates are wired to the filesystem
- * provider queue, so they fail closed with SEMANTIC_PACKETS_PENDING until
- * externally-dispatched agents answer; CARD_GENERATE derives the rule-based
- * cards once every target Unit exited the gates as PASSED.
+ * CARD_GENERATE provenance every audio stage requires: the ledger entry must
+ * be PASSED with its recorded output hash. Returns that hash.
+ */
+async function requireCardsLedgerProvenance(ctx: StageRunContext): Promise<string> {
+  const entry = await ctx.ledger.load("CARD_GENERATE");
+  if (!entry || entry.status !== "PASSED" || entry.output_hash === null) {
+    throw new StageError(
+      "CARD_GENERATE_NOT_PASSED",
+      "TTS stages require a PASSED CARD_GENERATE ledger entry with its output hash; " +
+        "audio never precedes deterministic card generation",
+    );
+  }
+  return entry.output_hash;
+}
+
+/**
+ * Provenance for TTS_SYNTHESIZE: CARD_GENERATE must be PASSED and the run's
+ * immediate upstream must name CARD_GENERATE with the matching output hash —
+ * audio never precedes deterministic cards.
+ */
+async function requireCardsProvenance(ctx: StageRunContext): Promise<void> {
+  const cardsOutputHash = await requireCardsLedgerProvenance(ctx);
+  if (!ctx.upstream || ctx.upstream.stage !== "CARD_GENERATE") {
+    throw new StageError(
+      "CARD_GENERATE_NOT_PASSED",
+      "no CARD_GENERATE upstream provenance in this run context; " +
+        "invoke audio stages through the pipeline or prime the ledger first",
+    );
+  }
+  if (ctx.upstream.outputHash !== cardsOutputHash) {
+    throw new StageError(
+      "CARD_GENERATE_HASH_MISMATCH",
+      `upstream hash ${(ctx.upstream.outputHash ?? "(null)").slice(0, 12)} does not match the ` +
+        `CARD_GENERATE ledger output ${cardsOutputHash.slice(0, 12)}`,
+    );
+  }
+}
+
+/** TTS_SYNTHESIZE provenance AUDIO_VALIDATE requires (same binding shape). */
+async function requireTtsProvenance(ctx: StageRunContext): Promise<void> {
+  const entry = await ctx.ledger.load("TTS_SYNTHESIZE");
+  if (!entry || entry.status !== "PASSED" || entry.output_hash === null) {
+    throw new StageError(
+      "TTS_SYNTHESIZE_NOT_PASSED",
+      "AUDIO_VALIDATE requires a PASSED TTS_SYNTHESIZE ledger entry with its output hash",
+    );
+  }
+  if (!ctx.upstream || ctx.upstream.stage !== "TTS_SYNTHESIZE") {
+    throw new StageError(
+      "TTS_SYNTHESIZE_NOT_PASSED",
+      "no TTS_SYNTHESIZE upstream provenance in this run context; " +
+        "invoke audio validation through the pipeline or prime the ledger first",
+    );
+  }
+  if (ctx.upstream.outputHash !== entry.output_hash) {
+    throw new StageError(
+      "TTS_SYNTHESIZE_HASH_MISMATCH",
+      `upstream hash ${(ctx.upstream.outputHash ?? "(null)").slice(0, 12)} does not match the ` +
+        `TTS_SYNTHESIZE ledger output ${entry.output_hash.slice(0, 12)}`,
+    );
+  }
+}
+
+/** SHA-256 of cards.jsonl (fail closed when the artifact is missing). */
+async function cardsJsonlSha256(workDir: string): Promise<string> {
+  return sha256File(path.join(workDir, "cards.jsonl"));
+}
+
+/** Map TTS/agent errors onto StageError so codes survive the ledger. */
+function toTtsStageError(err: unknown): StageError {
+  if (err instanceof StageError) return err;
+  if (err instanceof TtsProviderError) {
+    // Only transport/rate-limit failures are retryable (spec 11.1).
+    return new StageError(err.code, err.message, { retryable: err.retryable });
+  }
+  if (err instanceof WorkPacketError || err instanceof ReviewLoopError) {
+    return new StageError(err.code, err.message);
+  }
+  if (err instanceof MediaSpawnError) {
+    return new StageError(err.code, err.message);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return new StageError("STAGE_UNEXPECTED_ERROR", message);
+}
+
+/**
+ * TTS_SYNTHESIZE: plan the audio coverage from the validated content records,
+ * reuse every still-intact cached asset, and synthesize the rest through the
+ * replaceable provider into private content-addressed WAVs that carry their
+ * text hash as RIFF metadata. The manifest rewritten here is exactly the
+ * current required asset set, so a partial `--limit` run can never validate.
+ */
+export function createTtsSynthesizeStage(options: TtsSynthesizeStageOptions): AnyStage {
+  const ttsConfigPath = options.ttsConfigPath ?? DEFAULT_TTS_CONFIG_PATH;
+  const limit = options.limit;
+  return {
+    name: "TTS_SYNTHESIZE",
+    configVersion: TTS_CONFIG_VERSION,
+    inputSchema: z.unknown(),
+    outputSchema: TtsSynthesizeOutputSchema,
+    computeInputHash: async (ctx) => {
+      const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
+      return hashJson({
+        stage: "TTS_SYNTHESIZE",
+        configVersion: TTS_CONFIG_VERSION,
+        sourceHash: ctx.sourceHash,
+        tts_config_sha256: await sha256File(ttsConfigPath),
+        cards_jsonl_sha256: await cardsJsonlSha256(workDir),
+        limit: limit ?? null,
+        upstream: ctx.upstream?.outputHash ?? null,
+      });
+    },
+    run: async (_input, ctx) => {
+      try {
+        const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
+        const config = await readTtsConfig(ttsConfigPath);
+        await requireCardsProvenance(ctx);
+        const workloads = await loadUnitWorkloads(workDir);
+        const items = collectTtsItems(workloads);
+        if (items.length === 0) {
+          throw new StageError(
+            "TTS_INPUT_EMPTY",
+            "no headwords or example sentences recovered from the validated content; " +
+              "refusing to pass TTS_SYNTHESIZE with zero audio coverage",
+          );
+        }
+        const existing = await loadAudioManifest(workDir);
+        const plan = buildTtsPlan({ items, config, existing });
+        const entries = limit !== undefined ? plan.entries.slice(0, limit) : plan.entries;
+
+        // Verify cached assets against the disk BEFORE any paid call: a hit
+        // requires an intact file whose bytes still match the manifest.
+        const decided: Array<{ entry: (typeof entries)[number]; cached: AudioManifestRow | null }> = [];
+        for (const entry of entries) {
+          const prior = existing.find((row) => row.cache_key === entry.cacheKey) ?? null;
+          let valid: AudioManifestRow | null = null;
+          if (entry.cached && prior) {
+            const absPath = path.join(workDir, entry.objectKey);
+            if (await fileExists(absPath)) {
+              if ((await sha256File(absPath)) === prior.sha256) valid = prior;
+            }
+          }
+          decided.push({ entry, cached: valid });
+        }
+
+        let provider: TtsProvider | null = null;
+        const owed = decided.filter((decision) => decision.cached === null);
+        if (owed.length > 0) {
+          const apiKey = options.apiKey === undefined ? resolveTtsApiKey() : options.apiKey;
+          if (!apiKey) {
+            throw new StageError(
+              "TTS_API_KEY_MISSING",
+              `${owed.length} audio asset(s) need synthesis but no API key is configured; ` +
+                `set ${"MIMO_API_KEY"} (or the legacy local name) in the local environment`,
+            );
+          }
+          provider = createMiMoTtsProvider({
+            apiKey,
+            baseUrl: config.base_url,
+            model: config.model,
+            voice: config.voice,
+            format: config.audio_format,
+            timeoutMs: config.timeout_ms,
+            maxRetries: options.maxRetries ?? config.max_retries,
+            retryableStatusCodes: config.retryable_status_codes,
+            ...(options.fetchFn !== undefined ? { fetchFn: options.fetchFn } : {}),
+            ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
+            logger: ctx.logger,
+          });
+        }
+
+        const rows: AudioManifestRow[] = [];
+        let cacheHits = 0;
+        let synthesized = 0;
+        for (const { entry, cached } of decided) {
+          let fileSha256: string;
+          let bytes: number;
+          if (cached) {
+            fileSha256 = cached.sha256;
+            bytes = cached.bytes;
+            cacheHits += 1;
+          } else {
+            const result = await provider!.synthesize({ text: entry.text });
+            // The WAV carries its text hash as metadata: the audio gate's
+            // binding to the content records (spec 5.8).
+            const wav = withWavInfoComment(Buffer.from(result.audioBase64, "base64"), entry.textSha256);
+            const absPath = path.join(workDir, entry.objectKey);
+            await mkdir(path.dirname(absPath), { recursive: true });
+            await writeFile(absPath, wav);
+            fileSha256 = await sha256File(absPath);
+            bytes = wav.length;
+            synthesized += 1;
+          }
+          rows.push({
+            cache_key: entry.cacheKey,
+            object_key: entry.objectKey,
+            // Relative to the manifest's directory (`audio/`), mirroring the
+            // other private JSONL artifacts.
+            wav_path: path.posix.relative(AUDIO_DIR, entry.objectKey),
+            text_sha256: entry.textSha256,
+            text_chars: entry.textChars,
+            min_seconds: entry.minSeconds,
+            max_seconds: entry.maxSeconds,
+            sha256: fileSha256,
+            bytes,
+            provider: config.provider,
+            model: config.model,
+            voice: config.voice,
+            synthesis_config_version: config.synthesis_config_version,
+          });
+        }
+        rows.sort((a, b) => (a.cache_key < b.cache_key ? -1 : a.cache_key > b.cache_key ? 1 : 0));
+        const manifestSha256 = await writeAudioManifest(workDir, rows);
+        ctx.logger.info("tts_synthesize_completed", {
+          stage: "TTS_SYNTHESIZE",
+          compile_run_id: ctx.runId,
+          output_hash: manifestSha256,
+        });
+        return {
+          source_sha256: ctx.sourceHash,
+          audio_manifest: AUDIO_MANIFEST,
+          audio_manifest_sha256: manifestSha256,
+          synthesis_config_version: config.synthesis_config_version,
+          counts: {
+            items: items.length,
+            unique_texts: entries.length,
+            cache_hits: cacheHits,
+            synthesized,
+          },
+          characters: entries.reduce((acc, entry) => acc + entry.textChars, 0),
+          assets: rows.map((row) => ({
+            cache_key: row.cache_key,
+            object_key: row.object_key,
+            text_sha256: row.text_sha256,
+            text_chars: row.text_chars,
+            min_seconds: row.min_seconds,
+            max_seconds: row.max_seconds,
+            sha256: row.sha256,
+            bytes: row.bytes,
+          })),
+        } satisfies TtsSynthesizeOutput;
+      } catch (err) {
+        throw toTtsStageError(err);
+      }
+    },
+  };
+}
+
+/** Argument array for `lexiloop_media inspect` on a per-source work dir. */
+export function ttsInspectSpawnArgs(ttsConfigPath: string, workDir: string): string[] {
+  return [
+    "inspect",
+    "--manifest",
+    path.join(workDir, AUDIO_MANIFEST),
+    "--out",
+    path.join(workDir, AUDIO_INSPECTION),
+    "--policy",
+    path.resolve(ttsConfigPath),
+  ];
+}
+
+/**
+ * AUDIO_VALIDATE: the deterministic audio gate (spec 5.8). 100% of the
+ * manifest-required assets must exist and cover every required text; the
+ * Python worker (ffprobe/soundfile only — no ASR, no audio read-back)
+ * verifies container/codec/rate/channels, the text-length duration band,
+ * non-empty/non-silent audio with bounded head/tail silence, peak, clipping
+ * ratio, file size, and the WAV `text_hash` metadata against the content
+ * records. Its inspection artifact is the only input RELEASE_PACKAGE accepts.
+ */
+export function createAudioValidateStage(options: AudioValidateStageOptions): AnyStage {
+  const ttsConfigPath = options.ttsConfigPath ?? DEFAULT_TTS_CONFIG_PATH;
+  const { runPython } = options;
+  return {
+    name: "AUDIO_VALIDATE",
+    configVersion: TTS_CONFIG_VERSION,
+    inputSchema: z.unknown(),
+    outputSchema: AudioValidateOutputSchema,
+    computeInputHash: async (ctx) => {
+      const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
+      return hashJson({
+        stage: "AUDIO_VALIDATE",
+        configVersion: TTS_CONFIG_VERSION,
+        sourceHash: ctx.sourceHash,
+        tts_config_sha256: await sha256File(ttsConfigPath),
+        cards_jsonl_sha256: await cardsJsonlSha256(workDir),
+        audio_manifest_sha256: await sha256File(path.join(workDir, AUDIO_MANIFEST)),
+        upstream: ctx.upstream?.outputHash ?? null,
+      });
+    },
+    run: async (_input, ctx) => {
+      try {
+        const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
+        const config = await readTtsConfig(ttsConfigPath);
+        // CARD_GENERATE provenance (ledger + artifact binding) and the
+        // immediate TTS_SYNTHESIZE upstream must both match before the gate.
+        await requireCardsLedgerProvenance(ctx);
+        await requireTtsProvenance(ctx);
+
+        const rows = await loadAudioManifest(workDir);
+        if (rows.length === 0) {
+          throw new StageError("AUDIO_GATE_FAILED", "no audio manifest; run TTS_SYNTHESIZE first");
+        }
+        for (const row of rows) {
+          if (!(await fileExists(path.join(workDir, row.object_key)))) {
+            throw new StageError(
+              "AUDIO_ASSET_MISSING",
+              `manifest asset ${row.cache_key.slice(0, 12)} missing: ${row.object_key}`,
+            );
+          }
+        }
+
+        // Coverage: the manifest must contain every required text's cache key
+        // (a limited synthesis run can never pass the audio gate).
+        const workloads = await loadUnitWorkloads(workDir);
+        const expected = buildTtsPlan({ items: collectTtsItems(workloads), config, existing: rows });
+        const manifestKeys = new Set(rows.map((row) => row.cache_key));
+        const missing = expected.entries.filter((entry) => !manifestKeys.has(entry.cacheKey));
+        if (missing.length > 0) {
+          throw new StageError(
+            "AUDIO_COVERAGE_INCOMPLETE",
+            `${missing.length} required text(s) absent from the audio manifest ` +
+              `(first: ${missing[0]!.cacheKey.slice(0, 12)} "${missing[0]!.text}")`,
+          );
+        }
+
+        await runPython(ttsInspectSpawnArgs(ttsConfigPath, workDir));
+
+        const inspectionPath = path.join(workDir, AUDIO_INSPECTION);
+        const inspection = await readJsonl(inspectionPath, AudioInspectionRowSchema);
+        const byKey = new Map(inspection.map((row) => [row.cache_key, row]));
+        for (const row of rows) {
+          const result = byKey.get(row.cache_key);
+          if (!result) {
+            throw new StageError(
+              "AUDIO_GATE_FAILED",
+              `no inspection result for asset ${row.cache_key.slice(0, 12)}`,
+            );
+          }
+          if (!result.ok) {
+            throw new StageError(
+              "AUDIO_GATE_FAILED",
+              `asset ${row.cache_key.slice(0, 12)} failed deterministic inspection: ` +
+                `${result.error ?? "UNKNOWN"}${result.message ? ` (${result.message})` : ""}`,
+            );
+          }
+          if (result.text_sha256 !== undefined && result.text_sha256 !== row.text_sha256) {
+            throw new StageError(
+              "AUDIO_GATE_FAILED",
+              `asset ${row.cache_key.slice(0, 12)} text hash does not match the content record`,
+            );
+          }
+        }
+
+        return {
+          source_sha256: ctx.sourceHash,
+          audio_inspection: AUDIO_INSPECTION,
+          audio_inspection_sha256: await sha256File(inspectionPath),
+          synthesis_config_version: config.synthesis_config_version,
+          counts: { checked: rows.length, failed: 0 },
+        } satisfies AudioValidateOutput;
+      } catch (err) {
+        throw toTtsStageError(err);
+      }
+    },
+  };
+}
+
+/**
+ * The 13 production stages in compile order. RELEASE_PACKAGE is still a
+ * fail-closed placeholder (task 10); the four semantic agent gates are wired
+ * to the filesystem provider queue, so they fail closed with
+ * SEMANTIC_PACKETS_PENDING until externally-dispatched agents answer;
+ * CARD_GENERATE derives the rule-based cards once every target Unit exited
+ * the gates as PASSED; TTS_SYNTHESIZE caches provider audio and
+ * AUDIO_VALIDATE runs the deterministic Python audio gate.
  */
 export function getProductionStages(
   options: {
@@ -1176,6 +1682,7 @@ export function getProductionStages(
     rulePath?: string;
     ocrConfigPath?: string;
     cardsConfigPath?: string;
+    ttsConfigPath?: string;
   } = {},
 ): AnyStage[] {
   // resolveMediaStageOptions always provides a real argument-array runner,
@@ -1183,6 +1690,10 @@ export function getProductionStages(
   // "validate" stale artifacts without spawning the worker.
   const mediaOptions: MediaStageOptions = resolveMediaStageOptions(options);
   const agentGateOptions: AgentGateOptions = { privateRoot: mediaOptions.privateRoot };
+  const ttsOptions: TtsStageOptions = {
+    privateRoot: mediaOptions.privateRoot,
+    ...(options.ttsConfigPath !== undefined ? { ttsConfigPath: options.ttsConfigPath } : {}),
+  };
   const stages: Partial<Record<ProductionStageName, AnyStage>> = {
     IMAGE_EXTRACT: createImageExtractStage(mediaOptions),
     WATERMARK_CLEAN: createWatermarkCleanStage(mediaOptions),
@@ -1196,6 +1707,8 @@ export function getProductionStages(
       privateRoot: mediaOptions.privateRoot,
       ...(options.cardsConfigPath !== undefined ? { cardsConfigPath: options.cardsConfigPath } : {}),
     }),
+    TTS_SYNTHESIZE: createTtsSynthesizeStage(ttsOptions),
+    AUDIO_VALIDATE: createAudioValidateStage({ ...ttsOptions, runPython: mediaOptions.runPython }),
   };
   return PRODUCTION_STAGE_NAMES.map((name) => stages[name] ?? unimplementedStage(name));
 }

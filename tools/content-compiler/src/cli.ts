@@ -49,11 +49,19 @@ import {
   createWatermarkCleanStage,
   CardGenerateOutputSchema,
   createCardGenerateStage,
+  createAudioValidateStage,
+  createTtsSynthesizeStage,
+  AudioValidateOutputSchema,
   DEFAULT_CARDS_CONFIG_PATH,
+  DEFAULT_TTS_CONFIG_PATH,
+  TtsSynthesizeOutputSchema,
   PRODUCTION_STAGE_DEPENDENCIES,
   RELEASE_STAGE,
   getProductionStages,
 } from "./stage-registry";
+import { buildTtsPlan, collectTtsItems, readTtsConfig } from "./tts/plan";
+import { loadAudioManifest } from "./tts/cache";
+import type { TtsFetchFn } from "./tts/provider";
 import {
   VISUAL_OCR_QUEUE_DIR,
   ingestResult,
@@ -66,6 +74,7 @@ import {
   WorkPacketError,
   ingestSemanticResult,
   loadSemanticQueue,
+  loadUnitWorkloads,
   pendingUnitKeys,
   semanticQueueStatus,
 } from "./agents/work-packets";
@@ -89,6 +98,18 @@ export interface CliDeps {
    * `createPythonRunner()`; tests inject a stub.
    */
   runPython?: SpawnPythonFn;
+  /**
+   * Injectable HTTP boundary for the TTS provider (tests); defaults to global
+   * fetch. Never used by `tts plan`, and by `tts synthesize` only with
+   * explicit `--execute`.
+   */
+  ttsFetchFn?: TtsFetchFn;
+  /**
+   * Injectable TTS API key (tests); undefined resolves MIMO_API_KEY / the
+   * legacy local mimo-key from the environment at run time. The value is
+   * never logged and never lands in any artifact.
+   */
+  ttsApiKey?: string | null;
 }
 
 interface RunCommandOptions {
@@ -729,6 +750,227 @@ async function executeCardsGenerate(deps: CliDeps, options: CardsGenerateOptions
   }
 }
 
+// ---------------------------------------------------------------------------
+// Cached MiMo TTS (spec 5.8): tts plan | tts synthesize | tts validate
+//
+// `tts plan` is a pure dry-run: characters, request count, cache hits/misses,
+// and estimated output bytes BEFORE any paid/network call — it never writes.
+// `tts synthesize` is INERT without the explicit --execute flag; with it, the
+// command runs the SAME TTS_SYNTHESIZE stage handler the pipeline uses (its
+// CARD_GENERATE hash precondition included) and records a resume-consistent
+// PASSED entry in the shared stage ledger. `tts validate` runs the same
+// AUDIO_VALIDATE stage (the deterministic Python audio gate) and records the
+// output RELEASE_PACKAGE accepts. The API key is read only from the local
+// environment and is never logged or written to any artifact.
+// ---------------------------------------------------------------------------
+
+interface TtsCommandOptions {
+  sourceHash: string;
+  privateRoot?: string;
+  config?: string;
+}
+
+interface TtsSynthesizeCommandOptions extends TtsCommandOptions {
+  limit?: string;
+  execute?: boolean;
+}
+
+function ttsErrorCode(err: unknown): string | null {
+  if (err instanceof StageError || err instanceof WorkPacketError) return err.code;
+  return null;
+}
+
+function ttsFailure(deps: CliDeps, command: string, err: unknown): void {
+  const code = ttsErrorCode(err);
+  const message = err instanceof Error ? err.message : String(err);
+  deps.writeLine(`tts ${command} failed${code ? ` [${code}]` : ""}: ${message}`);
+  deps.exit?.(1);
+}
+
+function resolveTtsConfigPath(options: TtsCommandOptions): string {
+  const configOption = options.config ?? DEFAULT_TTS_CONFIG_PATH;
+  return path.isAbsolute(configOption) ? configOption : path.join(REPO_ROOT, configOption);
+}
+
+/** Print the synthesis plan; shared verbatim by `tts plan` and the dry-run. */
+async function printTtsPlan(deps: CliDeps, options: TtsCommandOptions): Promise<void> {
+  if (!/^[0-9a-f]{64}$/.test(options.sourceHash)) {
+    throw new Error("--source-hash must be a 64-character sha-256 hex string");
+  }
+  const workDir = workDirFor(deps, options.privateRoot, options.sourceHash);
+  const config = await readTtsConfig(resolveTtsConfigPath(options));
+  const workloads = await loadUnitWorkloads(workDir);
+  const items = collectTtsItems(workloads);
+  const plan = buildTtsPlan({ items, config, existing: await loadAudioManifest(workDir) });
+  deps.writeLine(
+    `tts plan: ${items.length} item(s) -> ${plan.requestCount} unique text(s) ` +
+      `(provider=${config.provider} model=${config.model} voice=${config.voice})`,
+  );
+  deps.writeLine(
+    `characters=${plan.characters} request_count=${plan.requestCount} ` +
+      `cache_hits=${plan.cacheHits} cache_misses=${plan.cacheMisses}`,
+  );
+  deps.writeLine(`estimated_output_bytes=${plan.estimatedOutputBytes}`);
+  for (const entry of plan.entries) {
+    deps.writeLine(
+      `audio ${entry.objectKey} ${entry.cached ? "cached" : "miss"} chars=${entry.textChars}`,
+    );
+  }
+}
+
+async function executeTtsPlan(deps: CliDeps, options: TtsCommandOptions): Promise<void> {
+  try {
+    await printTtsPlan(deps, options);
+    deps.writeLine("tts plan OK (dry-run: no network call, no writes)");
+  } catch (err) {
+    ttsFailure(deps, "plan", err);
+  }
+}
+
+async function executeTtsSynthesize(
+  deps: CliDeps,
+  options: TtsSynthesizeCommandOptions,
+): Promise<void> {
+  try {
+    await printTtsPlan(deps, options);
+    if (!options.execute) {
+      deps.writeLine(
+        "tts synthesize INERT without --execute (dry-run plan above; no synthesis, no writes)",
+      );
+      return;
+    }
+    if (!/^[0-9a-f]{64}$/.test(options.sourceHash)) {
+      throw new Error("--source-hash must be a 64-character sha-256 hex string");
+    }
+    const sourceHash = options.sourceHash;
+    const workDir = workDirFor(deps, options.privateRoot, sourceHash);
+    const limit = options.limit !== undefined ? Number.parseInt(options.limit, 10) : undefined;
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      throw new Error("--limit must be a positive integer");
+    }
+    const stage = createTtsSynthesizeStage({
+      privateRoot: path.resolve(options.privateRoot ?? path.join(deps.workRoot, "..")),
+      ttsConfigPath: resolveTtsConfigPath(options),
+      ...(deps.ttsFetchFn !== undefined ? { fetchFn: deps.ttsFetchFn } : {}),
+      ...(deps.ttsApiKey !== undefined ? { apiKey: deps.ttsApiKey } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    const ledger = deps.createLedger(sourceHash);
+    await withWorkLock(deps, workDir, async () => {
+      // Mirror the pipeline's upstream context so the recorded input hash is
+      // exactly what a `run`/`resume` would compute for TTS_SYNTHESIZE.
+      const upstreamEntry = await ledger.load("CARD_GENERATE");
+      const ctx: StageRunContext = {
+        runId: `tts-${new Date().toISOString()}`,
+        sourceHash,
+        config: {},
+        ledger,
+        logger: deps.logger,
+        upstream:
+          upstreamEntry?.status === "PASSED" && upstreamEntry.output_hash !== null
+            ? { stage: "CARD_GENERATE", outputHash: upstreamEntry.output_hash }
+            : null,
+      };
+      const inputHash = await stage.computeInputHash(ctx);
+      const existing = await ledger.load(stage.name);
+      if (
+        existing?.status === "PASSED" &&
+        existing.input_hash === inputHash &&
+        existing.config_version_hash === configVersionHash(stage)
+      ) {
+        deps.writeLine("tts synthesize up-to-date (PASSED, input unchanged)");
+        return;
+      }
+      const output = TtsSynthesizeOutputSchema.parse(await stage.run(undefined, ctx));
+      const now = new Date().toISOString();
+      await ledger.save({
+        stage: stage.name,
+        status: "PASSED",
+        compile_run_id: ctx.runId,
+        input_hash: inputHash,
+        config_version_hash: configVersionHash(stage),
+        output_hash: hashJson(output),
+        attempts: (existing?.attempts ?? 0) + 1,
+        started_at: now,
+        finished_at: now,
+        updated_at: now,
+        error_code: null,
+      });
+      for (const asset of output.assets) {
+        deps.writeLine(`asset ${asset.object_key} ${asset.bytes}B`);
+      }
+      deps.writeLine(
+        `tts synthesize OK (${output.counts.unique_texts} unique text(s), ` +
+          `${output.counts.synthesized} synthesized, ${output.counts.cache_hits} cache hit(s)) -> ` +
+          path.join(workDir, "audio", "manifest.jsonl"),
+      );
+    }, "tts");
+  } catch (err) {
+    ttsFailure(deps, "synthesize", err);
+  }
+}
+
+async function executeTtsValidate(deps: CliDeps, options: TtsCommandOptions): Promise<void> {
+  try {
+    if (!/^[0-9a-f]{64}$/.test(options.sourceHash)) {
+      throw new Error("--source-hash must be a 64-character sha-256 hex string");
+    }
+    const sourceHash = options.sourceHash;
+    const workDir = workDirFor(deps, options.privateRoot, sourceHash);
+    const stage = createAudioValidateStage({
+      privateRoot: path.resolve(options.privateRoot ?? path.join(deps.workRoot, "..")),
+      ttsConfigPath: resolveTtsConfigPath(options),
+      runPython: deps.runPython ?? createPythonRunner(),
+    });
+    const ledger = deps.createLedger(sourceHash);
+    await withWorkLock(deps, workDir, async () => {
+      const upstreamEntry = await ledger.load("TTS_SYNTHESIZE");
+      const ctx: StageRunContext = {
+        runId: `tts-validate-${new Date().toISOString()}`,
+        sourceHash,
+        config: {},
+        ledger,
+        logger: deps.logger,
+        upstream:
+          upstreamEntry?.status === "PASSED" && upstreamEntry.output_hash !== null
+            ? { stage: "TTS_SYNTHESIZE", outputHash: upstreamEntry.output_hash }
+            : null,
+      };
+      const inputHash = await stage.computeInputHash(ctx);
+      const existing = await ledger.load(stage.name);
+      if (
+        existing?.status === "PASSED" &&
+        existing.input_hash === inputHash &&
+        existing.config_version_hash === configVersionHash(stage)
+      ) {
+        deps.writeLine("tts validate up-to-date (PASSED, input unchanged)");
+        return;
+      }
+      const output = AudioValidateOutputSchema.parse(await stage.run(undefined, ctx));
+      const now = new Date().toISOString();
+      await ledger.save({
+        stage: stage.name,
+        status: "PASSED",
+        compile_run_id: ctx.runId,
+        input_hash: inputHash,
+        config_version_hash: configVersionHash(stage),
+        output_hash: hashJson(output),
+        attempts: (existing?.attempts ?? 0) + 1,
+        started_at: now,
+        finished_at: now,
+        updated_at: now,
+        error_code: null,
+      });
+      deps.writeLine(
+        `tts validate OK (${output.counts.checked} asset(s) passed deterministic inspection) -> ` +
+          path.join(workDir, "audio", "inspection.jsonl"),
+      );
+    }, "tts");
+  } catch (err) {
+    ttsFailure(deps, "validate", err);
+  }
+}
+
 export function buildCli(deps: CliDeps): Command {
   const program = new Command();
   program
@@ -898,6 +1140,42 @@ export function buildCli(deps: CliDeps): Command {
     .action(async (options: CardsGenerateOptions) => {
       await executeCardsGenerate(deps, options);
     });
+
+  const tts = program
+    .command("tts")
+    .description("cached MiMo TTS synthesis and deterministic audio validation (spec 5.8)");
+  const ttsSourceOption = (command: Command): Command =>
+    command
+      .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
+      .option("--config <path>", "versioned TTS synthesis config JSON", DEFAULT_TTS_CONFIG_PATH)
+      .option("--private-root <dir>", "private root holding work/<source-hash> directories");
+
+  ttsSourceOption(
+    tts
+      .command("plan")
+      .description("dry-run: characters, request count, cache hits/misses before any paid call"),
+  ).action(async (options: TtsCommandOptions) => {
+    await executeTtsPlan(deps, options);
+  });
+
+  ttsSourceOption(
+    tts
+      .command("synthesize")
+      .description("synthesize missing assets through the TTS provider (INERT without --execute)"),
+  )
+    .option("--limit <n>", "synthesize only the first N unique texts (smoke runs)")
+    .option("--execute", "REQUIRED to perform paid synthesis and write private audio", false)
+    .action(async (options: TtsSynthesizeCommandOptions) => {
+      await executeTtsSynthesize(deps, options);
+    });
+
+  ttsSourceOption(
+    tts
+      .command("validate")
+      .description("run the deterministic audio gate over every cached asset"),
+  ).action(async (options: TtsCommandOptions) => {
+    await executeTtsValidate(deps, options);
+  });
 
   return program;
 }

@@ -20,6 +20,7 @@ from typing import Any, NoReturn, Sequence
 import cv2
 import numpy as np
 
+from lexiloop_media import audio as audio_worker
 from lexiloop_media import ocr as ocr_worker
 from lexiloop_media import pdf_images, watermarks
 from lexiloop_media.watermarks import WatermarkRule
@@ -342,6 +343,10 @@ def build_parser() -> argparse.ArgumentParser:
     # separately from the shared CLI (contract tests monkeypatch the engine
     # hook there).
     ocr_worker.add_ocr_subparser(sub)
+
+    # Deterministic audio-gate inspection (spec 5.8): ffprobe/soundfile only,
+    # no ASR and no network; the command body lives in lexiloop_media.audio.
+    audio_worker.add_audio_subparser(sub)
 
     sleep = sub.add_parser(
         "selftest-sleep",
