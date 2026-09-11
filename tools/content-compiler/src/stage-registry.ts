@@ -6,11 +6,15 @@
  * WATERMARK_CLEAN call the versioned Python media workers (spec 5.3) through
  * `src/media.ts`; LAYOUT_OCR runs the PP-StructureV3 worker and
  * STRUCTURE_NORMALIZE recovers records deterministically, gating on
- * visual-OCR review packets (spec 5.4). Every other stage is still an
- * unimplemented, fail-closed handler. The names, order, and dependencies
- * declared here are final.
+ * visual-OCR review packets (spec 5.4); AGENT_ENRICH through REPAIR_LOOP run
+ * the four isolated agent roles (generation, independent review,
+ * deterministic validator, repair) behind the fail-closed three-round state
+ * machine (spec 5.6). Every other stage is still an unimplemented, fail-closed
+ * handler. The names, order, and dependencies declared here are final.
  */
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
+import { UnitValidationReport as UnitValidationReportSchema } from "@lexiloop/content-schema";
 import { hashJson, hashString, StageError, type AnyStage, type StageRunContext } from "./stage";
 import {
   DEFAULT_RULE_PATH,
@@ -42,8 +46,33 @@ import {
   unresolvedUnitKeys,
   VISUAL_OCR_QUEUE_DIR,
 } from "./agents/visual-ocr";
-import { mkdir, writeFile } from "node:fs/promises";
+import {
+  SEMANTIC_QUEUE_DIR,
+  WorkPacketError,
+  enqueueOrders,
+  loadSemanticQueue,
+  loadUnitWorkloads,
+  semanticQueueDigest,
+  type UnitWorkload,
+  type WorkOrder,
+} from "./agents/work-packets";
+import {
+  assessUnit,
+  collectUnitStates,
+  ReviewLoopError,
+  type UnitAssessment,
+} from "./agents/review-loop";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+
+/** Value type of the validation report (the schema export is value-only). */
+type UnitValidationReportT = z.output<typeof UnitValidationReportSchema>;
+
+/** Assessments whose phase hands the caller a work order to enqueue. */
+type OrderBearingAssessment = Extract<UnitAssessment, { order: WorkOrder }>;
+
+/** Assessments whose phase carries a deterministic validation report. */
+type ReportedAssessment = Extract<UnitAssessment, { report: UnitValidationReportT }>;
 
 export const PRODUCTION_STAGE_NAMES = [
   "SOURCE_FINGERPRINT",
@@ -584,9 +613,329 @@ export function createStructureNormalizeStage(options: MediaStageOptions): AnySt
   };
 }
 
+// ---------------------------------------------------------------------------
+// Semantic agent gates (spec 5.6): AGENT_ENRICH -> AGENT_REVIEW ->
+// DETERMINISTIC_VALIDATE -> REPAIR_LOOP
+//
+// Four isolated roles run behind one fail-closed state machine per Unit:
+// generation, independent review (which reads only source evidence, the
+// generated result, and the schema), deterministic validation, and repair
+// (only reviewer-flagged issues, mapped per issue code). Each stage owns one
+// packet boundary: it enqueues the packets its phase needs, then fails with
+// SEMANTIC_PACKETS_PENDING until externally-dispatched agents have answered
+// (filesystem provider; no LLM key lives in this application). After at most
+// three repair rounds a fourth repair is impossible and the whole Unit
+// becomes BLOCKED — there is no flag, CLI command, or DB update that clears
+// it, so CARD_GENERATE can only run when every target Unit exited all four
+// gates as PASSED.
+// ---------------------------------------------------------------------------
+
+/** Options for the semantic agent gate stages. */
+export interface AgentGateOptions {
+  /** Private root holding per-source work directories. */
+  privateRoot: string;
+  /** Versioned forbidden-term list for the deterministic validator. */
+  forbiddenTerms?: readonly string[];
+}
+
+export const AgentGateOutputSchema = z.object({
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Exit phase of every target Unit for this gate (assessUnit phases). */
+  units: z
+    .array(
+      z.object({
+        unit_key: z.string().min(1),
+        phase: z.string().min(1),
+      }),
+    )
+    .min(1),
+});
+export type AgentGateOutput = z.output<typeof AgentGateOutputSchema>;
+
+const AGENT_GATE_CONFIG_VERSION = "1";
+
+interface AgentGatePaths {
+  workDir: string;
+  queueDir: string;
+}
+
+function agentGatePaths(options: AgentGateOptions, sourceHash: string): AgentGatePaths {
+  const workDir = workDirectoryFor(options.privateRoot, sourceHash);
+  return { workDir, queueDir: path.join(workDir, SEMANTIC_QUEUE_DIR) };
+}
+
+/** Reassess every target Unit from the current queue state (pure, per run). */
+async function assessTargetUnits(
+  gate: AgentGatePaths,
+  options: AgentGateOptions,
+  ctx: StageRunContext,
+): Promise<Array<{ workload: UnitWorkload; assessment: UnitAssessment }>> {
+  const workloads = await loadUnitWorkloads(gate.workDir);
+  const entries = await loadSemanticQueue(gate.queueDir);
+  const states = collectUnitStates(
+    entries,
+    workloads.map((workload) => workload.unitKey),
+  );
+  return workloads.map((workload) => ({
+    workload,
+    assessment: assessUnit(workload, states.get(workload.unitKey)!, {
+      compileRunId: ctx.runId,
+      ...(options.forbiddenTerms !== undefined ? { forbiddenTerms: options.forbiddenTerms } : {}),
+    }),
+  }));
+}
+
+function unitKeysOf(
+  assessed: ReadonlyArray<{ workload: UnitWorkload }>,
+): string {
+  return assessed.map(({ workload }) => workload.unitKey).join(",");
+}
+
+/** Map agent-module errors onto StageError so codes survive the ledger. */
+function toAgentStageError(err: unknown): StageError {
+  if (err instanceof StageError) return err;
+  if (err instanceof WorkPacketError || err instanceof ReviewLoopError) {
+    return new StageError(err.code, err.message);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return new StageError("STAGE_UNEXPECTED_ERROR", message);
+}
+
+/** Atomic JSON write (temp file in the same directory, renamed over). */
+async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const tmp = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.tmp-${randomBytes(6).toString("hex")}`,
+  );
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(tmp, filePath);
+}
+
 /**
- * The 13 production stages in compile order. SOURCE_FINGERPRINT and the
- * stages from AGENT_ENRICH onward are still fail-closed placeholders.
+ * AGENT_ENRICH / AGENT_REVIEW: drive one packet boundary per Unit — the
+ * generation packets, then the review packet answering the unit's current
+ * generation run. Both enqueue what their phase needs and then fail closed
+ * with SEMANTIC_PACKETS_PENDING until the dispatched agents' results have
+ * been ingested; both pass once no target Unit awaits their phase.
+ */
+function createAgentPacketStage(
+  name: "AGENT_ENRICH" | "AGENT_REVIEW",
+  options: AgentGateOptions,
+): AnyStage {
+  const phase = name === "AGENT_ENRICH" ? "awaiting_generation" : "awaiting_review";
+  const roleLabel = name === "AGENT_ENRICH" ? "generation" : "review";
+  return {
+    name,
+    configVersion: AGENT_GATE_CONFIG_VERSION,
+    inputSchema: z.unknown(),
+    outputSchema: AgentGateOutputSchema,
+    // The queue digest folds every packet and result into the input hash, so
+    // an ingested agent result invalidates the gate and the pipeline
+    // naturally re-runs it on the next invocation.
+    computeInputHash: async (ctx) => {
+      const gate = agentGatePaths(options, ctx.sourceHash);
+      return hashJson({
+        stage: name,
+        configVersion: AGENT_GATE_CONFIG_VERSION,
+        sourceHash: ctx.sourceHash,
+        queue: await semanticQueueDigest(gate.queueDir),
+        forbidden_terms: options.forbiddenTerms ? hashJson(options.forbiddenTerms) : null,
+        upstream: ctx.upstream?.outputHash ?? null,
+      });
+    },
+    run: async (_input, ctx) => {
+      try {
+        const gate = agentGatePaths(options, ctx.sourceHash);
+        const assessed = await assessTargetUnits(gate, options, ctx);
+        const awaiting = assessed.filter(
+          (entry): entry is { workload: UnitWorkload; assessment: OrderBearingAssessment } =>
+            entry.assessment.phase === phase,
+        );
+        if (awaiting.length > 0) {
+          await enqueueOrders(gate.queueDir, awaiting.map(({ assessment }) => assessment.order));
+          throw new StageError(
+            "SEMANTIC_PACKETS_PENDING",
+            `${awaiting.length} ${roleLabel} packet(s) pending for unit(s) ${unitKeysOf(awaiting)}; ` +
+              "dispatch one fresh agent per packet per docs/runbooks/content-agent-compile.md, " +
+              "ingest its result, then resume",
+          );
+        }
+        return {
+          source_sha256: ctx.sourceHash,
+          units: assessed.map(({ workload, assessment }) => ({
+            unit_key: workload.unitKey,
+            phase: assessment.phase,
+          })),
+        } satisfies AgentGateOutput;
+      } catch (err) {
+        throw toAgentStageError(err);
+      }
+    },
+  };
+}
+
+export function createAgentEnrichStage(options: AgentGateOptions): AnyStage {
+  return createAgentPacketStage("AGENT_ENRICH", options);
+}
+
+export function createAgentReviewStage(options: AgentGateOptions): AnyStage {
+  return createAgentPacketStage("AGENT_REVIEW", options);
+}
+
+/**
+ * DETERMINISTIC_VALIDATE: mechanically checks schema, enums, lengths,
+ * coverage, foreign keys, stable keys, cited provenance, source-field
+ * immutability, forbidden terms, and cross-field consistency for every
+ * target Unit, persisting the per-unit reports under
+ * `<work-dir>/validation/`. A Unit whose ERROR findings attach to fields no
+ * reviewer flagged is blocked here and now: the repair protocol can never
+ * address them (agents repair only reviewer-flagged issues).
+ */
+export function createDeterministicValidateStage(options: AgentGateOptions): AnyStage {
+  return {
+    name: "DETERMINISTIC_VALIDATE",
+    configVersion: AGENT_GATE_CONFIG_VERSION,
+    inputSchema: z.unknown(),
+    outputSchema: AgentGateOutputSchema,
+    computeInputHash: async (ctx) => {
+      const gate = agentGatePaths(options, ctx.sourceHash);
+      return hashJson({
+        stage: "DETERMINISTIC_VALIDATE",
+        configVersion: AGENT_GATE_CONFIG_VERSION,
+        sourceHash: ctx.sourceHash,
+        queue: await semanticQueueDigest(gate.queueDir),
+        forbidden_terms: options.forbiddenTerms ? hashJson(options.forbiddenTerms) : null,
+        upstream: ctx.upstream?.outputHash ?? null,
+      });
+    },
+    run: async (_input, ctx) => {
+      try {
+        const gate = agentGatePaths(options, ctx.sourceHash);
+        const assessed = await assessTargetUnits(gate, options, ctx);
+        const validated: Array<{ workload: UnitWorkload; assessment: ReportedAssessment }> = [];
+        for (const entry of assessed) {
+          if (!("report" in entry.assessment)) {
+            throw new StageError(
+              "SEMANTIC_STATE_INVALID",
+              `unit ${entry.workload.unitKey} has no deterministic validation report ` +
+                `(phase ${entry.assessment.phase}); generation and review results must resolve first`,
+            );
+          }
+          validated.push({ workload: entry.workload, assessment: entry.assessment });
+        }
+        for (const { workload, assessment } of validated) {
+          await writeJsonAtomic(
+            path.join(gate.workDir, "validation", `${workload.unitKey}.json`),
+            assessment.report,
+          );
+        }
+        const unrepairable = validated.filter(
+          ({ assessment }) =>
+            assessment.phase === "blocked" && assessment.reason === "UNREPAIRABLE_VALIDATION",
+        );
+        if (unrepairable.length > 0) {
+          throw new StageError(
+            "UNIT_BLOCKED",
+            `deterministic validation failed on field(s) no reviewer flagged for unit(s) ` +
+              `${unitKeysOf(unrepairable)}; the repair protocol only addresses reviewer-flagged issues`,
+            { blocked: true },
+          );
+        }
+        return {
+          source_sha256: ctx.sourceHash,
+          units: validated.map(({ workload, assessment }) => ({
+            unit_key: workload.unitKey,
+            phase: assessment.phase,
+          })),
+        } satisfies AgentGateOutput;
+      } catch (err) {
+        throw toAgentStageError(err);
+      }
+    },
+  };
+}
+
+/**
+ * REPAIR_LOOP: drives the repair protocol — enqueue one repair packet per
+ * flagged Unit (whose mapping must cover exactly the flagged issues), fail
+ * closed while agents work, and terminate any Unit that exhausts the budget:
+ * one initial generation/review plus at most three repair-agent + fresh-review
+ * cycles, then a fourth repair is impossible and the whole Unit becomes
+ * BLOCKED. The stage (and therefore CARD_GENERATE and everything after it)
+ * only passes when every target Unit exited the gates as PASSED.
+ */
+export function createRepairLoopStage(options: AgentGateOptions): AnyStage {
+  return {
+    name: "REPAIR_LOOP",
+    configVersion: AGENT_GATE_CONFIG_VERSION,
+    inputSchema: z.unknown(),
+    outputSchema: AgentGateOutputSchema,
+    computeInputHash: async (ctx) => {
+      const gate = agentGatePaths(options, ctx.sourceHash);
+      return hashJson({
+        stage: "REPAIR_LOOP",
+        configVersion: AGENT_GATE_CONFIG_VERSION,
+        sourceHash: ctx.sourceHash,
+        queue: await semanticQueueDigest(gate.queueDir),
+        forbidden_terms: options.forbiddenTerms ? hashJson(options.forbiddenTerms) : null,
+        upstream: ctx.upstream?.outputHash ?? null,
+      });
+    },
+    run: async (_input, ctx) => {
+      try {
+        const gate = agentGatePaths(options, ctx.sourceHash);
+        const assessed = await assessTargetUnits(gate, options, ctx);
+        const awaiting = assessed.filter(
+          (entry): entry is { workload: UnitWorkload; assessment: OrderBearingAssessment } =>
+            entry.assessment.phase === "awaiting_repair",
+        );
+        if (awaiting.length > 0) {
+          await enqueueOrders(gate.queueDir, awaiting.map(({ assessment }) => assessment.order));
+          throw new StageError(
+            "SEMANTIC_PACKETS_PENDING",
+            `${awaiting.length} repair packet(s) pending for unit(s) ${unitKeysOf(awaiting)}; ` +
+              "dispatch one fresh repair agent per packet per docs/runbooks/content-agent-compile.md, " +
+              "ingest its result, then resume",
+          );
+        }
+        const blocked = assessed.filter(({ assessment }) => assessment.phase === "blocked");
+        if (blocked.length > 0) {
+          const reasons = blocked
+            .map(({ assessment }) => (assessment.phase === "blocked" ? assessment.reason : ""))
+            .join(",");
+          throw new StageError(
+            "UNIT_BLOCKED",
+            `unit(s) ${unitKeysOf(blocked)} exhausted the agent review gates (${reasons}); ` +
+              "a BLOCKED unit can never reach card, audio, or package stages and no flag clears it",
+            { blocked: true },
+          );
+        }
+        const notPassed = assessed.filter(({ assessment }) => assessment.phase !== "passed");
+        if (notPassed.length > 0) {
+          throw new StageError(
+            "SEMANTIC_STATE_INVALID",
+            `unit(s) ${unitKeysOf(notPassed)} did not exit the review loop as PASSED ` +
+              `(${notPassed.map(({ assessment }) => assessment.phase).join(",")})`,
+          );
+        }
+        return {
+          source_sha256: ctx.sourceHash,
+          units: assessed.map(({ workload }) => ({ unit_key: workload.unitKey, phase: "passed" })),
+        } satisfies AgentGateOutput;
+      } catch (err) {
+        throw toAgentStageError(err);
+      }
+    },
+  };
+}
+
+/**
+ * The 13 production stages in compile order. SOURCE_FINGERPRINT,
+ * CARD_GENERATE, TTS_SYNTHESIZE, AUDIO_VALIDATE, and RELEASE_PACKAGE are
+ * still fail-closed placeholders; the four semantic agent gates are wired to
+ * the filesystem provider queue, so they fail closed with
+ * SEMANTIC_PACKETS_PENDING until externally-dispatched agents answer.
  */
 export function getProductionStages(
   options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string; ocrConfigPath?: string } = {},
@@ -595,11 +944,16 @@ export function getProductionStages(
   // so production wiring can never construct media stages that would
   // "validate" stale artifacts without spawning the worker.
   const mediaOptions: MediaStageOptions = resolveMediaStageOptions(options);
+  const agentGateOptions: AgentGateOptions = { privateRoot: mediaOptions.privateRoot };
   const stages: Partial<Record<ProductionStageName, AnyStage>> = {
     IMAGE_EXTRACT: createImageExtractStage(mediaOptions),
     WATERMARK_CLEAN: createWatermarkCleanStage(mediaOptions),
     LAYOUT_OCR: createLayoutOcrStage(mediaOptions),
     STRUCTURE_NORMALIZE: createStructureNormalizeStage(mediaOptions),
+    AGENT_ENRICH: createAgentEnrichStage(agentGateOptions),
+    AGENT_REVIEW: createAgentReviewStage(agentGateOptions),
+    DETERMINISTIC_VALIDATE: createDeterministicValidateStage(agentGateOptions),
+    REPAIR_LOOP: createRepairLoopStage(agentGateOptions),
   };
   return PRODUCTION_STAGE_NAMES.map((name) => stages[name] ?? unimplementedStage(name));
 }

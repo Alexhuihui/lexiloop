@@ -58,6 +58,13 @@ import {
   queueStatus,
   unresolvedUnitKeys,
 } from "./agents/visual-ocr";
+import {
+  SEMANTIC_QUEUE_DIR,
+  ingestSemanticResult,
+  loadSemanticQueue,
+  pendingUnitKeys,
+  semanticQueueStatus,
+} from "./agents/work-packets";
 import { hashJson, type AnyStage, type StageRunContext } from "./stage";
 
 export const DEFAULT_WORK_ROOT = path.join(".lexiloop-private", "work");
@@ -537,6 +544,93 @@ async function executeVisualOcrStatus(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Semantic agent queue (spec 5.6): agents semantic packets|ingest|status
+// plus agents resume.
+//
+// The queue lives under `<work-dir>/agent-queue/semantic/` and is consumed by
+// externally-dispatched generation/review/repair agents. Ingestion validates
+// every result before the stage ledger may continue: packet + source hashes,
+// one resolution per packet, agent run ids distinct across the whole queue,
+// review results answering the unit's current generation run, and repair
+// mappings covering exactly the flagged issues. Agents — never humans —
+// resolve every review decision; see docs/runbooks/content-agent-compile.md.
+// ---------------------------------------------------------------------------
+
+function semanticQueueDirFor(deps: CliDeps, options: AgentQueueOptions): string {
+  return path.join(workDirFor(deps, options.privateRoot, options.sourceHash), SEMANTIC_QUEUE_DIR);
+}
+
+function semanticFailure(deps: CliDeps, command: string, err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  deps.writeLine(`agents semantic ${command} failed: ${message}`);
+  deps.exit?.(1);
+}
+
+async function executeSemanticPackets(
+  deps: CliDeps,
+  options: AgentQueueOptions,
+): Promise<void> {
+  try {
+    const queueDir = semanticQueueDirFor(deps, options);
+    const entries = await loadSemanticQueue(queueDir);
+    for (const entry of entries) {
+      deps.writeLine(
+        `${entry.order.packet_id} ${entry.status} role=${entry.order.role} ` +
+          `round=${entry.order.round} unit=${entry.order.unit_key} ` +
+          `schema=${entry.order.schema_ref} prompt=${entry.order.prompt_path} ` +
+          `out=${entry.order.output_path}`,
+      );
+    }
+    deps.writeLine(`agents semantic packets OK (${entries.length} packet(s)) -> ${queueDir}`);
+  } catch (err) {
+    semanticFailure(deps, "packets", err);
+  }
+}
+
+async function executeSemanticIngest(
+  deps: CliDeps,
+  options: AgentQueueOptions & { result: string },
+): Promise<void> {
+  try {
+    const queueDir = semanticQueueDirFor(deps, options);
+    const raw = await readFile(options.result, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`--result is not valid JSON: ${options.result}`);
+    }
+    const entry = await ingestSemanticResult(queueDir, options.sourceHash, parsed);
+    deps.writeLine(`agents semantic ingest OK ${entry.order.packet_id} ${entry.status}`);
+  } catch (err) {
+    semanticFailure(deps, "ingest", err);
+  }
+}
+
+async function executeSemanticStatus(
+  deps: CliDeps,
+  options: AgentQueueOptions,
+): Promise<void> {
+  try {
+    const queueDir = semanticQueueDirFor(deps, options);
+    const status = await semanticQueueStatus(queueDir);
+    deps.writeLine(
+      `packets total=${status.total} pending=${status.pending} resolved=${status.resolved}`,
+    );
+    for (const role of ["generation", "review", "repair"] as const) {
+      const roleStatus = status.by_role[role];
+      deps.writeLine(
+        `${role} total=${roleStatus.total} pending=${roleStatus.pending} resolved=${roleStatus.resolved}`,
+      );
+    }
+    const units = pendingUnitKeys(await loadSemanticQueue(queueDir));
+    deps.writeLine(units.length > 0 ? `blocking units: ${units.join(",")}` : "no blocking units");
+  } catch (err) {
+    semanticFailure(deps, "status", err);
+  }
+}
+
 export function buildCli(deps: CliDeps): Command {
   const program = new Command();
   program
@@ -653,6 +747,45 @@ export function buildCli(deps: CliDeps): Command {
   ).action(async (options: AgentQueueOptions) => {
     await executeVisualOcrStatus(deps, options);
   });
+
+  const semantic = agents
+    .command("semantic")
+    .description("semantic content agents: generation, independent review, repair (spec 5.6)");
+
+  queueSourceOption(
+    semantic
+      .command("packets")
+      .description("list semantic work packets and their resolution status"),
+  ).action(async (options: AgentQueueOptions) => {
+    await executeSemanticPackets(deps, options);
+  });
+
+  queueSourceOption(
+    semantic
+      .command("ingest")
+      .description("validate and store one strict agent result JSON"),
+  )
+    .requiredOption("--result <path>", "path to the agent result JSON file")
+    .action(async (options: AgentQueueOptions & { result: string }) => {
+      await executeSemanticIngest(deps, options);
+    });
+
+  queueSourceOption(
+    semantic
+      .command("status")
+      .description("queue counts per role and units blocked pending agents"),
+  ).action(async (options: AgentQueueOptions) => {
+    await executeSemanticStatus(deps, options);
+  });
+
+  agents
+    .command("resume")
+    .description("resume the compile pipeline after ingesting agent results (same semantics as `run`)")
+    .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
+    .option("--through <stage>", "run only the contiguous prefix up to this stage")
+    .action(async (options: RunCommandOptions) => {
+      await executeRun(deps, options);
+    });
 
   return program;
 }
