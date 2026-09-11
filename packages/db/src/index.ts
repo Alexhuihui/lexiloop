@@ -16,8 +16,10 @@
  */
 export * from "./schema";
 export * from "./envelopes";
+export * from "./sqlite-driver";
 export * from "./repositories/context";
 export * from "./repositories/content";
 export * from "./repositories/releases";
+export * from "./repositories/alias-repository";
 export * from "./repositories/study";
 export * from "./repositories/users";

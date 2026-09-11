@@ -79,6 +79,23 @@ import {
   semanticQueueStatus,
 } from "./agents/work-packets";
 import { hashJson, StageError, type AnyStage, type StageRunContext } from "./stage";
+import { AliasGraphError } from "@lexiloop/domain";
+import type { LexiloopDatabase } from "@lexiloop/db";
+import {
+  ReleaseMetadataConfigSchema,
+  ReleasePackageOutputSchema,
+  createReleasePackageStage,
+} from "./release/package";
+import { verifyBundle } from "./release/validate";
+import { AliasFileSchema } from "./release/aliases";
+import {
+  PublishError,
+  activateRelease,
+  rollbackRelease,
+  smokeRelease,
+  stageBundle,
+  type R2AudioStore,
+} from "./release/publish";
 
 export const DEFAULT_WORK_ROOT = path.join(".lexiloop-private", "work");
 
@@ -110,6 +127,12 @@ export interface CliDeps {
    * never logged and never lands in any artifact.
    */
   ttsApiKey?: string | null;
+  /**
+   * Injectable D1 + R2 dependencies for the `release` publishing commands
+   * (tests inject fakes; production wiring comes from the publish script).
+   * Without them, `release stage|smoke|activate|rollback` fail closed.
+   */
+  release?: { db: LexiloopDatabase; r2: R2AudioStore };
 }
 
 interface RunCommandOptions {
@@ -971,6 +994,229 @@ async function executeTtsValidate(deps: CliDeps, options: TtsCommandOptions): Pr
   }
 }
 
+// ---------------------------------------------------------------------------
+// Release packaging and publishing (spec 5.9/6.4/11.3): release
+// package | verify | stage | smoke | activate | rollback
+//
+// `release package` runs the SAME RELEASE_PACKAGE stage the pipeline uses
+// (13/13 PASSED ledger entries required, stale provenance refused) and writes
+// the immutable bundle under `<private-root>/releases/<release-id>/`.
+// `release verify` re-hashes every manifest-declared file. `release stage`
+// imports the bundle as an INACTIVE D1 release (IMPORTING — app_meta is never
+// touched) and uploads content-addressed audio idempotently. `release smoke`
+// runs the pre-activation checks (IMPORTING -> VALIDATING -> READY, failures
+// -> FAILED). ONLY `activate` moves the active pointer, and only for READY;
+// `rollback` re-activates a RETIRED release. There is no --force and no
+// manual status override anywhere.
+// ---------------------------------------------------------------------------
+
+interface ReleasePackageOptions {
+  sourceHash: string;
+  privateRoot?: string;
+  previousRelease?: string;
+  metadata?: string;
+}
+
+interface ReleaseVerifyOptions {
+  bundle: string;
+}
+
+interface ReleaseStageOptions {
+  bundle: string;
+  privateRoot?: string;
+}
+
+interface ReleaseActivateOptions {
+  release: string;
+  aliases?: string;
+}
+
+interface ReleaseIdOptions {
+  release: string;
+}
+
+function releaseErrorCode(err: unknown): string | null {
+  if (err instanceof StageError || err instanceof PublishError || err instanceof AliasGraphError) {
+    return err.code;
+  }
+  return null;
+}
+
+function releaseFailure(deps: CliDeps, command: string, err: unknown): void {
+  const code = releaseErrorCode(err);
+  const message = err instanceof Error ? err.message : String(err);
+  deps.writeLine(`release ${command} failed${code ? ` [${code}]` : ""}: ${message}`);
+  deps.exit?.(1);
+}
+
+/** Absolute path resolution for bundle/private roots (repo-root relative). */
+function resolveRootPath(value: string | undefined, fallback: string): string {
+  const option = value ?? fallback;
+  return path.isAbsolute(option) ? option : path.join(REPO_ROOT, option);
+}
+
+function requireReleaseDeps(deps: CliDeps): { db: LexiloopDatabase; r2: R2AudioStore } {
+  if (!deps.release) {
+    throw new PublishError(
+      "RELEASE_DEPS_MISSING",
+      "D1/R2 dependencies are not configured; run publishing through scripts/publish-release.ts " +
+        "(a D1 database and a private R2 store are required)",
+    );
+  }
+  return deps.release;
+}
+
+async function executeReleasePackage(deps: CliDeps, options: ReleasePackageOptions): Promise<void> {
+  try {
+    if (!/^[0-9a-f]{64}$/.test(options.sourceHash)) {
+      throw new Error("--source-hash must be a 64-character sha-256 hex string");
+    }
+    const sourceHash = options.sourceHash;
+    const privateRoot = resolveRootPath(options.privateRoot, path.join(".lexiloop-private"));
+    let metadata;
+    if (options.metadata !== undefined) {
+      metadata = ReleaseMetadataConfigSchema.parse(JSON.parse(await readFile(options.metadata, "utf8")));
+    }
+    const stage = createReleasePackageStage({
+      privateRoot,
+      ...(metadata !== undefined ? { metadata } : {}),
+      ...(options.previousRelease !== undefined ? { previousReleaseId: options.previousRelease } : {}),
+    });
+    const ledger = deps.createLedger(sourceHash);
+    const upstreamEntry = await ledger.load("AUDIO_VALIDATE");
+    const ctx: StageRunContext = {
+      runId: `release-${new Date().toISOString()}`,
+      sourceHash,
+      config: {},
+      ledger,
+      logger: deps.logger,
+      upstream:
+        upstreamEntry?.status === "PASSED" && upstreamEntry.output_hash !== null
+          ? { stage: "AUDIO_VALIDATE", outputHash: upstreamEntry.output_hash }
+          : null,
+    };
+    const inputHash = await stage.computeInputHash(ctx);
+    const existing = await ledger.load(stage.name);
+    if (
+      existing?.status === "PASSED" &&
+      existing.input_hash === inputHash &&
+      existing.config_version_hash === configVersionHash(stage)
+    ) {
+      deps.writeLine("release package up-to-date (PASSED, input unchanged)");
+      return;
+    }
+    const output = ReleasePackageOutputSchema.parse(await stage.run(undefined, ctx));
+    const now = new Date().toISOString();
+    await ledger.save({
+      stage: stage.name,
+      status: "PASSED",
+      compile_run_id: ctx.runId,
+      input_hash: inputHash,
+      config_version_hash: configVersionHash(stage),
+      output_hash: hashJson(output),
+      attempts: (existing?.attempts ?? 0) + 1,
+      started_at: now,
+      finished_at: now,
+      updated_at: now,
+      error_code: null,
+    });
+    deps.writeLine(
+      `release package OK (${output.units} unit(s), ${output.audio_assets} audio asset(s)) -> ` +
+        `${path.join(privateRoot, output.release_dir)}`,
+    );
+    deps.writeLine(`release ${output.release_id} manifest ${output.manifest_sha256.slice(0, 12)}`);
+  } catch (err) {
+    releaseFailure(deps, "package", err);
+  }
+}
+
+async function executeReleaseVerify(deps: CliDeps, options: ReleaseVerifyOptions): Promise<void> {
+  try {
+    const bundleDir = resolveRootPath(options.bundle, options.bundle);
+    const result = await verifyBundle(bundleDir);
+    if (!result.ok || !result.manifest) {
+      const details = result.errors.map((error) => `${error.path}: ${error.reason}`).join("; ");
+      throw new PublishError("BUNDLE_VERIFY_FAILED", `bundle at ${bundleDir} failed verification: ${details}`);
+    }
+    deps.writeLine(
+      `release verify OK (${result.manifest.files.length} file(s), release ${result.manifest.release_id}, ` +
+        `manifest ${result.manifestSha256?.slice(0, 12)})`,
+    );
+  } catch (err) {
+    releaseFailure(deps, "verify", err);
+  }
+}
+
+async function executeReleaseStage(deps: CliDeps, options: ReleaseStageOptions): Promise<void> {
+  try {
+    const { db, r2 } = requireReleaseDeps(deps);
+    const bundleDir = resolveRootPath(options.bundle, options.bundle);
+    const verified = await verifyBundle(bundleDir);
+    if (!verified.ok || !verified.manifest) {
+      const details = verified.errors.map((error) => `${error.path}: ${error.reason}`).join("; ");
+      throw new PublishError("BUNDLE_VERIFY_FAILED", `bundle at ${bundleDir} failed verification: ${details}`);
+    }
+    const privateRoot = resolveRootPath(options.privateRoot, path.join(".lexiloop-private"));
+    const audioRoot = path.join(privateRoot, "work", verified.manifest.source_pdf_sha256);
+    const result = await stageBundle({ db, r2, bundleDir, audioRoot, now: Date.now() });
+    deps.writeLine(
+      `release stage OK (release ${result.releaseId} status=IMPORTING, ` +
+        `audio uploaded=${result.uploaded} reused=${result.reused}; app_meta untouched)`,
+    );
+  } catch (err) {
+    releaseFailure(deps, "stage", err);
+  }
+}
+
+async function executeReleaseSmoke(deps: CliDeps, options: ReleaseIdOptions): Promise<void> {
+  try {
+    const { db, r2 } = requireReleaseDeps(deps);
+    const result = await smokeRelease({ db, r2, releaseId: options.release });
+    for (const check of result.checks) {
+      const detail = check.detail ? ` (${check.detail})` : "";
+      deps.writeLine(`check ${check.passed ? "PASS" : "FAIL"} ${check.name}${detail}`);
+    }
+    deps.writeLine(`release smoke OK (release ${result.releaseId} status=READY)`);
+  } catch (err) {
+    releaseFailure(deps, "smoke", err);
+  }
+}
+
+async function executeReleaseActivate(deps: CliDeps, options: ReleaseActivateOptions): Promise<void> {
+  try {
+    const { db } = requireReleaseDeps(deps);
+    let aliases: readonly unknown[] | undefined;
+    if (options.aliases !== undefined) {
+      aliases = AliasFileSchema.parse(JSON.parse(await readFile(options.aliases, "utf8"))).edges;
+    }
+    const result = await activateRelease({
+      db,
+      releaseId: options.release,
+      ...(aliases !== undefined ? { aliases } : {}),
+      now: Date.now(),
+    });
+    deps.writeLine(
+      `release activate OK (release ${result.releaseId} status=ACTIVE, ` +
+        `previous=${result.previousReleaseId ?? "none"}, aliases=${result.aliasesImported})`,
+    );
+  } catch (err) {
+    releaseFailure(deps, "activate", err);
+  }
+}
+
+async function executeReleaseRollback(deps: CliDeps, options: ReleaseIdOptions): Promise<void> {
+  try {
+    const { db } = requireReleaseDeps(deps);
+    const result = await rollbackRelease({ db, releaseId: options.release, now: Date.now() });
+    deps.writeLine(
+      `release rollback OK (release ${result.releaseId} status=ACTIVE again, ` +
+        `undone=${result.previousReleaseId ?? "none"})`,
+    );
+  } catch (err) {
+    releaseFailure(deps, "rollback", err);
+  }
+}
+
 export function buildCli(deps: CliDeps): Command {
   const program = new Command();
   program
@@ -1176,6 +1422,63 @@ export function buildCli(deps: CliDeps): Command {
   ).action(async (options: TtsCommandOptions) => {
     await executeTtsValidate(deps, options);
   });
+
+  const release = program
+    .command("release")
+    .description("immutable release packaging and publishing (spec 5.9/6.4/11.3)");
+
+  release
+    .command("package")
+    .description("package a fully-compiled work directory into the immutable release bundle")
+    .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
+    .option("--private-root <dir>", "private root holding work/ and releases/ directories")
+    .option("--previous-release <id>", "previous compatible release recorded in rollback.json")
+    .option("--metadata <path>", "release metadata JSON (schema/prompt/model ids)", )
+    .action(async (options: ReleasePackageOptions) => {
+      await executeReleasePackage(deps, options);
+    });
+
+  release
+    .command("verify")
+    .description("verify a bundle: manifest schema + SHA-256/size of every declared file")
+    .requiredOption("--bundle <dir>", "release bundle directory")
+    .action(async (options: ReleaseVerifyOptions) => {
+      await executeReleaseVerify(deps, options);
+    });
+
+  release
+    .command("stage")
+    .description("verify + upload audio to private R2 + import an INACTIVE D1 release (IMPORTING)")
+    .requiredOption("--bundle <dir>", "release bundle directory")
+    .option("--private-root <dir>", "private root holding work/<source-hash> audio")
+    .action(async (options: ReleaseStageOptions) => {
+      await executeReleaseStage(deps, options);
+    });
+
+  release
+    .command("smoke")
+    .description("run pre-activation checks (IMPORTING -> VALIDATING -> READY, failures -> FAILED)")
+    .requiredOption("--release <id>", "staged release id")
+    .action(async (options: ReleaseIdOptions) => {
+      await executeReleaseSmoke(deps, options);
+    });
+
+  release
+    .command("activate")
+    .description("atomically switch the active pointer to a READY release (the ONLY pointer writer)")
+    .requiredOption("--release <id>", "READY release id")
+    .option("--aliases <path>", "typed alias edges JSON to validate and import with the activation batch")
+    .action(async (options: ReleaseActivateOptions) => {
+      await executeReleaseActivate(deps, options);
+    });
+
+  release
+    .command("rollback")
+    .description("re-activate a RETIRED release (presents the older keys again; user state untouched)")
+    .requiredOption("--release <id>", "RETIRED release id")
+    .action(async (options: ReleaseIdOptions) => {
+      await executeReleaseRollback(deps, options);
+    });
 
   return program;
 }

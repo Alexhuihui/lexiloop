@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { ReleaseStatus } from "@lexiloop/content-schema";
 import { z } from "zod";
@@ -9,7 +9,6 @@ import {
   contentRelease,
   releaseUnit,
   type AppMetaRow,
-  type ContentKeyAliasRow,
   type ContentReleaseRow,
   type ReleaseUnitRow,
 } from "../schema";
@@ -154,58 +153,102 @@ export class ReleaseRepository {
     });
     return (await this.getById(releaseId)) ?? target;
   }
-}
 
-export interface ResolveAliasInput {
-  releaseId: string;
-  /** Any historical stable key. */
-  key: string;
-}
+  /**
+   * Legal status transitions (spec 11.3). There is no manual override: only
+   * these edges exist, and activation/rollback go through `activateBatch`.
+   */
+  private static readonly LEGAL_TRANSITIONS: Readonly<Record<string, readonly string[]>> = {
+    DRAFT: ["IMPORTING", "FAILED"],
+    IMPORTING: ["VALIDATING", "FAILED"],
+    VALIDATING: ["READY", "FAILED"],
+    READY: ["ACTIVE"],
+    ACTIVE: ["RETIRED"],
+    RETIRED: ["ACTIVE"],
+  };
 
-/**
- * Stable-key alias resolution (spec 5.5/6.4). Walks typed one-to-one edges of
- * the release to the canonical root key user state references. Cycles and
- * edges whose stored `canonical_key` disagrees with the walked root fail
- * loudly — alias data must never silently redirect progress.
- */
-export class AliasRepository {
-  constructor(private readonly db: LexiloopDatabase) {}
-
-  async resolve(input: ResolveAliasInput): Promise<string> {
-    const { releaseId, key } = input;
-    let current = key;
-    let firstCanonicalKey: string | null = null;
-    const visited = new Set<string>([key]);
-    for (;;) {
-      const edge = await this.db
-        .select()
-        .from(contentKeyAlias)
-        .where(and(eq(contentKeyAlias.releaseId, releaseId), eq(contentKeyAlias.fromKey, current)))
-        .get();
-      if (!edge) {
-        break;
-      }
-      firstCanonicalKey ??= edge.canonicalKey;
-      if (visited.has(edge.toKey)) {
-        throw new Error(`content_key_alias cycle detected in release ${releaseId} at key ${edge.toKey}`);
-      }
-      visited.add(edge.toKey);
-      current = edge.toKey;
+  /**
+   * Advances the release status along the legal lifecycle (spec 11.3).
+   * Import/tooling-internal: there is no CLI flag or manual status override.
+   */
+  async updateStatus(releaseId: string, status: ReleaseStatusValue): Promise<ContentReleaseRow> {
+    const current = await this.getById(releaseId);
+    if (!current) {
+      throw new Error(`updateStatus: release ${releaseId} does not exist`);
     }
-    if (firstCanonicalKey !== null && firstCanonicalKey !== current) {
-      throw new Error(
-        `content_key_alias inconsistency in release ${releaseId}: stored canonical root ${firstCanonicalKey} != walked root ${current}`,
-      );
+    const allowed = ReleaseRepository.LEGAL_TRANSITIONS[current.status] ?? [];
+    if (!allowed.includes(status)) {
+      throw new Error(`updateStatus: release ${releaseId} cannot move ${current.status} -> ${status}`);
     }
-    return current;
+    await this.db.update(contentRelease).set({ status }).where(eq(contentRelease.releaseId, releaseId));
+    return (await this.getById(releaseId)) ?? current;
   }
 
-  /** Reads one edge without walking; mostly for verification tooling. */
-  async getEdge(releaseId: string, fromKey: string): Promise<ContentKeyAliasRow | undefined> {
-    return await this.db
-      .select()
-      .from(contentKeyAlias)
-      .where(and(eq(contentKeyAlias.releaseId, releaseId), eq(contentKeyAlias.fromKey, fromKey)))
-      .get();
+  /**
+   * The atomic activation batch (spec 6.4/11.3): imports the validated alias
+   * edges, demotes the previous ACTIVE release to RETIRED, promotes the target
+   * to ACTIVE and switches the app_meta pointer - all inside one transaction.
+   * Any failure (e.g. a malformed alias row violating a constraint) rolls the
+   * whole batch back, leaving user state, statuses, and the pointer unchanged.
+   * Target must be READY (first activation) or RETIRED (rollback).
+   */
+  async activateBatch(input: {
+    releaseId: string;
+    activatedAt: number;
+    aliasRows: readonly {
+      releaseId: string;
+      fromKey: string;
+      toKey: string;
+      canonicalKey: string;
+      createdAt: number;
+    }[];
+  }): Promise<ContentReleaseRow> {
+    const target = await this.getById(input.releaseId);
+    if (!target) {
+      throw new Error(`activateBatch: release ${input.releaseId} does not exist`);
+    }
+    if (target.status !== "READY" && target.status !== "RETIRED") {
+      throw new Error(`activateBatch: release ${input.releaseId} is ${target.status}, expected READY or RETIRED`);
+    }
+    const meta = await this.getMeta();
+    const txDb = this.db as BetterSQLite3Database<typeof schema>;
+    txDb.transaction((tx) => {
+      for (const row of input.aliasRows) {
+        // Idempotent re-import (rollback + re-activation): the same edge row
+        // is updated in place; a genuinely new edge colliding with a stored
+        // from_key still violates the unique index and fails the batch.
+        tx.insert(contentKeyAlias)
+          .values({
+            releaseId: row.releaseId,
+            fromKey: row.fromKey,
+            toKey: row.toKey,
+            // Imported migration edges are renames; 'EQUIVALENT' stays
+            // reserved for future same-entity declarations.
+            edgeType: "RENAME",
+            canonicalKey: row.canonicalKey,
+            createdAt: row.createdAt,
+          })
+          .onConflictDoUpdate({
+            target: [contentKeyAlias.releaseId, contentKeyAlias.fromKey, contentKeyAlias.toKey],
+            set: { canonicalKey: row.canonicalKey, createdAt: row.createdAt },
+          })
+          .run();
+      }
+      if (meta?.activeReleaseId && meta.activeReleaseId !== input.releaseId) {
+        tx.update(contentRelease)
+          .set({ status: "RETIRED" })
+          .where(eq(contentRelease.releaseId, meta.activeReleaseId))
+          .run();
+      }
+      tx.update(contentRelease)
+        .set({ status: "ACTIVE", activatedAt: input.activatedAt })
+        .where(eq(contentRelease.releaseId, input.releaseId))
+        .run();
+      tx.update(appMeta)
+        .set({ activeReleaseId: input.releaseId, configVersion: sql`${appMeta.configVersion} + 1` })
+        .where(eq(appMeta.id, 1))
+        .run();
+    });
+    return (await this.getById(input.releaseId)) ?? target;
   }
 }

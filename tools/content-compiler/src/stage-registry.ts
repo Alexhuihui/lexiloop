@@ -2,17 +2,19 @@
  * Production stage registry (spec 5.2).
  *
  * Declares the 13 production stage names in exact compile order plus their
- * dependency edges. Stages land task by task: IMAGE_EXTRACT and
- * WATERMARK_CLEAN call the versioned Python media workers (spec 5.3) through
- * `src/media.ts`; LAYOUT_OCR runs the PP-StructureV3 worker and
- * STRUCTURE_NORMALIZE recovers records deterministically, gating on
- * visual-OCR review packets (spec 5.4); AGENT_ENRICH through REPAIR_LOOP run
- * the four isolated agent roles (generation, independent review,
- * deterministic validator, repair) behind the fail-closed three-round state
- * machine (spec 5.6); CARD_GENERATE derives the four deterministic card types
- * and the introduction queues' fixed order from the review-passed content
- * (spec 5.7). Every other stage is still an unimplemented, fail-closed
- * handler. The names, order, and dependencies declared here are final.
+ * dependency edges. IMAGE_EXTRACT and WATERMARK_CLEAN call the versioned
+ * Python media workers (spec 5.3) through `src/media.ts`; LAYOUT_OCR runs the
+ * PP-StructureV3 worker and STRUCTURE_NORMALIZE recovers records
+ * deterministically, gating on visual-OCR review packets (spec 5.4);
+ * AGENT_ENRICH through REPAIR_LOOP run the four isolated agent roles
+ * (generation, independent review, deterministic validator, repair) behind the
+ * fail-closed three-round state machine (spec 5.6); CARD_GENERATE derives the
+ * four deterministic card types and the introduction queues' fixed order from
+ * the review-passed content (spec 5.7); TTS_SYNTHESIZE caches provider audio
+ * and AUDIO_VALIDATE runs the deterministic Python audio gate (spec 5.8);
+ * RELEASE_PACKAGE produces the immutable release bundle (spec 5.9, implemented
+ * in `src/release/package.ts`). The names, order, and dependencies declared
+ * here are final.
  */
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
@@ -99,6 +101,15 @@ import {
   type TtsFetchFn,
   type TtsProvider,
 } from "./tts/provider";
+import {
+  createReleasePackageStage,
+  RELEASE_PACKAGE_PREDECESSORS,
+  RELEASE_PACKAGE_STAGE,
+} from "./release/package";
+
+// Re-exported so the CLI and tests can resolve the packaging stage alongside
+// the other production stage factories.
+export { createReleasePackageStage, RELEASE_PACKAGE_STAGE, RELEASE_PACKAGE_PREDECESSORS };
 
 /** Value type of the validation report (the schema export is value-only). */
 type UnitValidationReportT = z.output<typeof UnitValidationReportSchema>;
@@ -112,21 +123,7 @@ type OrderBearingAssessment = Extract<UnitAssessment, { order: WorkOrder }>;
 /** Assessments whose phase carries a deterministic validation report. */
 type ReportedAssessment = Extract<UnitAssessment, { report: UnitValidationReportT }>;
 
-export const PRODUCTION_STAGE_NAMES = [
-  "SOURCE_FINGERPRINT",
-  "IMAGE_EXTRACT",
-  "WATERMARK_CLEAN",
-  "LAYOUT_OCR",
-  "STRUCTURE_NORMALIZE",
-  "AGENT_ENRICH",
-  "AGENT_REVIEW",
-  "DETERMINISTIC_VALIDATE",
-  "REPAIR_LOOP",
-  "CARD_GENERATE",
-  "TTS_SYNTHESIZE",
-  "AUDIO_VALIDATE",
-  "RELEASE_PACKAGE",
-] as const;
+export const PRODUCTION_STAGE_NAMES = [...RELEASE_PACKAGE_PREDECESSORS, RELEASE_PACKAGE_STAGE] as const;
 
 export type ProductionStageName = (typeof PRODUCTION_STAGE_NAMES)[number];
 
@@ -150,14 +147,15 @@ export const PRODUCTION_STAGE_DEPENDENCIES: Readonly<
 };
 
 /** The final stage, guarded so it only runs when all predecessors PASSED. */
-export const RELEASE_STAGE: ProductionStageName = "RELEASE_PACKAGE";
+export const RELEASE_STAGE: ProductionStageName = RELEASE_PACKAGE_STAGE;
 
 /** Default private root (git-ignored); artifacts live under `<root>/work/`. */
 export const DEFAULT_PRIVATE_ROOT = ".lexiloop-private";
 
 /**
- * Placeholder handler used until the real stage lands. Fails closed with a
- * non-retryable error so an accidental run can never produce content.
+ * Fail-closed handler for stages whose real implementation has not landed yet
+ * (currently SOURCE_FINGERPRINT). An accidental run can never produce content
+ * past it.
  */
 function unimplementedStage(name: ProductionStageName): AnyStage {
   const configVersion = "0-unimplemented";
@@ -170,7 +168,7 @@ function unimplementedStage(name: ProductionStageName): AnyStage {
     run: async () => {
       throw new StageError(
         "STAGE_NOT_IMPLEMENTED",
-        `Stage ${name} has no handler yet (planned for Phase 2 tasks 5-10)`,
+        `Stage ${name} has no handler yet (planned for Phase 2)`,
       );
     },
   };
@@ -1667,13 +1665,13 @@ export function createAudioValidateStage(options: AudioValidateStageOptions): An
 }
 
 /**
- * The 13 production stages in compile order. RELEASE_PACKAGE is still a
- * fail-closed placeholder (task 10); the four semantic agent gates are wired
- * to the filesystem provider queue, so they fail closed with
- * SEMANTIC_PACKETS_PENDING until externally-dispatched agents answer;
- * CARD_GENERATE derives the rule-based cards once every target Unit exited
- * the gates as PASSED; TTS_SYNTHESIZE caches provider audio and
- * AUDIO_VALIDATE runs the deterministic Python audio gate.
+ * The 13 production stages in compile order. Every stage is implemented:
+ * the four semantic agent gates are wired to the filesystem provider queue, so
+ * they fail closed with SEMANTIC_PACKETS_PENDING until externally-dispatched
+ * agents answer; CARD_GENERATE derives the rule-based cards once every target
+ * Unit exited the gates as PASSED; TTS_SYNTHESIZE caches provider audio and
+ * AUDIO_VALIDATE runs the deterministic Python audio gate; RELEASE_PACKAGE
+ * writes the immutable release bundle under `<private-root>/releases/`.
  */
 export function getProductionStages(
   options: {
@@ -1709,6 +1707,7 @@ export function getProductionStages(
     }),
     TTS_SYNTHESIZE: createTtsSynthesizeStage(ttsOptions),
     AUDIO_VALIDATE: createAudioValidateStage({ ...ttsOptions, runPython: mediaOptions.runPython }),
+    RELEASE_PACKAGE: createReleasePackageStage({ privateRoot: mediaOptions.privateRoot }),
   };
   return PRODUCTION_STAGE_NAMES.map((name) => stages[name] ?? unimplementedStage(name));
 }
