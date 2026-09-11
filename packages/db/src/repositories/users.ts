@@ -85,6 +85,27 @@ export class UserRepository {
       .returning();
     return rows.length > 0;
   }
+
+  /**
+   * seed-users credential rotation (spec 7.1): installs a freshly generated
+   * salt/verifier pair and bumps session_version in one statement, so every
+   * outstanding session of the account stops matching immediately.
+   */
+  async rotateCredentials(
+    ctx: UserContext,
+    input: { passwordSalt: string; passwordVerifier: string },
+  ): Promise<AppUserRow | undefined> {
+    const rows = await this.db
+      .update(appUser)
+      .set({
+        passwordSalt: input.passwordSalt,
+        passwordVerifier: input.passwordVerifier,
+        sessionVersion: sql`${appUser.sessionVersion} + 1`,
+      })
+      .where(eq(appUser.userId, ctx.userId))
+      .returning();
+    return rows[0];
+  }
 }
 
 export interface CreateAuthSessionInput {
