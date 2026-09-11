@@ -16,6 +16,8 @@ import { ZodError, flattenError } from "zod";
 import type { LexiloopDatabase } from "@lexiloop/db";
 import { DEFAULT_SESSION_IDLE_HOURS } from "./auth/session";
 import { registerAuthRoutes } from "./auth/routes";
+import { registerContentRoutes } from "./content/routes";
+import { registerProgressRoutes } from "./progress/routes";
 import { securityHeadersMiddleware } from "./middleware/security-headers";
 import type { AuthenticatedPrincipal } from "./middleware/auth";
 import { jsonError, requestContextMiddleware, type ManagedRequestContext } from "./observability/request-context";
@@ -35,6 +37,19 @@ export interface WorkerDeps {
   /** Drizzle handle over D1 (production) or better-sqlite3 (tests/scripts). */
   db: LexiloopDatabase;
   loginRateLimiter: LoginRateLimiter;
+  /**
+   * Private R2 bucket backing `/api/audio/*`. The production entry point
+   * passes the `AUDIO` binding (wrapped in instrumentR2); tests inject a
+   * fake. Routes fail closed with 503 when absent.
+   */
+  audioBucket?: R2Bucket;
+  /**
+   * Pre-created per-request log context. The production entry point creates
+   * it (with the request id and worker release id) BEFORE wrapping the
+   * D1/R2 bindings with instrumentD1/instrumentR2, so binding usage lands in
+   * this request's log line; tests omit it and the middleware creates one.
+   */
+  requestContext?: ManagedRequestContext;
   /** Extra accepted write-request Origins; the request's own origin is always allowed. */
   allowedOrigins?: readonly string[];
   /** Idle session window in hours (plan: SESSION_IDLE_HOURS=168). */
@@ -72,6 +87,8 @@ export function buildApp(deps: WorkerDeps): WorkerApp {
   });
 
   registerAuthRoutes(app);
+  registerContentRoutes(app);
+  registerProgressRoutes(app);
 
   app.notFound((c) => jsonError(c, 404, "NOT_FOUND", "Route not found"));
 

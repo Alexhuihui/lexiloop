@@ -94,22 +94,28 @@ interface LoggingOptions {
   releaseId?: string;
   logWrite?: LogWriter;
   now?: () => number;
+  /**
+   * Pre-created per-request context from the production entry point, which
+   * must instrument the D1/R2 bindings with the SAME context the request log
+   * reports. When absent (tests, scripts) a fresh context is created here.
+   */
+  requestContext?: ManagedRequestContext;
 }
 
 /** Outer-boundary middleware: request id, usage counters, one JSON log line. */
 export function requestContextMiddleware(options: LoggingOptions): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
     const requestId = requestIdFrom(c.req.header(REQUEST_ID_HEADER));
-    const context = createRequestLogContext(requestId, options.releaseId);
+    const context = options.requestContext ?? createRequestLogContext(requestId, options.releaseId);
     c.set("requestContext", context);
-    c.header(REQUEST_ID_HEADER, requestId);
+    c.header(REQUEST_ID_HEADER, context.requestId);
 
     const start = performance.now();
     await next();
 
     // Set on the finalized response so the id survives handler-returned
     // Responses (raw Response returns bypass c.header preparation).
-    c.res.headers.set(REQUEST_ID_HEADER, requestId);
+    c.res.headers.set(REQUEST_ID_HEADER, context.requestId);
 
     const status = c.res.status;
     const level: LogLevel = status >= 500 ? "error" : status >= 400 ? "warn" : "info";
@@ -169,9 +175,11 @@ interface D1ResultMeta {
 }
 
 /**
- * Wraps a D1 binding so every executed statement contributes
- * `meta.rows_read` / `meta.rows_written` to the request usage. `first()` has
- * no result metadata in the D1 API and is forwarded untouched.
+ * Wraps a D1 binding so every executed statement contributes to the request
+ * usage. `run`/`all` extract `meta.rows_read` / `meta.rows_written` from the
+ * D1 result; `raw` (the path drizzle's D1 driver uses for SELECTs) carries no
+ * metadata, so the number of returned rows is recorded instead — a lower
+ * bound on the true rows_read. `first()` is forwarded untouched.
  */
 export function instrumentD1(db: D1Database, usage: RequestUsageRecorder): D1Database {
   const recordMeta = (result: unknown): void => {
@@ -196,7 +204,9 @@ export function instrumentD1(db: D1Database, usage: RequestUsageRecorder): D1Dat
       },
       raw: async () => {
         const result = await statement.raw();
-        recordMeta(result);
+        if (Array.isArray(result)) {
+          usage.recordD1Read(result.length);
+        }
         return result;
       },
       first: statement.first.bind(statement),

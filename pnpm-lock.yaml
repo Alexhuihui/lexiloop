@@ -114,6 +114,9 @@ importers:
       '@lexiloop/fsrs':
         specifier: workspace:*
         version: link:../../packages/fsrs
+      drizzle-orm:
+        specifier: 0.45.2
+        version: 0.45.2(@cloudflare/workers-types@5.20260908.1)(@types/better-sqlite3@9.6.0)(better-sqlite3@13.0.3)
       hono:
         specifier: 4.13.7
         version: 4.13.7
