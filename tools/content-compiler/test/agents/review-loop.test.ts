@@ -612,6 +612,42 @@ describe("review loop (spec 5.6)", () => {
       expect.arrayContaining([expect.objectContaining({ check: "FOREIGN_KEY_UNKNOWN" })]),
     );
   });
+
+  it("blocks terminally when the reviewer flags a nonexistent field path", async () => {
+    const workload = makeWorkload();
+    const provider = stubProvider({
+      generation: (request) =>
+        generationOutputFor(workload, request.order.packet_id, request.packetHash, "run-gen"),
+      review: (request) => {
+        const generation = reviewedGeneration(request);
+        const review = reviewOutputFor(workload, generation, "run-review");
+        // A schema-valid but malformed reviewer verdict: the flagged path
+        // resolves to no generated field, so no repair protocol can address
+        // it. The unit must consume the normal flow into a terminal BLOCKED —
+        // never an unresolvable repair round and never an exception loop.
+        review.field_verdicts.push({
+          field_path: "explanations[9].translation_hints",
+          verdict: "REPAIR",
+          issue_code: "TRANSLATION_HINT_MISMATCH",
+          evidence: "越界路径",
+        });
+        return envelopeFor(request, "run-review", review);
+      },
+      repair: () => {
+        throw new Error("repair must never be dispatched for an unresolvable flag");
+      },
+    });
+
+    const result = await reviewUnit(workload, provider);
+
+    expect(result.status).toBe("BLOCKED");
+    expect(result.blockedReason).toBe("UNREPAIRABLE_VALIDATION");
+    expect(result.repairAttempts).toHaveLength(0);
+    expect(result.report.status).toBe("BLOCKED");
+    expect(result.report.findings).toEqual(
+      expect.arrayContaining([expect.objectContaining({ check: "REVIEW_FIELD_UNKNOWN" })]),
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

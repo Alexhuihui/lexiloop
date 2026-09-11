@@ -26,15 +26,17 @@ import {
 import { z } from "zod";
 import {
   SEMANTIC_PROMPT_VERSION,
+  WorkPacketError,
   buildGenerationOrder,
   buildRepairOrder,
   buildReviewOrder,
+  parseSemanticAgentResult,
   type SemanticGenerationResultT,
   type SemanticQueueEntry,
   type SemanticRepairResultT,
   type SemanticReviewResultT,
   type SemanticAgentResultT,
-  SemanticAgentResultSchema,
+  validateSemanticResult,
   type UnitWorkload,
   type WorkOrder,
 } from "./work-packets";
@@ -132,7 +134,7 @@ export function applyRepairs(
   meta: RepairMeta,
 ): AgentGenerationOutputT {
   const flagged = new Map<string, number>();
-  for (const field of flaggedFields(review).filter((field) => field.verdict === "REPAIR")) {
+  for (const field of flaggedFields(review, generation).filter((field) => field.verdict === "REPAIR")) {
     const key = `${field.field_path}\u0000${field.issue_code}`;
     flagged.set(key, (flagged.get(key) ?? 0) + 1);
   }
@@ -161,6 +163,8 @@ export function applyRepairs(
   );
   for (const action of repairs.repairs) {
     const resolved = parseFieldPath(action.field_path);
+    // Flagged fields are resolution-checked upstream (see flaggedFields);
+    // this remains as an internal assertion for direct misuse.
     if (!resolved || resolved.index >= explanations.length) {
       throw new ReviewLoopError(
         "REPAIR_FIELD_UNKNOWN",
@@ -288,7 +292,7 @@ export function assessUnit(
     repairRounds: round,
     forbiddenTerms: options.forbiddenTerms,
   });
-  const flags = flaggedFields(review);
+  const flags = flaggedFields(review, folded.generation);
   const settled = { generation: folded.generation, review, report };
 
   // A blocked Unit's report must say BLOCKED even when the deterministic
@@ -401,6 +405,15 @@ function toDispatchResult(
   };
 }
 
+/**
+ * Validate one dispatched result against THE shared fail-closed boundary
+ * (`validateSemanticResult`), using the loop's own state: packet identity,
+ * loop-scoped run distinctness, and role-specific target binding (review
+ * answers the current folded generation run; repair answers the latest
+ * review with a mapping covering exactly its resolvable flagged issues).
+ * `WorkPacketError` from the shared validator is re-typed as
+ * `ReviewLoopError` so this module keeps one public error surface.
+ */
 function validateDispatch(
   workload: UnitWorkload,
   state: UnitResultState,
@@ -409,70 +422,28 @@ function validateDispatch(
   raw: unknown,
   seenRunIds: ReadonlySet<string>,
 ): SemanticAgentResultT {
-  const parsed = SemanticAgentResultSchema.safeParse(toDispatchResult(request.order, request.packetHash, raw));
-  if (!parsed.success) {
-    throw new ReviewLoopError(
-      "OUTPUT_SCHEMA_INVALID",
-      `agent result for ${request.order.packet_id} violates the strict contract: ${parsed.error.issues[0]?.message}`,
-    );
-  }
-  const result = parsed.data;
-  if (result.packet_id !== request.order.packet_id) {
-    throw new ReviewLoopError("PACKET_MISMATCH", `result claims packet ${result.packet_id}`);
-  }
-  if (result.role !== request.order.role) {
-    throw new ReviewLoopError("ROLE_MISMATCH", `packet ${request.order.packet_id} expects ${request.order.role}`);
-  }
-  if (result.packet_hash !== request.packetHash) {
-    throw new ReviewLoopError("PACKET_HASH_MISMATCH", `packet ${request.order.packet_id} changed`);
-  }
-  if (seenRunIds.has(result.agent_run_id)) {
-    throw new ReviewLoopError(
-      "AGENT_RUN_NOT_DISTINCT",
-      `agent_run_id ${result.agent_run_id} already answered a packet for this unit`,
-    );
-  }
-  if (result.role === "review") {
-    const coherent = result.output.field_verdicts.every(
-      (verdict) => verdict.verdict === "PASS" || verdict.issue_code !== undefined,
-    );
-    if (!coherent) {
-      throw new ReviewLoopError(
-        "RESULT_INVALID",
-        "REPAIR/BLOCK field verdicts require a structured issue_code",
-      );
-    }
-  }
-  if (phase === "awaiting_generation" && result.role === "generation") {
-    if (result.output.unit_key !== workload.unitKey) {
-      throw new ReviewLoopError("UNIT_SCOPE_MISMATCH", "generation output leaves the unit scope");
-    }
-    if (result.output.input_hash !== request.packetHash) {
-      throw new ReviewLoopError(
-        "INPUT_HASH_MISMATCH",
-        "generation output does not answer the dispatched packet (source immutability)",
-      );
-    }
-  }
-  if (phase === "awaiting_review" && result.role === "review") {
-    if (result.output.unit_key !== workload.unitKey) {
-      throw new ReviewLoopError("UNIT_SCOPE_MISMATCH", "review output leaves the unit scope");
-    }
-    const { runId } = foldGeneration(state, state.repairs.length);
-    if (result.output.reviewed_agent_run_id !== runId) {
-      throw new ReviewLoopError("REVIEW_TARGET_MISMATCH", "review does not answer the current generation run");
-    }
-  }
-  if (phase === "awaiting_repair" && result.role === "repair") {
-    if (result.output.unit_key !== workload.unitKey) {
-      throw new ReviewLoopError("UNIT_SCOPE_MISMATCH", "repair output leaves the unit scope");
-    }
+  try {
+    const parsed = parseSemanticAgentResult(toDispatchResult(request.order, request.packetHash, raw));
+    const folded =
+      phase === "awaiting_generation" ? null : foldGeneration(state, state.repairs.length);
     const lastReview = state.reviews[state.reviews.length - 1];
-    if (!lastReview || result.output.review_id !== lastReview.result.output.review_id) {
-      throw new ReviewLoopError("REPAIR_TARGET_MISMATCH", "repair does not answer the latest review");
-    }
+    validateSemanticResult(parsed, {
+      role: request.order.role,
+      packetId: request.order.packet_id,
+      packetHash: request.packetHash,
+      unitKey: workload.unitKey,
+      seenRunIds,
+      currentGenerationRunId: phase === "awaiting_review" ? folded!.runId : null,
+      lastReviewId: lastReview ? lastReview.result.output.review_id : null,
+      ...(phase === "awaiting_repair" && lastReview
+        ? { flaggedIssues: flaggedFields(lastReview.result.output, folded!.generation) }
+        : {}),
+    });
+    return parsed;
+  } catch (err) {
+    if (err instanceof WorkPacketError) throw new ReviewLoopError(err.code, err.message);
+    throw err;
   }
-  return result;
 }
 
 function buildRepairAttempts(

@@ -49,13 +49,14 @@ import {
 import {
   SEMANTIC_QUEUE_DIR,
   WorkPacketError,
-  enqueueOrders,
   loadSemanticQueue,
   loadUnitWorkloads,
   semanticQueueDigest,
   type UnitWorkload,
   type WorkOrder,
 } from "./agents/work-packets";
+import { AgentDispatchPendingError } from "./agents/provider";
+import { createFilesystemProvider } from "./agents/filesystem-provider";
 import {
   assessUnit,
   collectUnitStates,
@@ -713,6 +714,40 @@ async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> 
 }
 
 /**
+ * Hand every awaiting Unit's work order to the filesystem provider — the one
+ * dispatch seam, shared with the runbook's supervisor flow: dispatch means
+ * "enqueue the packet, then fail with AgentDispatchPendingError until the
+ * externally-dispatched agent's result has been ingested". All pending
+ * packets are enqueued before the stage fails closed with their resume
+ * instructions.
+ */
+async function dispatchWorkOrders(
+  provider: ReturnType<typeof createFilesystemProvider>,
+  awaiting: ReadonlyArray<{ workload: UnitWorkload; assessment: OrderBearingAssessment }>,
+): Promise<never> {
+  const pending: string[] = [];
+  for (const { assessment } of awaiting) {
+    try {
+      await provider.dispatch(assessment.order);
+    } catch (err) {
+      if (err instanceof AgentDispatchPendingError) {
+        pending.push(err.message);
+        continue;
+      }
+      throw err;
+    }
+  }
+  // An awaiting assessment never has a stored result, so a resolved dispatch
+  // here would mean the queue changed mid-run; fail closed regardless.
+  throw new StageError(
+    "SEMANTIC_PACKETS_PENDING",
+    pending.length > 0
+      ? pending.join("; ")
+      : `packet ${awaiting[0]?.assessment.order.order.packet_id ?? "?"} awaits an external agent`,
+  );
+}
+
+/**
  * AGENT_ENRICH / AGENT_REVIEW: drive one packet boundary per Unit — the
  * generation packets, then the review packet answering the unit's current
  * generation run. Both enqueue what their phase needs and then fail closed
@@ -724,7 +759,6 @@ function createAgentPacketStage(
   options: AgentGateOptions,
 ): AnyStage {
   const phase = name === "AGENT_ENRICH" ? "awaiting_generation" : "awaiting_review";
-  const roleLabel = name === "AGENT_ENRICH" ? "generation" : "review";
   return {
     name,
     configVersion: AGENT_GATE_CONFIG_VERSION,
@@ -753,13 +787,8 @@ function createAgentPacketStage(
             entry.assessment.phase === phase,
         );
         if (awaiting.length > 0) {
-          await enqueueOrders(gate.queueDir, awaiting.map(({ assessment }) => assessment.order));
-          throw new StageError(
-            "SEMANTIC_PACKETS_PENDING",
-            `${awaiting.length} ${roleLabel} packet(s) pending for unit(s) ${unitKeysOf(awaiting)}; ` +
-              "dispatch one fresh agent per packet per docs/runbooks/content-agent-compile.md, " +
-              "ingest its result, then resume",
-          );
+          const provider = createFilesystemProvider({ queueDir: gate.queueDir, sourceHash: ctx.sourceHash });
+          await dispatchWorkOrders(provider, awaiting);
         }
         return {
           source_sha256: ctx.sourceHash,
@@ -891,13 +920,8 @@ export function createRepairLoopStage(options: AgentGateOptions): AnyStage {
             entry.assessment.phase === "awaiting_repair",
         );
         if (awaiting.length > 0) {
-          await enqueueOrders(gate.queueDir, awaiting.map(({ assessment }) => assessment.order));
-          throw new StageError(
-            "SEMANTIC_PACKETS_PENDING",
-            `${awaiting.length} repair packet(s) pending for unit(s) ${unitKeysOf(awaiting)}; ` +
-              "dispatch one fresh repair agent per packet per docs/runbooks/content-agent-compile.md, " +
-              "ingest its result, then resume",
-          );
+          const provider = createFilesystemProvider({ queueDir: gate.queueDir, sourceHash: ctx.sourceHash });
+          await dispatchWorkOrders(provider, awaiting);
         }
         const blocked = assessed.filter(({ assessment }) => assessment.phase === "blocked");
         if (blocked.length > 0) {

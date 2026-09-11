@@ -42,7 +42,7 @@ import {
 import { z } from "zod";
 import { MediaOutputInvalidError, readJsonl } from "../media";
 import { hashJson, hashString } from "../stage";
-import { EXPLANATION_FIELDS, flaggedFields } from "../validate/unit-validator";
+import { EXPLANATION_FIELDS, flaggedFields, type FlaggedField } from "../validate/unit-validator";
 import type { WorkOrderMeta } from "./provider";
 
 /** Value types of the strict contracts (the schema exports are value-only). */
@@ -496,23 +496,86 @@ function verdictsHaveIssueCodes(output: AgentReviewOutputT): boolean {
   );
 }
 
-/**
- * Validate one agent result and record it. The packet rows are never
- * modified. Throws `WorkPacketError` with a stable code on any violation
- * (fail closed): invalid envelopes, tampered hashes, foreign sources,
- * reused agent runs, review/repair answers detached from the unit's current
- * state, and repair mappings that do not cover exactly the flagged issues.
- */
-export async function ingestSemanticResult(
-  queueDir: string,
-  sourceHash: string,
-  result: unknown,
-): Promise<SemanticQueueEntry> {
-  const parsed = SemanticAgentResultSchema.safeParse(result);
+/** Parse one strict agent result (`OUTPUT_SCHEMA_INVALID` on violation). */
+export function parseSemanticAgentResult(raw: unknown): SemanticAgentResultT {
+  const parsed = SemanticAgentResultSchema.safeParse(raw);
   if (!parsed.success) {
-    throw new WorkPacketError("RESULT_INVALID", parsed.error.message);
+    throw new WorkPacketError(
+      "OUTPUT_SCHEMA_INVALID",
+      `violates the strict contract: ${parsed.error.issues[0]?.message ?? parsed.error.message}`,
+    );
   }
-  const response = parsed.data;
+  return parsed.data;
+}
+
+/**
+ * The context a semantic result must cohere with. Both fail-closed boundaries
+ * — the queue ingest (`ingestSemanticResult`) and the in-process dispatch
+ * loop (`reviewUnit`) — build this from their own state and call
+ * `validateSemanticResult`, so the invariants live in exactly one place and
+ * the two paths cannot drift apart.
+ */
+export interface SemanticResultContext {
+  /** The packet role the result claims to answer. */
+  role: "generation" | "review" | "repair";
+  packetId: string;
+  /** Canonical packet hash the result must echo verbatim. */
+  packetHash: string;
+  /** Unit scope the result (and its role output) must stay inside. */
+  unitKey: string;
+  /** source_hash the result must echo; enforced at the queue boundary only. */
+  sourceHash?: string;
+  /** True when the packet already has a stored result (queue boundary only). */
+  alreadyResolved?: boolean;
+  /** agent_run_ids that already answered a packet (queue-wide or loop-scoped). */
+  seenRunIds: ReadonlySet<string>;
+  /** agent_run_id of the unit's current generation (null = none resolved yet). */
+  currentGenerationRunId: string | null;
+  /** review_id of the latest resolved review (null = none resolved yet). */
+  lastReviewId: string | null;
+  /**
+   * The issues a repair mapping must cover exactly (repair results only);
+   * derived with the generation so unresolvable reviewer paths cannot create
+   * an unmappeable repair obligation.
+   */
+  flaggedIssues?: readonly FlaggedField[];
+}
+
+/**
+ * THE fail-closed validation of one semantic agent result against the packet
+ * it answers: envelope shape, packet identity (id/role/hash echo, source
+ * echo), agent-run distinctness, review verdict coherence, and role-specific
+ * target binding — a generation output answers its exact packet (source
+ * immutability), a review answers the unit's current generation run, and a
+ * repair answers the latest review with a mapping covering exactly the
+ * flagged issues. Throws `WorkPacketError` with a stable code on any
+ * violation; never records anything.
+ */
+export function validateSemanticResult(
+  response: SemanticAgentResultT,
+  context: SemanticResultContext,
+): SemanticAgentResultT {
+  if (response.packet_id !== context.packetId) {
+    throw new WorkPacketError("PACKET_MISMATCH", `result claims packet ${response.packet_id}`);
+  }
+  if (response.role !== context.role) {
+    throw new WorkPacketError("ROLE_MISMATCH", `packet ${context.packetId} expects ${context.role}`);
+  }
+  if (context.sourceHash !== undefined && response.source_hash !== context.sourceHash) {
+    throw new WorkPacketError("SOURCE_HASH_MISMATCH", `packet ${context.packetId}`);
+  }
+  if (response.packet_hash !== context.packetHash) {
+    throw new WorkPacketError("PACKET_HASH_MISMATCH", `packet ${context.packetId} changed`);
+  }
+  if (context.alreadyResolved) {
+    throw new WorkPacketError("RESULT_ALREADY_RESOLVED", `packet ${context.packetId} already has a result`);
+  }
+  if (context.seenRunIds.has(response.agent_run_id)) {
+    throw new WorkPacketError(
+      "AGENT_RUN_NOT_DISTINCT",
+      `agent_run_id ${response.agent_run_id} already answered a packet`,
+    );
+  }
   if (response.role === "review" && !verdictsHaveIssueCodes(response.output)) {
     throw new WorkPacketError(
       "RESULT_INVALID",
@@ -520,21 +583,91 @@ export async function ingestSemanticResult(
     );
   }
 
+  // Role-specific target binding before anything is stored.
+  if (response.role === "generation") {
+    if (response.output.packet_id !== context.packetId) {
+      throw new WorkPacketError("PACKET_MISMATCH", "generation output names a different packet");
+    }
+    if (response.output.unit_key !== context.unitKey) {
+      throw new WorkPacketError("UNIT_SCOPE_MISMATCH", "generation output leaves the packet's unit scope");
+    }
+    if (response.output.input_hash !== context.packetHash) {
+      throw new WorkPacketError(
+        "INPUT_HASH_MISMATCH",
+        "generation output does not answer the dispatched packet (source immutability)",
+      );
+    }
+  } else if (response.role === "review") {
+    if (response.output.unit_key !== context.unitKey) {
+      throw new WorkPacketError("UNIT_SCOPE_MISMATCH", "review output leaves the packet's unit scope");
+    }
+    if (response.output.reviewed_agent_run_id !== context.currentGenerationRunId) {
+      throw new WorkPacketError(
+        "REVIEW_TARGET_MISMATCH",
+        "review does not answer the unit's current generation run",
+      );
+    }
+  } else {
+    if (response.output.unit_key !== context.unitKey) {
+      throw new WorkPacketError("UNIT_SCOPE_MISMATCH", "repair output leaves the packet's unit scope");
+    }
+    if (context.lastReviewId === null || response.output.review_id !== context.lastReviewId) {
+      throw new WorkPacketError("REPAIR_TARGET_MISMATCH", "repair does not answer the latest review");
+    }
+    if (context.flaggedIssues) {
+      // Multiset compare: the mapping must cover exactly the flagged issues —
+      // no unmapped flagged issue, no rewrite of fields the reviewer passed.
+      const flaggedCounts = new Map<string, number>();
+      for (const field of context.flaggedIssues) {
+        const key = `${field.field_path}\u0000${field.issue_code}`;
+        flaggedCounts.set(key, (flaggedCounts.get(key) ?? 0) + 1);
+      }
+      const mappedCounts = new Map<string, number>();
+      for (const action of response.output.repairs) {
+        const key = `${action.field_path}\u0000${action.issue_code}`;
+        mappedCounts.set(key, (mappedCounts.get(key) ?? 0) + 1);
+      }
+      for (const [key, count] of mappedCounts) {
+        if (count > (flaggedCounts.get(key) ?? 0)) {
+          throw new WorkPacketError(
+            "REPAIR_OUT_OF_SCOPE",
+            `repair mapping touches a field the reviewer did not flag: ${key.replace("\u0000", " / ")}`,
+          );
+        }
+      }
+      for (const [key, count] of flaggedCounts) {
+        if ((mappedCounts.get(key) ?? 0) < count) {
+          throw new WorkPacketError(
+            "REPAIR_INCOMPLETE",
+            `reviewer-flagged issue has no repair mapping: ${key.replace("\u0000", " / ")}`,
+          );
+        }
+      }
+    }
+  }
+  return response;
+}
+
+/**
+ * Validate one agent result against the shared fail-closed boundary
+ * (`validateSemanticResult`, queue context: source echo, single resolution,
+ * queue-wide run distinctness, round ordering, repair mapping coverage) and
+ * record it. The packet rows are never modified. Throws `WorkPacketError`
+ * with a stable code on any violation (fail closed).
+ */
+export async function ingestSemanticResult(
+  queueDir: string,
+  sourceHash: string,
+  result: unknown,
+): Promise<SemanticQueueEntry> {
+  const response = parseSemanticAgentResult(result);
+
   const stored = await readJsonlStrict(queueFile(queueDir, PACKETS_FILE), (raw) =>
     StoredPacketSchema.parse(raw),
   );
   const entry = stored.find((candidate) => candidate.order.packet_id === response.packet_id);
   if (!entry) {
     throw new WorkPacketError("PACKET_NOT_FOUND", `unknown packet ${response.packet_id}`);
-  }
-  if (entry.packet_hash !== response.packet_hash) {
-    throw new WorkPacketError("PACKET_HASH_MISMATCH", `packet ${response.packet_id} changed`);
-  }
-  if (response.source_hash !== sourceHash) {
-    throw new WorkPacketError("SOURCE_HASH_MISMATCH", `packet ${response.packet_id}`);
-  }
-  if (entry.order.role !== response.role) {
-    throw new WorkPacketError("ROLE_MISMATCH", `packet ${response.packet_id} expects ${entry.order.role}`);
   }
 
   const states = await loadUnitStates(queueDir);
@@ -562,76 +695,26 @@ export async function ingestSemanticResult(
   const results = await readJsonlStrict(queueFile(queueDir, RESULTS_FILE), (raw) =>
     SemanticAgentResultSchema.parse(raw),
   );
-  if (results.some((existing) => existing.packet_id === response.packet_id)) {
-    throw new WorkPacketError(
-      "RESULT_ALREADY_RESOLVED",
-      `packet ${response.packet_id} already has a result`,
-    );
-  }
-  if (results.some((existing) => existing.agent_run_id === response.agent_run_id)) {
-    throw new WorkPacketError(
-      "AGENT_RUN_NOT_DISTINCT",
-      `agent_run_id ${response.agent_run_id} already answered a packet`,
-    );
-  }
-
-  // Role-specific target binding before anything is stored.
-  if (response.role === "generation") {
-    if (response.output.packet_id !== response.packet_id) {
-      throw new WorkPacketError("PACKET_MISMATCH", "generation output names a different packet");
-    }
-    if (response.output.input_hash !== response.packet_hash) {
-      throw new WorkPacketError(
-        "INPUT_HASH_MISMATCH",
-        "generation output does not answer the dispatched packet (source immutability)",
-      );
-    }
-  } else if (response.role === "review") {
-    if (response.output.unit_key !== entry.order.unit_key) {
-      throw new WorkPacketError("UNIT_SCOPE_MISMATCH", "review output leaves the packet's unit scope");
-    }
-    if (response.output.reviewed_agent_run_id !== currentGenerationRunId(state)) {
-      throw new WorkPacketError(
-        "REVIEW_TARGET_MISMATCH",
-        "review does not answer the unit's current generation run",
-      );
-    }
-  } else {
-    if (response.output.unit_key !== entry.order.unit_key) {
-      throw new WorkPacketError("UNIT_SCOPE_MISMATCH", "repair output leaves the packet's unit scope");
-    }
-    if (!lastReview || response.output.review_id !== lastReview.result.output.review_id) {
-      throw new WorkPacketError("REPAIR_TARGET_MISMATCH", "repair does not answer the latest review");
-    }
-    // Multiset compare: the mapping must cover exactly the flagged issues —
-    // no unmapped flagged issue, no rewrite of fields the reviewer passed.
-    const flaggedCounts = new Map<string, number>();
-    for (const field of flaggedFields(lastReview.result.output)) {
-      const key = `${field.field_path}\u0000${field.issue_code}`;
-      flaggedCounts.set(key, (flaggedCounts.get(key) ?? 0) + 1);
-    }
-    const mappedCounts = new Map<string, number>();
-    for (const action of response.output.repairs) {
-      const key = `${action.field_path}\u0000${action.issue_code}`;
-      mappedCounts.set(key, (mappedCounts.get(key) ?? 0) + 1);
-    }
-    for (const [key, count] of mappedCounts) {
-      if (count > (flaggedCounts.get(key) ?? 0)) {
-        throw new WorkPacketError(
-          "REPAIR_OUT_OF_SCOPE",
-          `repair mapping touches a field the reviewer did not flag: ${key.replace("\u0000", " / ")}`,
-        );
-      }
-    }
-    for (const [key, count] of flaggedCounts) {
-      if ((mappedCounts.get(key) ?? 0) < count) {
-        throw new WorkPacketError(
-          "REPAIR_INCOMPLETE",
-          `reviewer-flagged issue has no repair mapping: ${key.replace("\u0000", " / ")}`,
-        );
-      }
-    }
-  }
+  const lastReviewOutput = lastReview?.result.output;
+  // The repair packet embeds the generation its review answered; flagged
+  // issue resolution needs it so unresolvable reviewer paths can never
+  // create an unmappeable repair obligation.
+  const packetGeneration =
+    entry.packet.role === "repair" ? entry.packet.generation : undefined;
+  validateSemanticResult(response, {
+    role: entry.order.role,
+    packetId: entry.order.packet_id,
+    packetHash: entry.packet_hash,
+    unitKey: entry.order.unit_key,
+    sourceHash,
+    alreadyResolved: results.some((existing) => existing.packet_id === response.packet_id),
+    seenRunIds: new Set(results.map((existing) => existing.agent_run_id)),
+    currentGenerationRunId: currentGenerationRunId(state),
+    lastReviewId: lastReviewOutput ? lastReviewOutput.review_id : null,
+    ...(entry.order.role === "repair" && lastReviewOutput
+      ? { flaggedIssues: flaggedFields(lastReviewOutput, packetGeneration) }
+      : {}),
+  });
 
   await appendJsonl(queueFile(queueDir, RESULTS_FILE), response);
   return {

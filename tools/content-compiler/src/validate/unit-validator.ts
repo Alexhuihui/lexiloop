@@ -64,11 +64,28 @@ export interface FlaggedField {
   verdict: "REPAIR" | "BLOCK";
 }
 
-/** Fields the reviewer flagged (everything but PASS). BLOCK is terminal and
- * never repairable, but is included so callers can detect it. */
-export function flaggedFields(review: AgentReviewOutputT): FlaggedField[] {
+/**
+ * Fields the reviewer flagged (everything but PASS with an issue code). When
+ * the generation output is supplied, flags whose `field_path` does not
+ * resolve to a real generated field — a malformed path or an out-of-range
+ * explanation index — are excluded: no repair protocol can address them, so
+ * they must surface as unrepairable validation findings (REVIEW_FIELD_UNKNOWN)
+ * instead of sending the state machine into an unresolvable repair round.
+ * BLOCK is terminal and never repairable, but is included so callers can
+ * detect it.
+ */
+export function flaggedFields(
+  review: AgentReviewOutputT,
+  generation?: AgentGenerationOutputT,
+): FlaggedField[] {
+  const explanationCount = generation?.explanations.length;
   return review.field_verdicts
-    .filter((verdict) => verdict.verdict !== "PASS" && verdict.issue_code !== undefined)
+    .filter((verdict) => {
+      if (verdict.verdict === "PASS" || verdict.issue_code === undefined) return false;
+      const resolved = parseFieldPath(verdict.field_path);
+      if (!resolved) return false;
+      return explanationCount === undefined || resolved.index < explanationCount;
+    })
     .map((verdict) => ({
       field_path: verdict.field_path,
       issue_code: verdict.issue_code!,
