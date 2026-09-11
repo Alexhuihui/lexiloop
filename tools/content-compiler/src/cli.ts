@@ -47,6 +47,9 @@ import {
 import {
   createImageExtractStage,
   createWatermarkCleanStage,
+  CardGenerateOutputSchema,
+  createCardGenerateStage,
+  DEFAULT_CARDS_CONFIG_PATH,
   PRODUCTION_STAGE_DEPENDENCIES,
   RELEASE_STAGE,
   getProductionStages,
@@ -60,12 +63,13 @@ import {
 } from "./agents/visual-ocr";
 import {
   SEMANTIC_QUEUE_DIR,
+  WorkPacketError,
   ingestSemanticResult,
   loadSemanticQueue,
   pendingUnitKeys,
   semanticQueueStatus,
 } from "./agents/work-packets";
-import { hashJson, type AnyStage, type StageRunContext } from "./stage";
+import { hashJson, StageError, type AnyStage, type StageRunContext } from "./stage";
 
 export const DEFAULT_WORK_ROOT = path.join(".lexiloop-private", "work");
 
@@ -245,13 +249,14 @@ async function withWorkLock<T>(
   deps: CliDeps,
   workDir: string,
   fn: () => Promise<T>,
+  label = "media",
 ): Promise<T | null> {
   let lock;
   try {
     lock = await acquireWorkLock({ directory: workDir });
   } catch (err) {
     if (err instanceof PipelineLockError) {
-      deps.writeLine(`media: ${err.message}`);
+      deps.writeLine(`${label}: ${err.message}`);
       deps.exit?.(1);
       return null;
     }
@@ -631,6 +636,99 @@ async function executeSemanticStatus(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Card generation (spec 5.7): cards generate
+//
+// The command runs the SAME CARD_GENERATE stage handler the pipeline uses —
+// including its fail-closed preconditions: cards are only produced once every
+// target Unit exited the four agent review gates as PASSED, and a Unit with a
+// learnable word that has zero cards is blocked terminally. The recorded
+// ledger entry mirrors the pipeline's own input-hash semantics (upstream
+// REPAIR_LOOP provenance included), so a subsequent `run`/`resume` stays
+// resume-consistent with what `cards generate` recorded.
+// ---------------------------------------------------------------------------
+
+function stageErrorCode(err: unknown): string | null {
+  if (err instanceof StageError || err instanceof WorkPacketError) return err.code;
+  return null;
+}
+
+interface CardsGenerateOptions {
+  sourceHash: string;
+  privateRoot?: string;
+  config?: string;
+}
+
+async function executeCardsGenerate(deps: CliDeps, options: CardsGenerateOptions): Promise<void> {
+  try {
+    if (!/^[0-9a-f]{64}$/.test(options.sourceHash)) {
+      throw new Error("--source-hash must be a 64-character sha-256 hex string");
+    }
+    const sourceHash = options.sourceHash;
+    const workDir = workDirFor(deps, options.privateRoot, sourceHash);
+    const configOption = options.config ?? DEFAULT_CARDS_CONFIG_PATH;
+    const cardsConfigPath = path.isAbsolute(configOption) ? configOption : path.join(REPO_ROOT, configOption);
+    const stage = createCardGenerateStage({
+      privateRoot: path.resolve(options.privateRoot ?? path.join(deps.workRoot, "..")),
+      cardsConfigPath,
+    });
+    const ledger = deps.createLedger(sourceHash);
+    await withWorkLock(deps, workDir, async () => {
+      // Mirror the pipeline's upstream context so the recorded input hash is
+      // exactly what a `run`/`resume` would compute for CARD_GENERATE.
+      const upstreamEntry = await ledger.load("REPAIR_LOOP");
+      const ctx: StageRunContext = {
+        runId: `cards-${new Date().toISOString()}`,
+        sourceHash,
+        config: {},
+        ledger,
+        logger: deps.logger,
+        upstream:
+          upstreamEntry?.status === "PASSED" && upstreamEntry.output_hash !== null
+            ? { stage: "REPAIR_LOOP", outputHash: upstreamEntry.output_hash }
+            : null,
+      };
+      const inputHash = await stage.computeInputHash(ctx);
+      const existing = await ledger.load(stage.name);
+      if (
+        existing?.status === "PASSED" &&
+        existing.input_hash === inputHash &&
+        existing.config_version_hash === configVersionHash(stage)
+      ) {
+        deps.writeLine("cards generate up-to-date (PASSED, input unchanged)");
+        return;
+      }
+      const output = CardGenerateOutputSchema.parse(await stage.run(undefined, ctx));
+      const now = new Date().toISOString();
+      await ledger.save({
+        stage: stage.name,
+        status: "PASSED",
+        compile_run_id: ctx.runId,
+        input_hash: inputHash,
+        config_version_hash: configVersionHash(stage),
+        output_hash: hashJson(output),
+        attempts: (existing?.attempts ?? 0) + 1,
+        started_at: now,
+        finished_at: now,
+        updated_at: now,
+        error_code: null,
+      });
+      for (const unit of output.units) {
+        deps.writeLine(`unit ${unit.unit_key} words=${unit.words} cards=${unit.cards}`);
+      }
+      deps.writeLine(
+        `cards generate OK (${output.counts.cards} card(s) across ${output.counts.units} unit(s)) -> ` +
+          path.join(workDir, "cards.jsonl"),
+      );
+    }, "cards");
+  } catch (err) {
+    const code = stageErrorCode(err);
+    const message = err instanceof Error ? err.message : String(err);
+    deps.writeLine(`cards generate failed${code ? ` [${code}]` : ""}: ${message}`);
+    deps.exit?.(1);
+  }
+}
+
 export function buildCli(deps: CliDeps): Command {
   const program = new Command();
   program
@@ -785,6 +883,20 @@ export function buildCli(deps: CliDeps): Command {
     .option("--through <stage>", "run only the contiguous prefix up to this stage")
     .action(async (options: RunCommandOptions) => {
       await executeRun(deps, options);
+    });
+
+  const cards = program
+    .command("cards")
+    .description("deterministic card generation from review-passed units (spec 5.7)");
+
+  cards
+    .command("generate")
+    .description("derive card definitions from fully-passed units and write cards.jsonl")
+    .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
+    .option("--config <path>", "versioned card rules JSON", DEFAULT_CARDS_CONFIG_PATH)
+    .option("--private-root <dir>", "private root holding work/<source-hash> directories")
+    .action(async (options: CardsGenerateOptions) => {
+      await executeCardsGenerate(deps, options);
     });
 
   return program;

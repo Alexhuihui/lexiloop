@@ -9,14 +9,17 @@
  * visual-OCR review packets (spec 5.4); AGENT_ENRICH through REPAIR_LOOP run
  * the four isolated agent roles (generation, independent review,
  * deterministic validator, repair) behind the fail-closed three-round state
- * machine (spec 5.6). Every other stage is still an unimplemented, fail-closed
+ * machine (spec 5.6); CARD_GENERATE derives the four deterministic card types
+ * and the introduction queues' fixed order from the review-passed content
+ * (spec 5.7). Every other stage is still an unimplemented, fail-closed
  * handler. The names, order, and dependencies declared here are final.
  */
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { UnitValidationReport as UnitValidationReportSchema } from "@lexiloop/content-schema";
+import { AgentGenerationOutput, UnitValidationReport as UnitValidationReportSchema } from "@lexiloop/content-schema";
 import { hashJson, hashString, StageError, type AnyStage, type StageRunContext } from "./stage";
 import {
+  COMPILER_ROOT,
   DEFAULT_RULE_PATH,
   MediaOutputInvalidError,
   MediaSpawnError,
@@ -63,11 +66,20 @@ import {
   ReviewLoopError,
   type UnitAssessment,
 } from "./agents/review-loop";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import {
+  CardRuleError,
+  CardRulesConfigSchema,
+  generateUnitCards,
+  type CardRulesConfig,
+} from "@lexiloop/domain";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /** Value type of the validation report (the schema export is value-only). */
 type UnitValidationReportT = z.output<typeof UnitValidationReportSchema>;
+
+/** Value type of the review-passed generation output. */
+type AgentGenerationOutputT = z.output<typeof AgentGenerationOutput>;
 
 /** Assessments whose phase hands the caller a work order to enqueue. */
 type OrderBearingAssessment = Extract<UnitAssessment, { order: WorkOrder }>;
@@ -954,15 +966,217 @@ export function createRepairLoopStage(options: AgentGateOptions): AnyStage {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Card generation (spec 5.7): CARD_GENERATE
+//
+// Cards are never freely written by agents: they are derived by fixed,
+// versioned rules from content that already exited all four agent gates as
+// PASSED. The stage re-assesses every target Unit through the same state
+// machine as the gates (so a queue that somehow regressed fails closed),
+// derives the four card types via @lexiloop/domain's rule engine, rejects any
+// Unit where a learnable word would end with zero cards (terminal block), and
+// writes `cards.jsonl` into the work directory — the bytes every downstream
+// stage (audio, package) anchor on.
+// ---------------------------------------------------------------------------
+
+/** Default versioned card-rules config (spec 5.7). */
+export const DEFAULT_CARDS_CONFIG_PATH = path.join(COMPILER_ROOT, "config", "cards", "v1.json");
+
+export const CardGenerateOutputSchema = z.object({
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Relative to the per-source work directory. */
+  cards_jsonl: z.literal("cards.jsonl"),
+  /** SHA-256 of the written card rows (one strict CardDefinition per line). */
+  cards_jsonl_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Version of the card rules the cards were generated with. */
+  card_rules_version: z.string().min(1),
+  counts: z.object({
+    units: z.number().int().nonnegative(),
+    words: z.number().int().nonnegative(),
+    cards: z.number().int().nonnegative(),
+    by_type: z.object({
+      WORD_MEANING: z.number().int().nonnegative(),
+      CONTEXT_MEANING: z.number().int().nonnegative(),
+      PHRASE: z.number().int().nonnegative(),
+      SENSE_DISCRIMINATION: z.number().int().nonnegative(),
+    }),
+  }),
+  units: z
+    .array(
+      z.object({
+        unit_key: z.string().min(1),
+        words: z.number().int().nonnegative(),
+        cards: z.number().int().nonnegative(),
+      }),
+    )
+    .min(1),
+});
+export type CardGenerateOutput = z.output<typeof CardGenerateOutputSchema>;
+
+const CARD_GENERATE_CONFIG_VERSION = "1";
+
+/** Options for the CARD_GENERATE stage. */
+export interface CardGenerateStageOptions {
+  /** Private root holding per-source work directories. */
+  privateRoot: string;
+  /** Versioned card-rules config; defaults to `config/cards/v1.json`. */
+  cardsConfigPath?: string;
+}
+
+/** Read + strictly validate the versioned card rules (fail closed). */
+async function readCardsConfig(filePath: string): Promise<CardRulesConfig> {
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new StageError("CARD_CONFIG_INVALID", `card rules config unreadable at ${filePath}: ${message}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new StageError("CARD_CONFIG_INVALID", `card rules config at ${filePath} is not valid JSON`);
+  }
+  const config = CardRulesConfigSchema.safeParse(parsed);
+  if (!config.success) {
+    throw new StageError(
+      "CARD_CONFIG_INVALID",
+      `card rules config at ${filePath} violates the contract: ${config.error.issues[0]?.message ?? config.error.message}`,
+    );
+  }
+  return config.data;
+}
+
+/** Map card-rule/agent errors onto StageError so codes survive the ledger. */
+function toCardStageError(err: unknown): StageError {
+  if (err instanceof StageError) return err;
+  if (err instanceof CardRuleError) {
+    // A learnable word with zero active cards blocks the Unit terminally
+    // (spec 5.7 rule 7); every other rule breach is a deterministic failure.
+    return new StageError(err.code, err.message, { blocked: err.code === "WORD_HAS_NO_CARDS" });
+  }
+  if (err instanceof WorkPacketError || err instanceof ReviewLoopError) {
+    return new StageError(err.code, err.message);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return new StageError("STAGE_UNEXPECTED_ERROR", message);
+}
+
+/**
+ * CARD_GENERATE: derive the deterministic learning cards (spec 5.7). The
+ * input hash covers the versioned card config plus every validated Unit
+ * input — the semantic queue digest folds each packet (unit source evidence)
+ * and each ingested agent result — so any config or content change re-runs
+ * card generation and nothing downstream can run on stale cards. The stage
+ * only passes when every target Unit exited the four agent gates as PASSED.
+ */
+export function createCardGenerateStage(options: CardGenerateStageOptions): AnyStage {
+  const cardsConfigPath = options.cardsConfigPath ?? DEFAULT_CARDS_CONFIG_PATH;
+  return {
+    name: "CARD_GENERATE",
+    configVersion: CARD_GENERATE_CONFIG_VERSION,
+    inputSchema: z.unknown(),
+    outputSchema: CardGenerateOutputSchema,
+    computeInputHash: async (ctx) =>
+      hashJson({
+        stage: "CARD_GENERATE",
+        configVersion: CARD_GENERATE_CONFIG_VERSION,
+        sourceHash: ctx.sourceHash,
+        cards_config_sha256: await sha256File(cardsConfigPath),
+        queue: await semanticQueueDigest(agentGatePaths(options, ctx.sourceHash).queueDir),
+        upstream: ctx.upstream?.outputHash ?? null,
+      }),
+    run: async (_input, ctx) => {
+      try {
+        const gate = agentGatePaths(options, ctx.sourceHash);
+        const config = await readCardsConfig(cardsConfigPath);
+        // Re-assess through the gates' own state machine: a Unit that is not
+        // passed fails the stage closed — cards never precede review.
+        const assessed = await assessTargetUnits(gate, options, ctx);
+        const generated: Array<{ workload: UnitWorkload; generation: AgentGenerationOutputT }> = [];
+        for (const entry of assessed) {
+          const { assessment } = entry;
+          if (assessment.phase !== "passed") {
+            throw new StageError(
+              "SEMANTIC_STATE_INVALID",
+              `unit ${entry.workload.unitKey} did not exit the review loop as PASSED ` +
+                `(phase ${assessment.phase}); CARD_GENERATE can only run once every ` +
+                "target Unit passed all four gates",
+            );
+          }
+          if (assessment.report.status !== "PASSED") {
+            throw new StageError(
+              "SEMANTIC_STATE_INVALID",
+              `unit ${entry.workload.unitKey} carries a ${assessment.report.status} validation report`,
+            );
+          }
+          generated.push({ workload: entry.workload, generation: assessment.generation });
+        }
+
+        const units: CardGenerateOutput["units"] = [];
+        const byType: CardGenerateOutput["counts"]["by_type"] = {
+          WORD_MEANING: 0,
+          CONTEXT_MEANING: 0,
+          PHRASE: 0,
+          SENSE_DISCRIMINATION: 0,
+        };
+        const rows: string[] = [];
+        for (const { workload, generation } of generated) {
+          const cards = generateUnitCards({ config, source: workload.source, generation });
+          for (const card of cards) {
+            byType[card.card_type] += 1;
+            rows.push(JSON.stringify(card));
+          }
+          units.push({
+            unit_key: workload.unitKey,
+            words: workload.source.words.length,
+            cards: cards.length,
+          });
+        }
+        const cardsPath = path.join(gate.workDir, "cards.jsonl");
+        await mkdir(path.dirname(cardsPath), { recursive: true });
+        await writeFile(
+          cardsPath,
+          rows.length > 0 ? `${rows.join("\n")}\n` : "",
+          "utf8",
+        );
+        return {
+          source_sha256: ctx.sourceHash,
+          cards_jsonl: "cards.jsonl",
+          cards_jsonl_sha256: await sha256File(cardsPath),
+          card_rules_version: config.card_rules_version,
+          counts: {
+            units: units.length,
+            words: units.reduce((acc, unit) => acc + unit.words, 0),
+            cards: units.reduce((acc, unit) => acc + unit.cards, 0),
+            by_type: byType,
+          },
+          units,
+        } satisfies CardGenerateOutput;
+      } catch (err) {
+        throw toCardStageError(err);
+      }
+    },
+  };
+}
+
 /**
  * The 13 production stages in compile order. SOURCE_FINGERPRINT,
- * CARD_GENERATE, TTS_SYNTHESIZE, AUDIO_VALIDATE, and RELEASE_PACKAGE are
- * still fail-closed placeholders; the four semantic agent gates are wired to
- * the filesystem provider queue, so they fail closed with
- * SEMANTIC_PACKETS_PENDING until externally-dispatched agents answer.
+ * TTS_SYNTHESIZE, AUDIO_VALIDATE, and RELEASE_PACKAGE are still fail-closed
+ * placeholders; the four semantic agent gates are wired to the filesystem
+ * provider queue, so they fail closed with SEMANTIC_PACKETS_PENDING until
+ * externally-dispatched agents answer; CARD_GENERATE derives the rule-based
+ * cards once every target Unit exited the gates as PASSED.
  */
 export function getProductionStages(
-  options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string; ocrConfigPath?: string } = {},
+  options: {
+    privateRoot?: string;
+    runPython?: SpawnPythonFn;
+    rulePath?: string;
+    ocrConfigPath?: string;
+    cardsConfigPath?: string;
+  } = {},
 ): AnyStage[] {
   // resolveMediaStageOptions always provides a real argument-array runner,
   // so production wiring can never construct media stages that would
@@ -978,6 +1192,10 @@ export function getProductionStages(
     AGENT_REVIEW: createAgentReviewStage(agentGateOptions),
     DETERMINISTIC_VALIDATE: createDeterministicValidateStage(agentGateOptions),
     REPAIR_LOOP: createRepairLoopStage(agentGateOptions),
+    CARD_GENERATE: createCardGenerateStage({
+      privateRoot: mediaOptions.privateRoot,
+      ...(options.cardsConfigPath !== undefined ? { cardsConfigPath: options.cardsConfigPath } : {}),
+    }),
   };
   return PRODUCTION_STAGE_NAMES.map((name) => stages[name] ?? unimplementedStage(name));
 }

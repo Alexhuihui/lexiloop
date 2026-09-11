@@ -1,0 +1,11 @@
+{
+  "card_rules_version": "cards-v1",
+  "template_versions": {
+    "WORD_MEANING": "v1",
+    "CONTEXT_MEANING": "v1",
+    "PHRASE": "v1",
+    "SENSE_DISCRIMINATION": "v1"
+  },
+  "context_meaning_origins": ["exam"],
+  "notes": "Rule parameters for deterministic card generation (spec 5.7). Cards are derived only from review-passed structured content: one WORD_MEANING card per learnable sense, one CONTEXT_MEANING card per qualified real-exam example carrying a review-passed contextual meaning, one PHRASE card per approved source phrase, and one SENSE_DISCRIMINATION card per review-confirmed confusable candidate. Template versions are recorded on generated cards but never participate in content_card_key derivation, so a template change cannot create new cards or sever user FSRS state."
+}
