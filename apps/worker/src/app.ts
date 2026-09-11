@@ -18,6 +18,7 @@ import { DEFAULT_SESSION_IDLE_HOURS } from "./auth/session";
 import { registerAuthRoutes } from "./auth/routes";
 import { registerContentRoutes } from "./content/routes";
 import { registerProgressRoutes } from "./progress/routes";
+import { registerStudyRoutes } from "./study/routes";
 import { securityHeadersMiddleware } from "./middleware/security-headers";
 import type { AuthenticatedPrincipal } from "./middleware/auth";
 import { jsonError, requestContextMiddleware, type ManagedRequestContext } from "./observability/request-context";
@@ -89,6 +90,7 @@ export function buildApp(deps: WorkerDeps): WorkerApp {
   registerAuthRoutes(app);
   registerContentRoutes(app);
   registerProgressRoutes(app);
+  registerStudyRoutes(app);
 
   app.notFound((c) => jsonError(c, 404, "NOT_FOUND", "Route not found"));
 
