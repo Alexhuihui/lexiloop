@@ -214,18 +214,20 @@ describe("stage registry", () => {
     }
   });
 
-  it("starts every production stage as a fail-closed handler", async () => {
+  it("keeps the registry fail-closed when no source path is wired", async () => {
     const ledger = await makeLedger();
     const report = await runPipeline(getProductionStages(), ledger.store);
+    // SOURCE_FINGERPRINT is implemented but fails closed when the run never
+    // told it where the source PDF lives (no path, no content past stage 1).
     expect(report.status).toBe("FAILED");
     expect(report.stoppedAt).toBe("SOURCE_FINGERPRINT");
     expect(report.results[0]).toMatchObject({
       name: "SOURCE_FINGERPRINT",
       status: "FAILED",
-      error_code: "STAGE_NOT_IMPLEMENTED",
+      error_code: "FINGERPRINT_CONFIG_INVALID",
     });
     const entry = await ledger.store.load("SOURCE_FINGERPRINT");
-    expect(entry).toMatchObject({ status: "FAILED", error_code: "STAGE_NOT_IMPLEMENTED" });
+    expect(entry).toMatchObject({ status: "FAILED", error_code: "FINGERPRINT_CONFIG_INVALID" });
   });
 });
 

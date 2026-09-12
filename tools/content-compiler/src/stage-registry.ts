@@ -2,8 +2,10 @@
  * Production stage registry (spec 5.2).
  *
  * Declares the 13 production stage names in exact compile order plus their
- * dependency edges. IMAGE_EXTRACT and WATERMARK_CLEAN call the versioned
- * Python media workers (spec 5.3) through `src/media.ts`; LAYOUT_OCR runs the
+ * dependency edges. SOURCE_FINGERPRINT inventories the source PDF (SHA-256 +
+ * page count through the versioned Python media workers, spec 5.3);
+ * IMAGE_EXTRACT and WATERMARK_CLEAN call the versioned Python media workers
+ * (spec 5.3) through `src/media.ts`; LAYOUT_OCR runs the
  * PP-StructureV3 worker and STRUCTURE_NORMALIZE recovers records
  * deterministically, gating on visual-OCR review packets (spec 5.4);
  * AGENT_ENRICH through REPAIR_LOOP run the four isolated agent roles
@@ -19,7 +21,7 @@
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { AgentGenerationOutput, UnitValidationReport as UnitValidationReportSchema } from "@lexiloop/content-schema";
-import { hashJson, hashString, StageError, type AnyStage, type StageRunContext } from "./stage";
+import { hashJson, StageError, type AnyStage, type StageRunContext } from "./stage";
 import {
   COMPILER_ROOT,
   DEFAULT_RULE_PATH,
@@ -29,6 +31,7 @@ import {
   cleanSpawnArgs,
   createPythonRunner,
   extractSpawnArgs,
+  fingerprintSpawnArgs,
   fileExists,
   readJsonl,
   sha256File,
@@ -152,24 +155,134 @@ export const RELEASE_STAGE: ProductionStageName = RELEASE_PACKAGE_STAGE;
 /** Default private root (git-ignored); artifacts live under `<root>/work/`. */
 export const DEFAULT_PRIVATE_ROOT = ".lexiloop-private";
 
+// ---------------------------------------------------------------------------
+// SOURCE_FINGERPRINT (spec 5.2/5.3): source inventory probe
+//
+// The first stage of every compile run. It hashes the source PDF, reads the
+// page count through the versioned Python media bridge (`lexiloop_media
+// fingerprint`, argument-array spawn), and emits a ledger output that later
+// stages chain via the pipeline's upstream provenance. The stage REPORTS the
+// page count; `plan`/`run` surface the expectation check against the approved
+// source inventory (440 pages for llcy-2024).
+// ---------------------------------------------------------------------------
+
+/** Approved source inventory: the llcy-2024 source PDF has 440 pages. */
+export const LLCY_2024_EXPECTED_PAGE_COUNT = 440;
+
+export const SourceFingerprintOutputSchema = z.object({
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  algorithm: z.literal("sha256"),
+  /** Reported by the PyMuPDF worker; checked against the inventory by plan/run. */
+  page_count: z.number().int().positive(),
+  /** Version of the fingerprint worker contract baked into the output. */
+  fingerprint_config_version: z.string().min(1),
+});
+export type SourceFingerprintOutput = z.output<typeof SourceFingerprintOutputSchema>;
+
+/** Strict shape of the `lexiloop_media fingerprint` stdout summary. */
+const FingerprintWorkerSummarySchema = z.object({
+  algorithm: z.literal("sha256"),
+  source_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  page_count: z.number().int().positive(),
+});
+
+/** Options for the SOURCE_FINGERPRINT stage. */
+export interface SourceFingerprintStageOptions {
+  /**
+   * Path of the source PDF. REQUIRED at run time (the stage fails closed
+   * without it); `computeInputHash` binds to content identity (the run's
+   * source hash) only, so resume never depends on the path staying stable.
+   */
+  sourcePath?: string;
+  /**
+   * Python runner (argument-array spawn). Defaults to the real runner;
+   * tests inject stubs.
+   */
+  runPython?: SpawnPythonFn;
+}
+
 /**
- * Fail-closed handler for stages whose real implementation has not landed yet
- * (currently SOURCE_FINGERPRINT). An accidental run can never produce content
- * past it.
+ * SOURCE_FINGERPRINT: compute the source PDF's SHA-256, read its page count
+ * through the Python media bridge, and emit the source-inventory ledger
+ * output. Every misuse fails closed with a machine-readable code:
+ * FINGERPRINT_CONFIG_INVALID (no path wired), SOURCE_NOT_FOUND (missing
+ * file), SOURCE_HASH_MISMATCH (run context or worker hashed other content),
+ * MEDIA_OUTPUT_INVALID (malformed worker summary).
  */
-function unimplementedStage(name: ProductionStageName): AnyStage {
-  const configVersion = "0-unimplemented";
+export function createSourceFingerprintStage(options: SourceFingerprintStageOptions = {}): AnyStage {
+  const runPython = options.runPython ?? createPythonRunner();
+  const configVersion = "1";
   return {
-    name,
+    name: "SOURCE_FINGERPRINT",
     configVersion,
     inputSchema: z.unknown(),
-    outputSchema: z.never(),
-    computeInputHash: () => hashString(`${name}:${configVersion}`),
-    run: async () => {
-      throw new StageError(
-        "STAGE_NOT_IMPLEMENTED",
-        `Stage ${name} has no handler yet (planned for Phase 2)`,
-      );
+    outputSchema: SourceFingerprintOutputSchema,
+    computeInputHash: (ctx) =>
+      hashJson({
+        stage: "SOURCE_FINGERPRINT",
+        configVersion,
+        sourceHash: ctx.sourceHash,
+        upstream: null,
+      }),
+    run: async (_input, ctx) => {
+      try {
+        if (options.sourcePath === undefined) {
+          throw new StageError(
+            "FINGERPRINT_CONFIG_INVALID",
+            "SOURCE_FINGERPRINT requires the source PDF path (pass --source, or wire " +
+              "sourcePath into the stage registry); the stage never guesses inputs",
+          );
+        }
+        const sourcePath = path.resolve(options.sourcePath);
+        if (!(await fileExists(sourcePath))) {
+          throw new StageError("SOURCE_NOT_FOUND", `source PDF not found: ${sourcePath}`);
+        }
+        // (a) The stage computes the file hash itself: the ledger output must
+        // never inherit a hash it did not verify.
+        const sourceSha256 = await sha256File(sourcePath);
+        if (/^[0-9a-f]{64}$/.test(ctx.sourceHash) && ctx.sourceHash !== sourceSha256) {
+          throw new StageError(
+            "SOURCE_HASH_MISMATCH",
+            `run context names source ${ctx.sourceHash.slice(0, 12)} but ${sourcePath} hashes to ` +
+              `${sourceSha256.slice(0, 12)}; the source changed under this run`,
+          );
+        }
+        // (b) Page count via PyMuPDF through the media bridge; the worker
+        // re-hashes the file so a swapped source can never slip through.
+        const { stdout } = await runPython(fingerprintSpawnArgs(sourcePath));
+        let rawSummary: unknown;
+        try {
+          rawSummary = JSON.parse(stdout.trim());
+        } catch {
+          throw new MediaOutputInvalidError(
+            sourcePath,
+            `fingerprint summary is not valid JSON: ${stdout.trim().slice(0, 120)}`,
+          );
+        }
+        const summary = FingerprintWorkerSummarySchema.safeParse(rawSummary);
+        if (!summary.success) {
+          throw new MediaOutputInvalidError(
+            sourcePath,
+            `fingerprint summary failed schema validation: ${summary.error.message}`,
+          );
+        }
+        if (summary.data.source_sha256 !== sourceSha256) {
+          throw new StageError(
+            "SOURCE_HASH_MISMATCH",
+            `fingerprint worker hashed ${summary.data.source_sha256.slice(0, 12)} but the stage ` +
+              `computed ${sourceSha256.slice(0, 12)} for ${sourcePath}`,
+          );
+        }
+        // (c) Ledger output: source hash + page count + config version.
+        return {
+          source_sha256: sourceSha256,
+          algorithm: "sha256",
+          page_count: summary.data.page_count,
+          fingerprint_config_version: configVersion,
+        } satisfies SourceFingerprintOutput;
+      } catch (err) {
+        throw toSpawnError(err);
+      }
     },
   };
 }
@@ -526,7 +639,10 @@ function packetForReview(review: NormalizeOutput["fieldReviews"][number]) {
  * no path can be bypassed by any flag.
  */
 export function createStructureNormalizeStage(options: MediaStageOptions): AnyStage {
-  const configVersion = "1";
+  // v2: banner calibration for the real raster (opener banners + right-rail
+  // side tabs with captured unit numbers; left-rail chapter tab widened to
+  // furniture). Bumped so cached ledgers invalidate and re-segment.
+  const configVersion = "2";
   return {
     name: "STRUCTURE_NORMALIZE",
     configVersion,
@@ -1665,17 +1781,20 @@ export function createAudioValidateStage(options: AudioValidateStageOptions): An
 }
 
 /**
- * The 13 production stages in compile order. Every stage is implemented:
- * the four semantic agent gates are wired to the filesystem provider queue, so
- * they fail closed with SEMANTIC_PACKETS_PENDING until externally-dispatched
+ * The 13 production stages in compile order, all implemented. The four
+ * semantic agent gates are wired to the filesystem provider queue, so they
+ * fail closed with SEMANTIC_PACKETS_PENDING until externally-dispatched
  * agents answer; CARD_GENERATE derives the rule-based cards once every target
  * Unit exited the gates as PASSED; TTS_SYNTHESIZE caches provider audio and
  * AUDIO_VALIDATE runs the deterministic Python audio gate; RELEASE_PACKAGE
  * writes the immutable release bundle under `<private-root>/releases/`.
+ * SOURCE_FINGERPRINT fails closed unless the source PDF path was wired (see
+ * `SourceFingerprintStageOptions`).
  */
 export function getProductionStages(
   options: {
     privateRoot?: string;
+    sourcePath?: string;
     runPython?: SpawnPythonFn;
     rulePath?: string;
     ocrConfigPath?: string;
@@ -1692,7 +1811,11 @@ export function getProductionStages(
     privateRoot: mediaOptions.privateRoot,
     ...(options.ttsConfigPath !== undefined ? { ttsConfigPath: options.ttsConfigPath } : {}),
   };
-  const stages: Partial<Record<ProductionStageName, AnyStage>> = {
+  const stages: Record<ProductionStageName, AnyStage> = {
+    SOURCE_FINGERPRINT: createSourceFingerprintStage({
+      runPython: mediaOptions.runPython,
+      ...(options.sourcePath !== undefined ? { sourcePath: options.sourcePath } : {}),
+    }),
     IMAGE_EXTRACT: createImageExtractStage(mediaOptions),
     WATERMARK_CLEAN: createWatermarkCleanStage(mediaOptions),
     LAYOUT_OCR: createLayoutOcrStage(mediaOptions),
@@ -1709,5 +1832,5 @@ export function getProductionStages(
     AUDIO_VALIDATE: createAudioValidateStage({ ...ttsOptions, runPython: mediaOptions.runPython }),
     RELEASE_PACKAGE: createReleasePackageStage({ privateRoot: mediaOptions.privateRoot }),
   };
-  return PRODUCTION_STAGE_NAMES.map((name) => stages[name] ?? unimplementedStage(name));
+  return PRODUCTION_STAGE_NAMES.map((name) => stages[name]);
 }

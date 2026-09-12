@@ -26,7 +26,10 @@ export interface FurnitureConfig {
 export const DEFAULT_FURNITURE_CONFIG: FurnitureConfig = {
   header_y_max: 0.06,
   footer_y_min: 0.93,
-  sidebar_x_max: 0.055,
+  // Calibrated on the real raster: the left-rail chapter tab's number block
+  // ends at x1 ~= 0.06, past the previous 0.055 cutoff, and must still be
+  // furniture. Body text starts at x0 ~= 0.10, so 0.07 leaves a safe gap.
+  sidebar_x_max: 0.07,
   min_header_repeat_pages: 3,
 };
 

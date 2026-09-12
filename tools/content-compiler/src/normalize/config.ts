@@ -14,8 +14,20 @@ export interface NormalizeBookConfig {
   book_edition: string;
   /** Tier assigned to words the book does not mark explicitly. */
   default_tier: string;
-  /** Anchored regexes detecting a unit-title block; group 1 = unit number. */
+  /**
+   * Anchored regexes detecting a unit-title block (opener banner); group 1 =
+   * unit number. Calibrated on the real raster: the opener banner is a single
+   * large "Unit N" block on the unit's first page.
+   */
   unit_title_patterns: string[];
+  /**
+   * Anchored regex for the per-page side-tab number. Calibrated: every page
+   * of a unit carries its unit number as a bare 1-2 digit block in the right
+   * rail (the "Unit" word is rotated rail text and usually not OCR'd).
+   */
+  unit_tab_number_pattern: string;
+  /** Right-rail x0 at or beyond which a bare number block is a unit tab. */
+  unit_tab_x_min: number;
   /** Part-of-speech markers, longest-first matching (trailing dot included). */
   pos_markers: string[];
   /** Block prefix marking an exam-derived example, e.g. 真. */
@@ -34,7 +46,9 @@ export const LLCY_2024_NORMALIZE_CONFIG: NormalizeBookConfig = {
   book_title: "LLRC 6500",
   book_edition: "2024",
   default_tier: "core",
-  unit_title_patterns: ["^Unit\\s+(\\d+)"],
+  unit_title_patterns: ["^Unit\\s*(\\d+)$"],
+  unit_tab_number_pattern: "^\\d{1,2}$",
+  unit_tab_x_min: 0.9,
   pos_markers: [
     "n.",
     "v.",

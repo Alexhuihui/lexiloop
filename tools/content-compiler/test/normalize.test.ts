@@ -26,7 +26,11 @@ import { assignReadingOrder, type PositionedBlock } from "../src/normalize/readi
 import { normalizeUnicodeText } from "../src/normalize/punctuation";
 import { joinHyphenatedLines } from "../src/normalize/joins";
 import { flagOcrConfusions } from "../src/normalize/confusions";
-import { partitionPageFurniture, type FurnitureConfig } from "../src/normalize/furniture";
+import {
+  DEFAULT_FURNITURE_CONFIG,
+  partitionPageFurniture,
+  type FurnitureConfig,
+} from "../src/normalize/furniture";
 import { MAX_PACKET_ROUND } from "../src/agents/visual-ocr";
 import type { VisualCorrection } from "../src/normalize/quality";
 import {
@@ -191,7 +195,9 @@ function normalizeConfig(): NormalizeBookConfig {
     book_title: "LLRC 6500",
     book_edition: "2024",
     default_tier: "core",
-    unit_title_patterns: ["^Unit\\s+(\\d+)"],
+    unit_title_patterns: ["^Unit\\s*(\\d+)$"],
+    unit_tab_number_pattern: "^\\d{1,2}$",
+    unit_tab_x_min: 0.9,
     pos_markers: [
       "n.",
       "v.",
@@ -825,5 +831,153 @@ describe("LAYOUT_OCR + STRUCTURE_NORMALIZE stages", () => {
     expect(second.status).toBe("BLOCKED");
     expect(second.results.map((r) => r.status)).toEqual(["SKIPPED", "BLOCKED"]);
     expect(second.results[1]!.error_code).toBe("DANGLING_UNIT_REFERENCE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Real-banner calibration (llcy-2024 raster): side tabs + opener banners
+//
+// The real book marks units with (a) a large "Unit N" opener banner on the
+// unit's first page and (b) a bare 1-2 digit unit number as a side tab in the
+// RIGHT rail (x0 >= 0.9) repeated on every subsequent page of the unit.
+// Chapters get their own banners (a "Chapter N" opener block and a LEFT-rail
+// tab pair) that must never start a unit. Geometry below mirrors the measured
+// private calibration pages; every text is a synthetic lookalike (tab digits
+// and "Unit N"/"Chapter N" placeholders, generic headwords).
+// ---------------------------------------------------------------------------
+
+describe("llcy-2024 banner calibration", () => {
+  it("drops the leaking left-rail chapter tab number as sidebar furniture", () => {
+    // Measured geometry: the word block ends at x1=0.0536 (already furniture)
+    // but the number block ends at x1=0.0599, past the old 0.055 cutoff.
+    const blocks = [
+      makeBlock("chapter.tab", 1, [0.0286, 0.7825, 0.0536, 0.8308], "Chapter"),
+      makeBlock("chapter.num", 1, [0.0249, 0.8371, 0.0599, 0.8571], "01"),
+      makeBlock("body", 1, [0.1, 0.14, 0.48, 0.2], "kappa /ˈkæpə/ n. 希腊字母"),
+    ];
+    const { content, furniture } = partitionPageFurniture(blocks, DEFAULT_FURNITURE_CONFIG);
+    expect(content.map((b) => b.blockKey)).toEqual(["body"]);
+    expect(furniture.map((b) => b.blockKey).sort()).toEqual(["chapter.num", "chapter.tab"]);
+  });
+
+  it("starts units from right-rail tab digits and keeps one unit per number", () => {
+    const blocks = [
+      // Page 1: right-rail tab "7" + one entry.
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      // Page 2: same tab digit -> the same unit stays open.
+      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+      // Page 3: tab flips to 8 -> a new unit starts.
+      makeBlock("p3.tab", 3, [0.9359, 0.8278, 0.9709, 0.8478], "8"),
+      makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.unitBoundaries).toEqual([
+      { unit_key: "u7", unit_order: 7, title: "Unit 7", first_page: 1, last_page: 2 },
+      { unit_key: "u8", unit_order: 8, title: "Unit 8", first_page: 3, last_page: 3 },
+    ]);
+    expect(output.units.map((u) => [u.unit_key, u.unit_order, u.title])).toEqual([
+      ["u7", 7, "Unit 7"],
+      ["u8", 8, "Unit 8"],
+    ]);
+    expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
+      ["alpha", "u7"],
+      ["beta", "u7"],
+      ["gamma", "u8"],
+    ]);
+  });
+
+  it("starts units from the opener banner with the captured number, not discovery order", () => {
+    const blocks = [
+      // Unit opener: a single large "Unit 12" banner block on the first page.
+      makeBlock("p1.opener", 1, [0.16, 0.07, 0.46, 0.13], "Unit 12"),
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "12"),
+      makeBlock("p1.head", 1, [0.1, 0.2, 0.48, 0.26], "delta /ˈdeltə/ n. 德尔塔"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units).toHaveLength(1);
+    expect(output.units[0]).toMatchObject({ unit_key: "u12", unit_order: 12 });
+    expect(output.words[0]!.unit_key).toBe("u12");
+  });
+
+  it("never starts units from entry numbers, chapter tabs, or chapter openers", () => {
+    const blocks = [
+      makeBlock("p1.entrynum", 1, [0.1262, 0.095, 0.1877, 0.1224], "118"),
+      makeBlock("p1.chapter.opener", 1, [0.2038, 0.2021, 0.4453, 0.2542], "Chapter 2"),
+      makeBlock("p1.opener", 1, [0.16, 0.07, 0.46, 0.13], "Unit 9"),
+      makeBlock("p1.head", 1, [0.1, 0.3, 0.48, 0.36], "epsilon /ˈepsɪlɒn/ n. 艾普西隆"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units).toHaveLength(1);
+    expect(output.units[0]).toMatchObject({ unit_key: "u9", unit_order: 9 });
+  });
+});
+
+describe("llcy-2024 signal-less page attribution", () => {
+  // Opener pages (even printed) carry no OCR-able unit signal: the stylized
+  // script banner defeats the recognizer and the left rail is chapter
+  // furniture. Trailing pages (even printed) look the same. Both must be
+  // attributed by nearest tab signal: an opener page sits closest to the
+  // FOLLOWING unit's first tab page, a trailing page closest to the open
+  // unit's last tab page.
+  it("attributes a signal-less opener page to the unit the following tab names", () => {
+    const blocks = [
+      // Page 1: unit opener page — no tab survived OCR, content only.
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      // Page 2: first tabbed page of unit 7.
+      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.unitBoundaries).toEqual([
+      { unit_key: "u7", unit_order: 7, title: "Unit 7", first_page: 1, last_page: 2 },
+    ]);
+    expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
+      ["alpha", "u7"],
+      ["beta", "u7"],
+    ]);
+  });
+
+  it("keeps a trailing signal-less page with the unit that most recently signaled", () => {
+    const blocks = [
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      // Page 2: trailing signal-less page of unit 7.
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+      // Page 3: next unit's opener (signal-less)...
+      makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
+      // Page 4: ...named by its first tab page.
+      makeBlock("p4.tab", 4, [0.9359, 0.8278, 0.9709, 0.8478], "8"),
+      makeBlock("p4.head", 4, [0.1, 0.14, 0.48, 0.2], "delta /ˈdeltə/ n. 德尔塔"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.unitBoundaries).toEqual([
+      { unit_key: "u7", unit_order: 7, title: "Unit 7", first_page: 1, last_page: 2 },
+      { unit_key: "u8", unit_order: 8, title: "Unit 8", first_page: 3, last_page: 4 },
+    ]);
+    expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
+      ["alpha", "u7"],
+      ["beta", "u7"],
+      ["gamma", "u8"],
+      ["delta", "u8"],
+    ]);
+  });
+});
+
+describe("llcy-2024 tab misread tolerance", () => {
+  it("treats a single misread tab between two runs of one unit as noise", () => {
+    const blocks = [
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      makeBlock("p2.tab", 2, [0.9396, 0.8327, 0.9767, 0.8536], "40"), // OCR misread of "07"
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+      makeBlock("p3.tab", 3, [0.9327, 0.8306, 0.9719, 0.8532], "7"),
+      makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units).toHaveLength(1);
+    expect(output.units[0]).toMatchObject({ unit_key: "u7", unit_order: 7 });
+    expect(output.words.map((w) => w.unit_key)).toEqual(["u7", "u7", "u7"]);
   });
 });

@@ -54,6 +54,8 @@ import {
   AudioValidateOutputSchema,
   DEFAULT_CARDS_CONFIG_PATH,
   DEFAULT_TTS_CONFIG_PATH,
+  LLCY_2024_EXPECTED_PAGE_COUNT,
+  SourceFingerprintOutputSchema,
   TtsSynthesizeOutputSchema,
   PRODUCTION_STAGE_DEPENDENCIES,
   RELEASE_STAGE,
@@ -136,8 +138,89 @@ export interface CliDeps {
 }
 
 interface RunCommandOptions {
-  sourceHash: string;
+  /** Source content hash; required unless --source is given. */
+  sourceHash?: string;
+  /** Source PDF path: hashed for the run and wired into SOURCE_FINGERPRINT. */
+  source?: string;
+  /** Page scope for the media stages; defaults to every page of the source. */
+  pages?: string;
+  privateRoot?: string;
   through?: string;
+}
+
+/**
+ * Resolved scope of a plan/run invocation: the content identity, the stages
+ * (rebuilt when --source/--private-root override the default wiring), and the
+ * work root the ledger and lock live under.
+ */
+interface RunScope {
+  sourceHash: string;
+  sourcePath: string | null;
+  stages: readonly AnyStage[];
+  workRoot: string;
+  /** Parsed --pages; null means "every page of the source". */
+  pages: number[] | null;
+}
+
+/** Stage-name option values accept lowercase/hyphenated forms. */
+function normalizeStageName(value: string): string {
+  return value.trim().toUpperCase().replace(/[\s-]+/g, "_");
+}
+
+/**
+ * Resolve the run scope shared by plan/run/resume/agents resume. The stages
+ * are rebuilt whenever --source or --private-root overrides the default
+ * wiring so SOURCE_FINGERPRINT receives the PDF path and every private
+ * artifact lands under the requested root.
+ */
+async function resolveRunScope(deps: CliDeps, options: RunCommandOptions): Promise<RunScope> {
+  if (options.source === undefined && options.sourceHash === undefined) {
+    throw new Error("either --source or --source-hash is required");
+  }
+  let sourceHash: string;
+  let sourcePath: string | null = null;
+  if (options.source !== undefined) {
+    // --source: hash the file (its identity) and wire it into the stages.
+    const resolved = await resolveMediaSource(options.source, options.sourceHash);
+    sourceHash = resolved.sourceHash;
+    sourcePath = resolved.sourcePath;
+  } else {
+    // --source-hash only: resume/status flows keyed on the given identity.
+    sourceHash = options.sourceHash!;
+  }
+  const privateRoot = resolveRootPath(options.privateRoot, path.join(".lexiloop-private"));
+  const overridesScope = options.source !== undefined || options.privateRoot !== undefined;
+  const stages = overridesScope
+    ? getProductionStages({
+        privateRoot,
+        ...(deps.runPython !== undefined ? { runPython: deps.runPython } : {}),
+        ...(sourcePath !== null ? { sourcePath } : {}),
+      })
+    : deps.stages;
+  const workRoot = options.privateRoot !== undefined ? path.join(privateRoot, "work") : deps.workRoot;
+  return {
+    sourceHash,
+    sourcePath,
+    stages,
+    workRoot,
+    pages: options.pages !== undefined ? parsePageList(options.pages) : null,
+  };
+}
+
+/**
+ * Media run config for plan/run invoked with --source: the requested page
+ * scope, defaulting to every page (the fingerprint already reported the
+ * count, so plan surfaces it without guessing).
+ */
+function mediaConfigFor(scope: RunScope, pageCount: number | null): MediaStageConfig | null {
+  if (!scope.sourcePath) return null;
+  const pages = scope.pages ?? (pageCount !== null ? rangePages(pageCount) : null);
+  if (!pages) return null;
+  return MediaStageConfigSchema.parse({ sourcePath: scope.sourcePath, pages, dpi: 300 });
+}
+
+function rangePages(count: number): number[] {
+  return Array.from({ length: count }, (_, index) => index + 1);
 }
 
 const hashSummary = (hash: string | null): string => (hash ? hash.slice(0, 12) : "-");
@@ -149,22 +232,37 @@ function releaseGateFor(): ReleaseGate {
   };
 }
 
-function resolveThrough(deps: CliDeps, through: string | undefined): string | undefined {
+function resolveThrough(stages: readonly AnyStage[], through: string | undefined): string | undefined {
   if (!through) return undefined;
-  resolveStagePrefix(deps.stages, through); // validates registration + contiguity
-  return through;
+  // Accept the exact registered name first, then ergonomic forms like
+  // "structure-normalize" for "STRUCTURE_NORMALIZE"; unknown names throw.
+  const exact = stages.some((stage) => stage.name === through);
+  const candidate = exact ? through : normalizeStageName(through);
+  resolveStagePrefix(stages, candidate); // validates registration + contiguity
+  return candidate;
 }
 
 async function executeRun(deps: CliDeps, options: RunCommandOptions): Promise<void> {
-  const through = resolveThrough(deps, options.through);
-  const ledger = deps.createLedger(options.sourceHash);
-  const report = await runPipeline(deps.stages, ledger, {
-    sourceHash: options.sourceHash,
+  const scope = await resolveRunScope(deps, options);
+  const through = resolveThrough(scope.stages, options.through);
+  const ledger = deps.createLedger(scope.sourceHash);
+  // Media stages key their inputs on the run config, so a --source run pins
+  // the page scope here; without --source the run proceeds on ledger
+  // provenance alone (resume of media work already recorded).
+  let config: Record<string, unknown> = {};
+  if (scope.sourcePath) {
+    const pageCount = await fingerprintPageCountFor(deps, scope);
+    const media = mediaConfigFor(scope, pageCount);
+    if (media) config = { media };
+  }
+  const report = await runPipeline(scope.stages, ledger, {
+    sourceHash: scope.sourceHash,
     through,
+    config,
     releaseGate: releaseGateFor(),
     logger: deps.logger,
     // Single-writer guard: one advisory lockfile per source work directory.
-    lockDirectory: path.join(deps.workRoot, options.sourceHash),
+    lockDirectory: path.join(scope.workRoot, scope.sourceHash),
   });
   for (const outcome of report.results) {
     const suffix = outcome.error_code ? ` error=${outcome.error_code}` : "";
@@ -178,34 +276,103 @@ async function executeRun(deps: CliDeps, options: RunCommandOptions): Promise<vo
   }
 }
 
+/**
+ * Page count for a --source run: from the parsed --pages when given,
+ * otherwise from the SOURCE_FINGERPRINT worker (read-only probe) so a full
+ * compile can request every page without knowing the count up front.
+ */
+async function fingerprintPageCountFor(deps: CliDeps, scope: RunScope): Promise<number | null> {
+  if (scope.pages !== null) return null;
+  if (!scope.sourcePath) return null;
+  const stage = scope.stages.find((entry) => entry.name === "SOURCE_FINGERPRINT");
+  if (!stage) return null;
+  const output = SourceFingerprintOutputSchema.parse(
+    await stage.run(undefined, {
+      runId: "scope",
+      sourceHash: scope.sourceHash,
+      config: {},
+      ledger: deps.createLedger(scope.sourceHash),
+      logger: deps.logger,
+      upstream: null,
+    }),
+  );
+  return output.page_count;
+}
+
 async function executePlan(deps: CliDeps, options: RunCommandOptions): Promise<void> {
-  const through = resolveThrough(deps, options.through);
-  const ledger = deps.createLedger(options.sourceHash);
-  const prefix = through ? resolveStagePrefix(deps.stages, through) : deps.stages;
+  const scope = await resolveRunScope(deps, options);
+  const through = resolveThrough(scope.stages, options.through);
+  const ledger = deps.createLedger(scope.sourceHash);
+  const prefix = through ? resolveStagePrefix(scope.stages, through) : scope.stages;
+
+  // Source inventory (read-only, no external call): hash, page count, and
+  // the 440-page expectation check from the approved source inventory.
+  let media: MediaStageConfig | null = null;
+  if (scope.sourcePath) {
+    deps.writeLine(`source ${scope.sourceHash}`);
+    const pageCount = await fingerprintPageCountFor(deps, scope);
+    deps.writeLine(
+      pageCount === null
+        ? "pages unknown (--pages not given and no fingerprint output)"
+        : `pages ${pageCount} (expected ${LLCY_2024_EXPECTED_PAGE_COUNT}) ` +
+            (pageCount === LLCY_2024_EXPECTED_PAGE_COUNT ? "PASS" : "FAIL"),
+    );
+    if (pageCount !== null && pageCount !== LLCY_2024_EXPECTED_PAGE_COUNT) {
+      deps.writeLine(
+        `plan FAIL: source page count ${pageCount} differs from the approved inventory ` +
+          `(${LLCY_2024_EXPECTED_PAGE_COUNT}); stop and re-verify the source`,
+      );
+      deps.exit?.(1);
+    }
+    if (pageCount !== null) {
+      deps.writeLine(`estimate ocr_pages=${pageCount} (PP-StructureV3, CPU)`);
+      media = mediaConfigFor(scope, pageCount);
+      await printTtsEstimate(deps, scope);
+    }
+  }
+
   // Dry-run caveat: stage input hashes are computed without upstream output
   // context (no artifacts are loaded), matching the pipeline's own hashing
   // for stages that key their inputs on run config.
-  const config: Record<string, unknown> = {};
+  const config: Record<string, unknown> = media ? { media } : {};
   for (const stage of prefix) {
     const entry = await ledger.load(stage.name);
-    const inputHash = await stage.computeInputHash({
-      runId: "plan",
-      sourceHash: options.sourceHash,
-      config,
-      ledger,
-      logger: deps.logger,
-      upstream: null,
-    });
+    let inputHash: string | null = null;
+    try {
+      inputHash = await stage.computeInputHash({
+        runId: "plan",
+        sourceHash: scope.sourceHash,
+        config,
+        ledger,
+        logger: deps.logger,
+        upstream: null,
+      });
+    } catch {
+      // A stage whose inputs are not materialized yet simply cannot be
+      // up-to-date; inputHash stays null and the stage reports would-run.
+    }
     const skipped =
+      inputHash !== null &&
       entry?.status === "PASSED" &&
       entry.input_hash === inputHash &&
       entry.config_version_hash === configVersionHash(stage);
     // plan is a dry-run: it never writes.
     deps.writeLine(
       skipped
-        ? `${stage.name} would-skip (PASSED, input unchanged)`
-        : `${stage.name} would-run (${entry?.status ?? "no entry"})`,
+        ? `${stage.name} would-skip (PASSED, input unchanged, config ${stage.configVersion})`
+        : `${stage.name} would-run (${entry?.status ?? "no entry"}, config ${stage.configVersion})`,
     );
+  }
+}
+
+/** Estimated TTS work from the validated content, when it already exists. */
+async function printTtsEstimate(deps: CliDeps, scope: RunScope): Promise<void> {
+  const workDir = path.join(scope.workRoot, scope.sourceHash);
+  try {
+    const workloads = await loadUnitWorkloads(workDir);
+    deps.writeLine(`estimate tts_items=${collectTtsItems(workloads).length}`);
+  } catch {
+    deps.writeLine("estimate tts_items=unavailable (no validated content yet)");
   }
 }
 
@@ -1227,12 +1394,25 @@ export function buildCli(deps: CliDeps): Command {
 
   const sourceHashOption = (command: Command): Command =>
     command
-      .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
+      .option(
+        "--source-hash <hash>",
+        "source content hash (PDF SHA-256); required unless --source is given",
+      )
+      .option("--source <path>", "path to the source PDF (hashed; wired into SOURCE_FINGERPRINT)")
+      .option("--pages <list>", "comma-separated page scope for the media stages (default: all)")
+      .option("--private-root <dir>", "private root holding work/<source-hash> directories")
       .option("--through <stage>", "run only the contiguous prefix up to this stage");
+
+  const requireSourceIdentity = (options: RunCommandOptions): string => {
+    if (options.sourceHash !== undefined) return options.sourceHash;
+    if (options.source !== undefined) return "(resolved from --source)";
+    throw new Error("either --source or --source-hash is required");
+  };
 
   sourceHashOption(
     program.command("plan").description("dry-run: print the stage order and what would run"),
   ).action(async (options: RunCommandOptions) => {
+    requireSourceIdentity(options);
     await executePlan(deps, options);
   });
 
@@ -1241,6 +1421,7 @@ export function buildCli(deps: CliDeps): Command {
       .command("run")
       .description("run the pipeline, resuming from PASSED stages with unchanged inputs"),
   ).action(async (options: RunCommandOptions) => {
+    requireSourceIdentity(options);
     await executeRun(deps, options);
   });
 
@@ -1249,6 +1430,7 @@ export function buildCli(deps: CliDeps): Command {
       .command("resume")
       .description("resume an interrupted compile (same semantics as run)"),
   ).action(async (options: RunCommandOptions) => {
+    requireSourceIdentity(options);
     await executeRun(deps, options);
   });
 
@@ -1257,7 +1439,7 @@ export function buildCli(deps: CliDeps): Command {
     .description("print the current ledger state of every registered stage")
     .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
     .action(async (options: RunCommandOptions) => {
-      await executeStatus(deps, options.sourceHash);
+      await executeStatus(deps, options.sourceHash!);
     });
 
   const media = program
@@ -1364,14 +1546,14 @@ export function buildCli(deps: CliDeps): Command {
     await executeSemanticStatus(deps, options);
   });
 
-  agents
-    .command("resume")
-    .description("resume the compile pipeline after ingesting agent results (same semantics as `run`)")
-    .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
-    .option("--through <stage>", "run only the contiguous prefix up to this stage")
-    .action(async (options: RunCommandOptions) => {
-      await executeRun(deps, options);
-    });
+  sourceHashOption(
+    agents
+      .command("resume")
+      .description("resume the compile pipeline after ingesting agent results (same semantics as `run`)"),
+  ).action(async (options: RunCommandOptions) => {
+    requireSourceIdentity(options);
+    await executeRun(deps, options);
+  });
 
   const cards = program
     .command("cards")

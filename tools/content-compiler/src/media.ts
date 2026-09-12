@@ -400,6 +400,11 @@ export function workDirectory(privateRoot: string, sourceHash: string): string {
 // Shared spawn arguments + artifact validation (used by CLI and stages)
 // ---------------------------------------------------------------------------
 
+/** Argument array for `lexiloop_media fingerprint` (source inventory probe). */
+export function fingerprintSpawnArgs(sourcePath: string): string[] {
+  return ["fingerprint", "--source", resolve(sourcePath)];
+}
+
 /** Argument array for `lexiloop_media extract` on a per-source work dir. */
 export function extractSpawnArgs(media: MediaStageConfig, workDir: string): string[] {
   return [

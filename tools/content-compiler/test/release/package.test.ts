@@ -55,6 +55,7 @@ import { loadAudioManifest, ttsCacheKey } from "../../src/tts/cache";
 import {
   PRODUCTION_STAGE_DEPENDENCIES,
   PRODUCTION_STAGE_NAMES,
+  SourceFingerprintOutputSchema,
   createReleasePackageStage,
   getProductionStages,
 } from "../../src/stage-registry";
@@ -297,9 +298,24 @@ async function writeValidationReport(
 
 /** Synthetic but self-consistent output object for one upstream stage. */
 async function stageOutputFor(name: string, workDir: string): Promise<Record<string, unknown>> {
+  const output = await syntheticStageOutput(name, workDir);
+  // The primed fixture must satisfy the real stage's output contract, so the
+  // release packaging test cannot drift away from the production schemas.
+  if (name === "SOURCE_FINGERPRINT") SourceFingerprintOutputSchema.parse(output);
+  return output;
+}
+
+async function syntheticStageOutput(name: string, workDir: string): Promise<Record<string, unknown>> {
   switch (name) {
     case "SOURCE_FINGERPRINT":
-      return { source_sha256: SOURCE_HASH, algorithm: "sha256" };
+      // Same shape the real stage emits (SourceFingerprintOutputSchema):
+      // source hash + page count + fingerprint worker contract version.
+      return {
+        source_sha256: SOURCE_HASH,
+        algorithm: "sha256",
+        page_count: 1,
+        fingerprint_config_version: "1",
+      };
     case "IMAGE_EXTRACT":
       return {
         source_sha256: SOURCE_HASH,

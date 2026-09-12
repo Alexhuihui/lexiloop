@@ -232,6 +232,42 @@ def cmd_clean(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# fingerprint
+# ---------------------------------------------------------------------------
+
+
+def cmd_fingerprint(args: argparse.Namespace) -> None:
+    """Source inventory probe: SHA-256 + page count of the source PDF.
+
+    Read-only (no artifacts are written); the SOURCE_FINGERPRINT stage folds
+    this summary into its ledger output so later stages chain the source
+    identity and `plan` can surface the page-count expectation check.
+    """
+    source = Path(args.source)
+    if not source.is_file():
+        _fail("SOURCE_NOT_FOUND", f"source PDF not found: {source}")
+    import pymupdf
+
+    try:
+        handle = pymupdf.open(source)
+    except Exception as exc:
+        _fail("SOURCE_UNREADABLE", f"cannot open source PDF: {source}: {exc}")
+    try:
+        page_count = handle.page_count
+    finally:
+        handle.close()
+    if page_count < 1:
+        _fail("SOURCE_UNREADABLE", f"source PDF has no pages: {source}")
+    _emit(
+        {
+            "algorithm": "sha256",
+            "source_sha256": pdf_images.sha256_file(source),
+            "page_count": page_count,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # qa-packets
 # ---------------------------------------------------------------------------
 
@@ -325,6 +361,13 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--out-dir", required=True, help="per-source work directory")
     extract.add_argument("--dpi", type=int, default=300, help="DPI for the render fallback")
     extract.set_defaults(func=cmd_extract)
+
+    fingerprint = sub.add_parser(
+        "fingerprint",
+        help="report the source PDF's sha-256 and page count (read-only)",
+    )
+    fingerprint.add_argument("--source", required=True, help="path to the source PDF")
+    fingerprint.set_defaults(func=cmd_fingerprint)
 
     clean = sub.add_parser("clean", help="remove watermarks strictly inside declared masks")
     clean.add_argument("--pages-jsonl", required=True, help="pages.jsonl from extract")

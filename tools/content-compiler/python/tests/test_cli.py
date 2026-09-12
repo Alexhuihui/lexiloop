@@ -89,3 +89,42 @@ def test_cli_extract_summary_is_single_json_line(
     summary = json.loads(lines[0])
     assert [page["page"] for page in summary["pages"]] == [1, 2]
     assert (tmp_path / "pages.jsonl").is_file()
+
+
+# ---------------------------------------------------------------------------
+# fingerprint (source inventory: sha-256 + page count, read-only)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_fingerprint_reports_hash_and_page_count(
+    fixture_pdf_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli.main(["fingerprint", "--source", str(fixture_pdf_path)])
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1  # exactly one JSON summary object on stdout
+    summary = json.loads(lines[0])
+    assert summary["algorithm"] == "sha256"
+    assert summary["source_sha256"] == pdf_images.sha256_file(fixture_pdf_path)
+    assert summary["page_count"] == 2
+
+
+def test_cli_fingerprint_missing_source_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["fingerprint", "--source", str(tmp_path / "missing.pdf")])
+    assert excinfo.value.code == 2
+    payload = json.loads(capsys.readouterr().err.strip())
+    assert payload["error"] == "SOURCE_NOT_FOUND"
+
+
+def test_cli_fingerprint_non_pdf_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    not_a_pdf = tmp_path / "not-a-pdf.pdf"
+    not_a_pdf.write_bytes(b"definitely not a pdf")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["fingerprint", "--source", str(not_a_pdf)])
+    assert excinfo.value.code == 2
+    payload = json.loads(capsys.readouterr().err.strip())
+    assert payload["error"] == "SOURCE_UNREADABLE"

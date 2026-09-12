@@ -222,23 +222,47 @@ function touchBoundary(state: WalkState, unitKey: string | null, page: number): 
   if (boundary && page > boundary.last_page) boundary.last_page = page;
 }
 
-function startUnit(state: WalkState, block: PreprocessedBlock): void {
-  const unitOrder = state.units.length + 1;
-  const unitKey = `u${unitOrder}`;
+/**
+ * Open (or re-point to) the unit carried by a banner with the captured number
+ * `unitNumber`. The captured number is authoritative (Task 6 minor): the
+ * unit key and order derive from it, never from discovery order, so unit
+ * identity is stable regardless of which pages a run happens to cover.
+ *
+ * Side tabs repeat the unit's number on every page; a banner whose number
+ * equals the currently open unit never re-opens it. A banner re-opening an
+ * already-closed unit (banner numbers must be monotonic in page order) is a
+ * determinism violation and fails loudly instead of mis-attributing words.
+ */
+function startUnit(
+  state: WalkState,
+  block: PreprocessedBlock,
+  unitNumber: number,
+  title: string,
+  firstPage: number,
+): void {
+  const unitKey = `u${unitNumber}`;
+  const existing = state.boundaryByUnit.get(unitKey);
+  if (existing) {
+    if (state.currentUnit === existing) return; // repeated per-page tab
+    throw new Error(
+      `unit banner ${unitKey} re-appeared on page ${block.page} after unit ` +
+        `${state.currentUnit?.unit_key ?? "?"} opened; banner numbers must be monotonic`,
+    );
+  }
   const unit: UnitT = {
     unit_key: unitKey,
     book_key: state.config.book_key,
     level: 1,
-    unit_order: unitOrder,
-    title: block.normalizedText,
+    unit_order: unitNumber,
+    title,
     ...provenance(block),
   };
   const boundary: UnitBoundary = {
     unit_key: unitKey,
-    unit_order: unitOrder,
-    title: block.normalizedText,
-    first_page: block.page,
-    last_page: block.page,
+    unit_order: unitNumber,
+    title,
+    first_page: firstPage,
+    last_page: firstPage,
   };
   state.units.push(unit);
   state.unitBoundaries.push(boundary);
@@ -482,6 +506,134 @@ function resolveReviews(state: WalkState, corrections: readonly VisualCorrection
 }
 
 /**
+ * Unit signal found on one page: the captured number plus the block that
+ * named it (provenance anchor for the Unit record).
+ */
+interface PageSignal {
+  number: number;
+  anchor: PreprocessedBlock;
+  title: string;
+}
+
+/** The page's unit signal: an opener banner match, else its right-rail tab. */
+function pageSignal(
+  blocksOfPage: readonly PreprocessedBlock[],
+  unitTitleRes: readonly RegExp[],
+  config: NormalizeBookConfig,
+): PageSignal | null {
+  for (const block of blocksOfPage) {
+    for (const re of unitTitleRes) {
+      const match = re.exec(block.normalizedText);
+      if (match) {
+        const captured = Number.parseInt(match[1] ?? "", 10);
+        if (Number.isInteger(captured) && captured > 0) {
+          return { number: captured, anchor: block, title: block.normalizedText };
+        }
+      }
+    }
+  }
+  let tabBlock: PreprocessedBlock | null = null;
+  for (const block of blocksOfPage) {
+    if (matchUnitTabNumber(block, config) !== null) tabBlock = block; // last wins: bottom rail
+  }
+  if (tabBlock) {
+    const number = matchUnitTabNumber(tabBlock, config)!;
+    return { number, anchor: tabBlock, title: `Unit ${number}` };
+  }
+  return null;
+}
+
+/**
+ * Unit attribution for signal-less pages (unit openers whose stylized banner
+ * defeats OCR, chapter dividers, trailing even-printed pages): nearest
+ * signaled page wins, ties keep the earlier unit. A page before any signal
+ * belongs to the first signal's unit (an opener page precedes its unit's
+ * first tab page); a page after every signal stays with the open unit.
+ *
+ * Before attribution, a SINGLE-page signal run that disagrees with identical
+ * neighbor runs is an OCR misread of the repeated tab and is corrected to the
+ * neighbors (units never interleave, so a one-page unit between two pages of
+ * one and the same other unit is impossible). Multi-page disagreement still
+ * stands as a real signal, and genuine monotonicity violations throw below.
+ */
+function attributePages(
+  pages: readonly PreprocessedBlock[][],
+  unitTitleRes: readonly RegExp[],
+  config: NormalizeBookConfig,
+): Array<{ unitNumber: number; anchor: PreprocessedBlock; title: string }> {
+  const signals = pages.map((blocksOfPage) => pageSignal(blocksOfPage, unitTitleRes, config));
+
+  // Collapse isolated single-page misreads of the repeating tab. Runs are
+  // taken over the SIGNALED pages only (signal-less gaps between tab pages
+  // are the normal even/odd rail rhythm, not run separators).
+  const signalIndexes = signals.flatMap((signal, index) => (signal ? [index] : []));
+  const runs: Array<{ start: number; end: number; value: number }> = [];
+  signalIndexes.forEach((index) => {
+    const value = signals[index]!.number;
+    const last = runs[runs.length - 1];
+    if (last && last.value === value) last.end = index;
+    else runs.push({ start: index, end: index, value });
+  });
+  for (let index = 1; index < runs.length - 1; index += 1) {
+    const run = runs[index]!;
+    const previous = runs[index - 1]!;
+    const next = runs[index + 1]!;
+    if (run.start === run.end && run.value !== previous.value && previous.value === next.value) {
+      for (let page = run.start; page <= run.end; page += 1) {
+        signals[page] = signals[previous.start]!;
+      }
+    }
+  }
+
+  return signals.map((signal, index) => {
+    if (signal) return { unitNumber: signal.number, anchor: signal.anchor, title: signal.title };
+    const previous = [...signalIndexes].reverse().find((candidate) => candidate < index);
+    const next = signalIndexes.find((candidate) => candidate > index);
+    if (previous === undefined && next === undefined) {
+      // A page with no signal at all anywhere: leave it unattributed (its
+      // content lands in the pre-unit bucket and the stage fails closed).
+      return { unitNumber: 0, anchor: pages[index]![0]!, title: "" };
+    }
+    if (previous === undefined) {
+      const chosen = signals[next!]!;
+      return { unitNumber: chosen.number, anchor: chosen.anchor, title: chosen.title };
+    }
+    if (next === undefined) {
+      const chosen = signals[previous]!;
+      return { unitNumber: chosen.number, anchor: chosen.anchor, title: chosen.title };
+    }
+    const previousDistance = index - previous;
+    const nextDistance = next - index;
+    const chosen = previousDistance <= nextDistance ? signals[previous]! : signals[next]!;
+    return { unitNumber: chosen.number, anchor: chosen.anchor, title: chosen.title };
+  });
+}
+/** Group reading-ordered blocks by page, preserving in-page order. */
+function groupByPage<T extends { page: number }>(blocks: readonly T[]): Map<number, T[]> {
+  const byPage = new Map<number, T[]>();
+  for (const block of blocks) {
+    const list = byPage.get(block.page);
+    if (list) list.push(block);
+    else byPage.set(block.page, [block]);
+  }
+  return byPage;
+}
+
+/**
+ * Unit number carried by a side-tab block, or null. The real raster repeats
+ * the unit's number as a bare 1-2 digit block in the right rail of every
+ * page; position (x0 >= `unit_tab_x_min`) is what distinguishes a tab from
+ * the bare entry numbers printed inside the text column.
+ */
+function matchUnitTabNumber(block: PreprocessedBlock, config: NormalizeBookConfig): number | null {
+  if (block.bbox[0] < config.unit_tab_x_min) return null;
+  const match = new RegExp(config.unit_tab_number_pattern, "u").exec(block.normalizedText);
+  if (!match) return null;
+  const number = Number.parseInt(match[1] ?? match[0], 10);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+/**
  * Recover book/Unit/word/sense/phrase/example records from OCR blocks.
  * `blocks` must already be in reading order (see `assignReadingOrder`);
  * page furniture is partitioned off internally before segmentation.
@@ -515,40 +667,65 @@ export function segmentStructure(
     unitWordCount: new Map(),
   };
 
-  for (const block of content) {
-    const text = block.normalizedText;
-    let unitMatch: RegExpExecArray | null = null;
-    for (const re of unitTitleRes) {
-      const match = re.exec(text);
-      if (match) {
-        unitMatch = match;
-        break;
+  const groupedPages = [...groupByPage(content).values()];
+  const attribution = attributePages(groupedPages, unitTitleRes, config);
+
+  groupedPages.forEach((blocksOfPage, pageIndex) => {
+    // Page-level unit attribution: the right-rail tab names the unit that
+    // owns the WHOLE page (it physically sits near the rail's bottom — after
+    // the page content in reading order), and signal-less pages (openers
+    // whose stylized banner defeats OCR, chapter dividers, trailing pages)
+    // follow the nearest tab signal. Open the page's unit before reading it.
+    const { unitNumber, anchor, title } = attribution[pageIndex]!;
+    if (unitNumber > 0 && unitNumber !== state.currentUnit?.unit_order) {
+      startUnit(state, anchor, unitNumber, title, blocksOfPage[0]!.page);
+    }
+
+    for (const block of blocksOfPage) {
+      const text = block.normalizedText;
+      let unitMatch: RegExpExecArray | null = null;
+      for (const re of unitTitleRes) {
+        const match = re.exec(text);
+        if (match) {
+          unitMatch = match;
+          break;
+        }
+      }
+      if (unitMatch) {
+        // Opener banner: the captured group is the unit's real number.
+        const captured = Number.parseInt(unitMatch[1] ?? "", 10);
+        const bannerNumber =
+          Number.isInteger(captured) && captured > 0 ? captured : state.units.length + 1;
+        if (bannerNumber !== state.currentUnit?.unit_order) {
+          startUnit(state, block, bannerNumber, text, block.page);
+        }
+        continue;
+      }
+      if (matchUnitTabNumber(block, config) !== null) {
+        // Per-page side tab: attribution already handled it; never content.
+        continue;
+      }
+      if (config.note_patterns.some((pattern) => new RegExp(pattern, "u").test(text))) {
+        continue; // Word-root/synonym notes carry no learnable entity.
+      }
+      const headMatch = HEAD_ENTRY_RE.exec(text);
+      if (headMatch && findPosMarker(headMatch[3] ?? "", config.pos_markers) !== null) {
+        startWord(state, block, headMatch);
+        continue;
+      }
+      if (text.startsWith(config.exam_marker)) {
+        addExample(state, block, config.exam_marker);
+        continue;
+      }
+      if (
+        block.confidence >= config.non_critical_confidence_min &&
+        state.currentWord &&
+        !CJK_RANGE.test(text.slice(0, 1))
+      ) {
+        addPhrase(state, block);
       }
     }
-    if (unitMatch) {
-      startUnit(state, block);
-      continue;
-    }
-    if (config.note_patterns.some((pattern) => new RegExp(pattern, "u").test(text))) {
-      continue; // Word-root/synonym notes carry no learnable entity.
-    }
-    const headMatch = HEAD_ENTRY_RE.exec(text);
-    if (headMatch && findPosMarker(headMatch[3] ?? "", config.pos_markers) !== null) {
-      startWord(state, block, headMatch);
-      continue;
-    }
-    if (text.startsWith(config.exam_marker)) {
-      addExample(state, block, config.exam_marker);
-      continue;
-    }
-    if (
-      block.confidence >= config.non_critical_confidence_min &&
-      state.currentWord &&
-      !CJK_RANGE.test(text.slice(0, 1))
-    ) {
-      addPhrase(state, block);
-    }
-  }
+  });
 
   resolveReviews(state, corrections);
 
