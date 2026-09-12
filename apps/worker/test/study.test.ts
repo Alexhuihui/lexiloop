@@ -1211,3 +1211,65 @@ describe("alias-aware grading and undo across release activation and rollback", 
     expect(cardStateRow(fx.bob.userId, "k-new")).toBeDefined();
   });
 });
+
+describe("alias-aware queue selection across a rename (canonical progress)", () => {
+  /**
+   * Finding (final review): group/supplemental selection joined
+   * word_progress.word_key (canonical) directly to the release-local
+   * word.word_key, so a renamed word with existing progress re-entered
+   * NEW_WORDS as if unseen and vanished from QUICK_TEST. Bob therefore holds
+   * INTRODUCED progress under the canonical w-new, with k-new (k-old's
+   * canonical card) already graded and a second, ungraded active card
+   * (k-old-2) — while the ACTIVE release R1 still presents the OLD keys.
+   */
+  async function seedRenamedWordProgress(): Promise<void> {
+    await fx.db.insert(cardDefinition).values({
+      releaseId: R1,
+      contentCardKey: "k-old-2",
+      cardType: "WORD_MEANING",
+      targetEntityKey: "t-old-2",
+      wordKey: "w-old",
+      unitKey: "u-1",
+      templateVersion: "tv-1",
+      status: "ACTIVE",
+    });
+    await new WordProgressRepository(fx.db).upsert({ userId: fx.bob.userId }, {
+      wordKey: "w-new",
+      stage: "INTRODUCED",
+      initialFamiliarity: null,
+      firstSeenAt: T0 - DAY,
+      lastSeenAt: T0 - DAY,
+      introducedReleaseId: R1,
+      introducedAt: T0 - DAY,
+    });
+    await seedCardState(fx.db, fx.bob.userId, "k-new", T0 - 500);
+  }
+
+  it("does not re-teach a renamed word whose canonical key already has progress", async () => {
+    await seedRenamedWordProgress();
+    const group = await createSession(fx.bobAuth, "NEW_WORDS");
+    expect(group.status).toBe(201);
+    // w-old resolves to w-new, which is INTRODUCED: it must not re-enter the
+    // teaching order. The group is exactly w1's and w2's cards.
+    expect(group.body.cards.map((card) => card.presented_card_key)).toEqual([
+      "k-wm-1",
+      "k-wm-2",
+      "k-wm-3",
+      "k-cm-4",
+      "k-ph-5",
+      "k-sd-0",
+      "k-sd-6",
+    ]);
+  });
+
+  it("surfaces the renamed word's ungraded active cards in the QUICK_TEST queue", async () => {
+    await seedRenamedWordProgress();
+    const quick = await createSession(fx.bobAuth, "QUICK_TEST");
+    expect(quick.status).toBe(201);
+    // w-old is introduced through its canonical root; k-old is graded (its
+    // canonical k-new carries card_state), so only the ungraded k-old-2 is
+    // offered — under its release-local presented key.
+    expect(quick.body.cards).toEqual([{ canonical_card_key: "k-old-2", presented_card_key: "k-old-2" }]);
+    expect(quick.body.release_id).toBe(R1);
+  });
+});

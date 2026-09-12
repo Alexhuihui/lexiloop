@@ -54,9 +54,10 @@ export const schema = {
  * Driver-agnostic by construction: both the sync better-sqlite3 driver
  * (compiler, scripts, tests) and the async D1 driver (worker) satisfy the
  * union. All repository statements are executed with `await`, which both
- * drivers support; the single exception is ReleaseRepository.setActive's
- * interactive transaction, isolated there with a documented cast (drizzle's
- * per-driver transaction callbacks cannot be inferred through the union).
+ * drivers support. Multi-statement atomic units never use interactive
+ * transactions on D1 (it rejects BEGIN/COMMIT/SAVEPOINT): they compose
+ * single SQL statements through `createAtomicBatchRunner` (see ./atomic),
+ * which maps to D1's `batch()` and to a better-sqlite3 `transaction()`.
  * A tsc-level probe lives in test/driver.test.ts.
  */
 export type LexiloopDatabase =

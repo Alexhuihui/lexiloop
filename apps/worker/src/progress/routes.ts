@@ -7,7 +7,7 @@
  */
 
 import type { Hono } from "hono";
-import { WordProgressRepository } from "@lexiloop/db";
+import { AliasRepository, ReleaseRepository, WordProgressRepository } from "@lexiloop/db";
 import { requireAuth } from "../middleware/auth";
 import { privateNoStoreHeaders } from "../http/cache";
 import type { AppEnv } from "../app";
@@ -18,7 +18,17 @@ export function registerProgressRoutes(app: Hono<AppEnv>): void {
   app.get("/api/progress/words/:wordKey", requireAuth(), async (c) => {
     const auth = c.var.auth;
     const wordKey = c.req.param("wordKey");
-    const row = await new WordProgressRepository(c.var.deps.db).get({ userId: auth.userId }, wordKey);
+    // Alias invariance (spec 6.4), the read-side twin of every mutation path:
+    // personal state is keyed by the canonical root, so a presented (e.g.
+    // renamed) key reads the SAME progress row instead of looking unseen.
+    // Resolution itself is release-independent; the active release id only
+    // decorates diagnostics.
+    const active = await new ReleaseRepository(c.var.deps.db).getActive();
+    const canonicalKey = await new AliasRepository(c.var.deps.db).resolve({
+      releaseId: active?.releaseId ?? "",
+      key: wordKey,
+    });
+    const row = await new WordProgressRepository(c.var.deps.db).get({ userId: auth.userId }, canonicalKey);
     return c.json(
       {
         word_key: wordKey,

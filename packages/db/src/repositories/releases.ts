@@ -1,11 +1,10 @@
-import { eq, sql } from "drizzle-orm";
-import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import { eq, sql, type SQL } from "drizzle-orm";
 import { ReleaseStatus } from "@lexiloop/content-schema";
 import { z } from "zod";
-import { schema, type LexiloopDatabase } from "../schema";
+import { createAtomicBatchRunner } from "../atomic";
+import type { LexiloopDatabase } from "../schema";
 import {
   appMeta,
-  contentKeyAlias,
   contentRelease,
   releaseUnit,
   type AppMetaRow,
@@ -116,11 +115,10 @@ export class ReleaseRepository {
    * RETIRED and promotes the target (READY for first activation, RETIRED for
    * rollback — spec 11.3).
    *
-   * Transaction note (review finding): interactive `transaction()` callbacks
-   * cannot be inferred through the sync/async handle union, so this is the
-   * one isolated sync-typed call. At runtime both drivers implement it
-   * (drizzle's D1 session issues BEGIN/COMMIT); on D1 the worker may
-   * alternatively compose the three statements with `batch()`.
+   * The switch is one atomic statement list (see createAtomicBatchRunner):
+   * every statement is a single SQL statement over the pre-batch reads
+   * (`getById`/`getMeta`), composed by `batch()` on D1 and one transaction
+   * on better-sqlite3 — never an interactive transaction, which D1 rejects.
    */
   async setActive(releaseId: string, activatedAt: number): Promise<ContentReleaseRow> {
     const target = await this.getById(releaseId);
@@ -134,23 +132,12 @@ export class ReleaseRepository {
     if (target.status !== "READY" && target.status !== "RETIRED") {
       throw new Error(`setActive: release ${releaseId} is ${target.status}, expected READY or RETIRED`);
     }
-    const txDb = this.db as BetterSQLite3Database<typeof schema>;
-    txDb.transaction((tx) => {
-      if (meta?.activeReleaseId) {
-        tx.update(contentRelease)
-          .set({ status: "RETIRED" })
-          .where(eq(contentRelease.releaseId, meta.activeReleaseId))
-          .run();
-      }
-      tx.update(contentRelease)
-        .set({ status: "ACTIVE", activatedAt })
-        .where(eq(contentRelease.releaseId, releaseId))
-        .run();
-      tx.update(appMeta)
-        .set({ activeReleaseId: releaseId, configVersion: sql`${appMeta.configVersion} + 1` })
-        .where(eq(appMeta.id, 1))
-        .run();
-    });
+    const statements: SQL[] = [];
+    if (meta?.activeReleaseId) {
+      statements.push(sqlDemoteRelease(meta.activeReleaseId));
+    }
+    statements.push(sqlActivateRelease(releaseId, activatedAt), sqlSwitchPointer(releaseId));
+    await createAtomicBatchRunner(this.db).run(statements);
     return (await this.getById(releaseId)) ?? target;
   }
 
@@ -187,10 +174,14 @@ export class ReleaseRepository {
   /**
    * The atomic activation batch (spec 6.4/11.3): imports the validated alias
    * edges, demotes the previous ACTIVE release to RETIRED, promotes the target
-   * to ACTIVE and switches the app_meta pointer - all inside one transaction.
-   * Any failure (e.g. a malformed alias row violating a constraint) rolls the
-   * whole batch back, leaving user state, statuses, and the pointer unchanged.
-   * Target must be READY (first activation) or RETIRED (rollback).
+   * to ACTIVE and switches the app_meta pointer - all as ONE statement list
+   * executed through D1's only atomic primitive, `batch()` (one transaction
+   * on better-sqlite3; D1 itself rejects BEGIN/COMMIT/SAVEPOINT). Every
+   * statement is a single SQL statement over the pre-batch reads (`getById`/
+   * `getMeta`), so the batch composes them atomically. Any failure (e.g. a
+   * malformed alias row violating a constraint) rolls the whole batch back,
+   * leaving user state, statuses, and the pointer unchanged. Target must be
+   * READY (first activation) or RETIRED (rollback).
    */
   async activateBatch(input: {
     releaseId: string;
@@ -211,44 +202,45 @@ export class ReleaseRepository {
       throw new Error(`activateBatch: release ${input.releaseId} is ${target.status}, expected READY or RETIRED`);
     }
     const meta = await this.getMeta();
-    const txDb = this.db as BetterSQLite3Database<typeof schema>;
-    txDb.transaction((tx) => {
-      for (const row of input.aliasRows) {
-        // Idempotent re-import (rollback + re-activation): the same edge row
-        // is updated in place; a genuinely new edge colliding with a stored
-        // from_key still violates the unique index and fails the batch.
-        tx.insert(contentKeyAlias)
-          .values({
-            releaseId: row.releaseId,
-            fromKey: row.fromKey,
-            toKey: row.toKey,
-            // Imported migration edges are renames; 'EQUIVALENT' stays
-            // reserved for future same-entity declarations.
-            edgeType: "RENAME",
-            canonicalKey: row.canonicalKey,
-            createdAt: row.createdAt,
-          })
-          .onConflictDoUpdate({
-            target: [contentKeyAlias.releaseId, contentKeyAlias.fromKey, contentKeyAlias.toKey],
-            set: { canonicalKey: row.canonicalKey, createdAt: row.createdAt },
-          })
-          .run();
-      }
-      if (meta?.activeReleaseId && meta.activeReleaseId !== input.releaseId) {
-        tx.update(contentRelease)
-          .set({ status: "RETIRED" })
-          .where(eq(contentRelease.releaseId, meta.activeReleaseId))
-          .run();
-      }
-      tx.update(contentRelease)
-        .set({ status: "ACTIVE", activatedAt: input.activatedAt })
-        .where(eq(contentRelease.releaseId, input.releaseId))
-        .run();
-      tx.update(appMeta)
-        .set({ activeReleaseId: input.releaseId, configVersion: sql`${appMeta.configVersion} + 1` })
-        .where(eq(appMeta.id, 1))
-        .run();
-    });
+    const statements: SQL[] = input.aliasRows.map((row) => sqlUpsertAliasEdge(row));
+    if (meta?.activeReleaseId && meta.activeReleaseId !== input.releaseId) {
+      statements.push(sqlDemoteRelease(meta.activeReleaseId));
+    }
+    statements.push(sqlActivateRelease(input.releaseId, input.activatedAt), sqlSwitchPointer(input.releaseId));
+    await createAtomicBatchRunner(this.db).run(statements);
     return (await this.getById(input.releaseId)) ?? target;
   }
+}
+
+/** Single-statement demotion of a release to RETIRED (pre-batch read guard). */
+function sqlDemoteRelease(releaseId: string): SQL {
+  return sql`UPDATE content_release SET status = 'RETIRED' WHERE release_id = ${releaseId}`;
+}
+
+/** Single-statement promotion of the target release to ACTIVE. */
+function sqlActivateRelease(releaseId: string, activatedAt: number): SQL {
+  return sql`UPDATE content_release SET status = 'ACTIVE', activated_at = ${activatedAt} WHERE release_id = ${releaseId}`;
+}
+
+/** Single-statement app_meta pointer switch with the config_version bump. */
+function sqlSwitchPointer(releaseId: string): SQL {
+  return sql`UPDATE app_meta SET active_release_id = ${releaseId}, config_version = config_version + 1 WHERE id = 1`;
+}
+
+/**
+ * Idempotent alias-edge upsert (rollback + re-activation): the same edge row
+ * is updated in place; a genuinely new edge colliding with a stored from_key
+ * still violates the unique index and fails the batch.
+ */
+function sqlUpsertAliasEdge(row: {
+  releaseId: string;
+  fromKey: string;
+  toKey: string;
+  canonicalKey: string;
+  createdAt: number;
+}): SQL {
+  return sql`INSERT INTO content_key_alias (release_id, from_key, to_key, edge_type, canonical_key, created_at)
+    VALUES (${row.releaseId}, ${row.fromKey}, ${row.toKey}, 'RENAME', ${row.canonicalKey}, ${row.createdAt})
+    ON CONFLICT (release_id, from_key, to_key) DO UPDATE SET
+      canonical_key = excluded.canonical_key, created_at = excluded.created_at`;
 }

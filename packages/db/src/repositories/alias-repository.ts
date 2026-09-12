@@ -50,15 +50,52 @@ export class AliasRepository {
   constructor(private readonly db: LexiloopDatabase) {}
 
   async resolve(input: ResolveAliasInput): Promise<string> {
-    const { releaseId, key } = input;
-    let current = key;
+    const edgesOf = async (fromKey: string): Promise<ContentKeyAliasRow[]> =>
+      await this.db.select().from(contentKeyAlias).where(eq(contentKeyAlias.fromKey, fromKey));
+    return await this.walk(input.releaseId, input.key, edgesOf);
+  }
+
+  /**
+   * Resolves many keys in one pass (queue building: a release's whole
+   * teaching order must be matched against canonically keyed user state).
+   * The alias table holds only explicitly declared migration edges, so it is
+   * read once and every key runs the exact `resolve` walk from that snapshot
+   * — same bidirectional semantics and the same loud ambiguity, cycle, and
+   * canonical-root failures, without per-key round trips on D1.
+   */
+  async resolveMany(input: { releaseId: string; keys: readonly string[] }): Promise<Map<string, string>> {
+    const byFrom = new Map<string, ContentKeyAliasRow[]>();
+    for (const edge of await this.db.select().from(contentKeyAlias)) {
+      const edges = byFrom.get(edge.fromKey);
+      if (edges) {
+        edges.push(edge);
+      } else {
+        byFrom.set(edge.fromKey, [edge]);
+      }
+    }
+    const resolved = new Map<string, string>();
+    for (const key of new Set(input.keys)) {
+      resolved.set(key, await this.walk(input.releaseId, key, async (fromKey) => byFrom.get(fromKey) ?? []));
+    }
+    return resolved;
+  }
+
+  /**
+   * The bidirectional edge walk from a presented key to its canonical root:
+   * a key may sit on the from side (renamed away) or on the to side (merged
+   * into an older root). `edgesOf` returns the outgoing edges of one key —
+   * either queried per hop or read from a caller-provided snapshot.
+   */
+  private async walk(
+    releaseId: string,
+    start: string,
+    edgesOf: (fromKey: string) => Promise<ContentKeyAliasRow[]>,
+  ): Promise<string> {
+    let current = start;
     let canonical: string | null = null;
-    const visited = new Set<string>([key]);
+    const visited = new Set<string>([start]);
     for (;;) {
-      const edges = await this.db
-        .select()
-        .from(contentKeyAlias)
-        .where(eq(contentKeyAlias.fromKey, current));
+      const edges = await edgesOf(current);
       if (edges.length > 1) {
         throw new Error(
           `content_key_alias: key ${current} has ${edges.length} outgoing edges across releases; ` +

@@ -82,12 +82,11 @@ test("quick recall and the first rating introduce the studied group", async ({ p
   }
 
   // Completion: every STUDIED word is INTRODUCED server-side. The summary
-  // counts progress rows by the CLIENT's release-local keys, so it reads
-  // 2/3: harbour's progress row lives under its canonical v2 word key (the
-  // rename alias), and anchor/voyage have no rename. Stats are canonical-
-  // keyed, so learned_words still counts all three.
+  // reads progress through the alias-resolving endpoint, so harbour's row is
+  // found under its canonical v2 word key (the rename alias): 3/3. Stats are
+  // canonical-keyed, so learned_words counts all three as well.
   await expect(page.getByRole("heading", { name: "本组学习完成" })).toBeVisible();
-  await expect(page.getByText("已引入 2 / 3 个单词")).toBeVisible();
+  await expect(page.getByText("已引入 3 / 3 个单词")).toBeVisible();
 
   const statsAfter = await api.stats();
   expect(statsAfter.reviews_total).toBe(statsBefore.reviews_total + 14);

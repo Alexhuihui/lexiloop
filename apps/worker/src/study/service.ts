@@ -10,7 +10,7 @@
  * user-scoped through `UserContext` (spec 6.3).
  */
 
-import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type { SQL } from "drizzle-orm";
 import {
@@ -22,12 +22,14 @@ import {
   StudySessionRepository,
   UserSettingsRepository,
   WordProgressRepository,
+  createAtomicBatchRunner,
   cardDefinition,
   cardState,
   schema,
   unit,
   word,
   wordProgress,
+  type AtomicBatchRunner,
   type CardDefinitionRow,
   type LexiloopDatabase,
   type StudySessionMode,
@@ -63,44 +65,12 @@ export class StudyHttpError extends Error {
 
 /**
  * One atomic write unit for the study workflow (spec 8.3: one grade = one
- * D1 batch; any statement failure rolls back the whole unit). Statements are
- * prebuilt drizzle `SQL` — all decisions are made BEFORE the unit runs, and
- * conditional flips are expressed as guarded UPDATE statements.
- *
- * - D1 (production): drizzle's `batch()` — `db.run(sql)` yields the deferred
- *   statement objects `batch()` prepares, executed as one implicit
- *   transaction.
- * - better-sqlite3 (tests/scripts): one interactive `transaction()`.
+ * D1 batch; any statement failure rolls back the whole unit). Owned by the
+ * db package (`createAtomicBatchRunner`) so release activation composes the
+ * exact same primitive; re-exported here for the study surface.
  */
-export interface AtomicBatchRunner {
-  run(statements: readonly SQL[]): Promise<void>;
-}
-
-export function createAtomicBatchRunner(db: LexiloopDatabase): AtomicBatchRunner {
-  const asyncHandle = db as unknown as {
-    batch?: (queries: readonly unknown[]) => Promise<unknown>;
-    run: (query: SQL) => unknown;
-  };
-  if (typeof asyncHandle.batch === "function") {
-    return {
-      async run(statements) {
-        await asyncHandle.batch!(statements.map((statement) => asyncHandle.run(statement)));
-      },
-    };
-  }
-  // The documented cast pattern (see ReleaseRepository.setActive): the sync
-  // driver has no batch, so the unit runs inside one transaction callback.
-  const syncHandle = db as unknown as BetterSQLite3Database<typeof schema>;
-  return {
-    async run(statements) {
-      syncHandle.transaction((tx) => {
-        for (const statement of statements) {
-          tx.run(statement);
-        }
-      });
-    },
-  };
-}
+export { createAtomicBatchRunner } from "@lexiloop/db";
+export type { AtomicBatchRunner } from "@lexiloop/db";
 
 /** API view of a study session (personal data: `private, no-store`). */
 export interface SessionView {
@@ -254,20 +224,23 @@ export class StudyService {
   private async newWordsCards(ctx: UserContext, releaseId: string): Promise<StudyQueueCard[]> {
     const settings = await new UserSettingsRepository(this.db).get(ctx);
     const limit = settings?.newWordsPerGroup ?? DEFAULT_NEW_WORDS_PER_GROUP;
-    const groupRows = await builder(this.db)
-      .select({ wordKey: word.wordKey, sourceOrder: word.sourceOrder })
-      .from(word)
-      .leftJoin(unit, and(eq(unit.releaseId, word.releaseId), eq(unit.unitKey, word.unitKey)))
-      .leftJoin(wordProgress, and(eq(wordProgress.userId, ctx.userId), eq(wordProgress.wordKey, word.wordKey)))
-      .where(
-        and(
-          eq(word.releaseId, releaseId),
-          or(isNull(wordProgress.stage), inArray(wordProgress.stage, ["UNSEEN", "IN_PROGRESS"])),
-        ),
-      )
-      .orderBy(asc(unit.unitOrder), asc(word.tier), asc(word.sourceOrder), asc(word.wordKey))
-      .limit(limit);
-    const words = groupRows.map((row) => ({ word_key: row.wordKey, source_order: row.sourceOrder }));
+    const candidates = await this.textbookOrderedWords(releaseId);
+    // User state is keyed by the canonical ROOT (spec 6.4): resolve the whole
+    // teaching order through the alias repository first, so a renamed word
+    // whose root already carries progress is never re-taught as unseen.
+    const rootByKey = await this.aliases.resolveMany({
+      releaseId,
+      keys: candidates.map((row) => row.wordKey),
+    });
+    const stages = await this.progressStages(ctx);
+    const words: Array<{ word_key: string; source_order: number }> = [];
+    for (const row of candidates) {
+      const root = rootByKey.get(row.wordKey);
+      const stage = root === undefined ? undefined : stages.get(root);
+      if (stage !== undefined && stage !== "UNSEEN" && stage !== "IN_PROGRESS") continue;
+      words.push({ word_key: row.wordKey, source_order: row.sourceOrder });
+      if (words.length === limit) break;
+    }
     const definitions = words.length === 0 ? [] : await this.definitionsOf(releaseId, words.map((w) => w.word_key));
     const entries = buildInitialQueue(
       words,
@@ -279,33 +252,60 @@ export class StudyService {
   /**
    * QUICK_TEST queue: the supplemental "cards to introduce" (待引入卡) —
    * cards of already-INTRODUCED words without a card_state, in the 5.7 order.
+   * INTRODUCED progress lives under canonical roots, so the candidate words
+   * are resolved through the alias repository before matching (a renamed
+   * word's not-yet-graded cards must still surface here).
    */
   private async supplementalCards(ctx: UserContext, releaseId: string): Promise<StudyQueueCard[]> {
-    const introduced = await builder(this.db)
-      .select({ wordKey: wordProgress.wordKey, sourceOrder: word.sourceOrder })
-      .from(wordProgress)
-      .innerJoin(word, and(eq(word.releaseId, releaseId), eq(word.wordKey, wordProgress.wordKey)))
-      .where(and(eq(wordProgress.userId, ctx.userId), eq(wordProgress.stage, "INTRODUCED")));
-    if (introduced.length === 0) {
+    const introducedRoots = new Set<string>();
+    for (const [wordKey, stage] of await this.progressStages(ctx)) {
+      if (stage === "INTRODUCED") introducedRoots.add(wordKey);
+    }
+    const candidates = await this.textbookOrderedWords(releaseId);
+    const rootByKey = await this.aliases.resolveMany({
+      releaseId,
+      keys: candidates.map((row) => row.wordKey),
+    });
+    const words: Array<{ word_key: string; source_order: number }> = [];
+    for (const row of candidates) {
+      const root = rootByKey.get(row.wordKey);
+      if (root === undefined || !introducedRoots.has(root)) continue;
+      words.push({ word_key: row.wordKey, source_order: row.sourceOrder });
+    }
+    if (words.length === 0) {
       return [];
     }
-    const words = introduced.map((row) => ({ word_key: row.wordKey, source_order: row.sourceOrder }));
     const definitions = await this.definitionsOf(releaseId, words.map((w) => w.word_key));
-    const stateRows =
+    // card_state rows are keyed canonically too: resolve each definition's
+    // local card key to its root before the graded check, so a card already
+    // graded under another presentation is not re-introduced.
+    const canonicalByCard = new Map<string, string>();
+    for (const definition of definitions) {
+      canonicalByCard.set(
+        definition.contentCardKey,
+        await this.aliases.resolve({ releaseId, key: definition.contentCardKey }),
+      );
+    }
+    const gradedCanonical = new Set(
       definitions.length === 0
         ? []
-        : await builder(this.db)
-            .select({ contentCardKey: cardState.contentCardKey })
-            .from(cardState)
-            .where(
-              and(
-                eq(cardState.userId, ctx.userId),
-                inArray(cardState.contentCardKey, definitions.map((d) => d.contentCardKey)),
-              ),
-            );
+        : (
+            await builder(this.db)
+              .select({ contentCardKey: cardState.contentCardKey })
+              .from(cardState)
+              .where(
+                and(
+                  eq(cardState.userId, ctx.userId),
+                  inArray(cardState.contentCardKey, [...new Set(canonicalByCard.values())]),
+                ),
+              )
+          ).map((row) => row.contentCardKey),
+    );
     const entries = buildSupplementalQueue(
       words,
-      stateRows.map((row) => ({ content_card_key: row.contentCardKey })),
+      definitions
+        .filter((definition) => gradedCanonical.has(canonicalByCard.get(definition.contentCardKey)!))
+        .map((definition) => ({ content_card_key: definition.contentCardKey })),
       definitions.map(toQueueDefinition),
     );
     return await this.withCanonicalKeys(releaseId, entries);
@@ -346,6 +346,25 @@ export class StudyService {
       .select()
       .from(cardDefinition)
       .where(and(eq(cardDefinition.releaseId, releaseId), inArray(cardDefinition.wordKey, [...wordKeys])));
+  }
+
+  /** The release's words in the binding textbook order (unit, tier, source, key). */
+  private async textbookOrderedWords(releaseId: string): Promise<Array<{ wordKey: string; sourceOrder: number }>> {
+    return await builder(this.db)
+      .select({ wordKey: word.wordKey, sourceOrder: word.sourceOrder })
+      .from(word)
+      .leftJoin(unit, and(eq(unit.releaseId, word.releaseId), eq(unit.unitKey, word.unitKey)))
+      .where(eq(word.releaseId, releaseId))
+      .orderBy(asc(unit.unitOrder), asc(word.tier), asc(word.sourceOrder), asc(word.wordKey));
+  }
+
+  /** The user's word_progress stages, keyed by (canonical) word key. */
+  private async progressStages(ctx: UserContext): Promise<Map<string, string>> {
+    const rows = await builder(this.db)
+      .select({ wordKey: wordProgress.wordKey, stage: wordProgress.stage })
+      .from(wordProgress)
+      .where(eq(wordProgress.userId, ctx.userId));
+    return new Map(rows.map((row) => [row.wordKey, row.stage]));
   }
 
   /** Resolves every presented key to its canonical state key (spec 6.4). */

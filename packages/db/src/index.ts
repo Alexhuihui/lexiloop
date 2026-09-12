@@ -17,6 +17,7 @@
 export * from "./schema";
 export * from "./envelopes";
 export * from "./sqlite-driver";
+export * from "./atomic";
 export * from "./repositories/context";
 export * from "./repositories/content";
 export * from "./repositories/releases";

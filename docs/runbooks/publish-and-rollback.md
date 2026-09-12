@@ -79,8 +79,15 @@ tsx scripts/publish-release.ts \
 ```
 
 The script wires a D1-shaped SQLite database and a content-addressed
-directory R2 store — a faithful local rehearsal of the production bindings —
-and runs verify -> stage -> smoke -> activate in one fail-closed pass.
+directory R2 store and runs verify -> stage -> smoke -> activate in one
+fail-closed pass. What is faithful about the rehearsal: the exact D1 schema
+and migrations, the activation semantics (activation composes ONE atomic
+statement batch on BOTH drivers — `batch()` on real D1, a single transaction
+on the local SQLite driver), and the content-addressed R2 object semantics.
+What is NOT faithful: nothing here touches the remote Cloudflare bindings —
+there is no `--remote` path yet. Wiring these commands to the real D1/R2
+resources is future work (Task 19's Cloudflare step); until then the
+rehearsal runs entirely against local files.
 `--no-activate` stops after READY (the old release remains ACTIVE);
 `--rollback <release-id>` re-activates a RETIRED release instead.
 
@@ -109,8 +116,11 @@ Guarantees:
   that every audio asset is gate-passed and present in R2. Any failure marks
   the release FAILED.
 - **Atomic activation.** `activate` imports validated alias edges and
-  switches `active_release_id` in one transaction; any failure leaves user
-  state, statuses, and the pointer unchanged. Only READY may activate.
+  switches `active_release_id` as ONE statement batch — `batch()` on D1
+  (its only atomic primitive: D1 rejects interactive
+  BEGIN TRANSACTION/COMMIT/SAVEPOINT), one transaction on the local driver;
+  any failure leaves user state, statuses, and the pointer unchanged. Only
+  READY may activate.
 - **User state is never rewritten.** Activation and rollback touch only
   release rows and the `app_meta` pointer — never `word_progress`,
   `card_state`, or `review_log`. Pinned sessions keep presenting old keys;

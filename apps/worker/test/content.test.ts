@@ -13,6 +13,7 @@ import {
   audioAsset,
   book,
   contentAudioLink,
+  contentKeyAlias,
   example,
   explanation,
   lexicalRelation,
@@ -739,6 +740,41 @@ describe("GET /api/progress/words/:wordKey", () => {
     expect(res.headers.get("cache-control")).toBe("private, no-store");
     const body = (await res.json()) as { word_key: string; progress: unknown };
     expect(body.progress).toBeNull();
+  });
+
+  it("resolves a renamed (old) presented key to its canonical progress row", async () => {
+    // The rename edge (old presented key -> canonical w-abandon), stored
+    // under the release that declares it, exactly as activation imports it.
+    await fx.db.insert(contentKeyAlias).values({
+      releaseId: ACTIVE_RELEASE,
+      fromKey: "w-abandon-old",
+      toKey: "w-abandon",
+      edgeType: "RENAME",
+      canonicalKey: "w-abandon",
+      createdAt: T0,
+    });
+    await new WordProgressRepository(fx.db).upsert({ userId: fx.alice.userId }, {
+      wordKey: "w-abandon",
+      stage: "INTRODUCED",
+      initialFamiliarity: "KNOWN",
+      firstSeenAt: T0,
+      lastSeenAt: T0,
+      introducedReleaseId: ACTIVE_RELEASE,
+      introducedAt: T0,
+    });
+
+    // Reading by the OLD key surfaces the canonical row (spec 6.4): the
+    // learn preview must not treat a renamed word as unseen.
+    const old = await fx.app.request("/api/progress/words/w-abandon-old", { headers: { cookie: fx.aliceCookie } });
+    expect(old.status).toBe(200);
+    const oldBody = (await old.json()) as { word_key: string; progress: { stage: string } | null };
+    expect(oldBody.word_key).toBe("w-abandon-old");
+    expect(oldBody.progress).toMatchObject({ stage: "INTRODUCED" });
+
+    // The canonical key keeps resolving to the same row.
+    const canonical = await fx.app.request("/api/progress/words/w-abandon", { headers: { cookie: fx.aliceCookie } });
+    const canonicalBody = (await canonical.json()) as { progress: { stage: string } | null };
+    expect(canonicalBody.progress).toMatchObject({ stage: "INTRODUCED" });
   });
 
   it("never returns another user's progress", async () => {

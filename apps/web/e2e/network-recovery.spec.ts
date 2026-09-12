@@ -9,9 +9,10 @@
  * queue), never hardcoded: earlier specs shape how many words remain.
  */
 import { expect, test, type Page } from "@playwright/test";
-import { HARBOUR_V1 } from "../../worker/e2e-harness/fixture";
+import { ANCHOR_V1 } from "../../worker/e2e-harness/fixture";
 import {
   alice,
+  bob,
   harnessState,
   loginViaUi,
   SpecApi,
@@ -40,12 +41,14 @@ async function control(action: string, body: Record<string, unknown>): Promise<C
 }
 
 /** Reads the server-decided group size from the learn setup preview. */
-async function groupSizeOf(page: Page): Promise<number> {
+async function groupSizeOf(page: Page, waitForStudiedTag = true): Promise<number> {
   await expect(page.getByText(/预计本组 \d+ 个新词/)).toBeVisible();
-  // The preview first renders with an empty progress map (every word looks
-  // learnable); wait for personal progress to land — earlier journeys made
-  // anchor INTRODUCED, which is the only tag progress can produce.
-  await expect(page.getByLabel("本单元单词顺序")).toContainText("已学");
+  if (waitForStudiedTag) {
+    // The preview first renders with an empty progress map (every word looks
+    // learnable); wait for personal progress to land — earlier journeys made
+    // anchor INTRODUCED, which is the only tag progress can produce.
+    await expect(page.getByLabel("本单元单词顺序")).toContainText("已学");
+  }
   const preview = await page.getByText(/预计本组 \d+ 个新词/).textContent();
   const match = /\d+/.exec(preview ?? "");
   if (!match) {
@@ -131,17 +134,17 @@ test("recovers from auth expiry by re-login and resumes the attempted route", as
 });
 
 test("R2 denial surfaces inline without blocking study", async ({ page }) => {
+  // Bob's account is untouched by the earlier journeys, so his server-decided
+  // group opens with the textbook's first word (anchor) — which has word-level
+  // audio. Delete THAT audio object so the first study card is
+  // deterministically the denied one.
   const api = new SpecApi(page.request, state.baseUrl);
-  await api.login(alice(state));
+  await api.login(bob(state));
 
-  // The learn setup's server-decided group always opens with the earliest
-  // textbook-order word that still has learnable progress — harbour here —
-  // and harbour has word-level audio. Delete THAT audio object so the first
-  // study card is deterministically the denied one.
-  const harbourContent = (await api.get(`/api/content/words/${HARBOUR_V1.wordKey}`)).body as {
+  const anchorContent = (await api.get(`/api/content/words/${ANCHOR_V1.wordKey}`)).body as {
     audio: Array<{ asset_key: string }>;
   };
-  const assetKey = harbourContent.audio[0]!.asset_key;
+  const assetKey = anchorContent.audio[0]!.asset_key;
   const deleted = await control("r2-delete", { key: assetKey });
   expect(deleted.ok).toBe(true);
 
@@ -153,13 +156,13 @@ test("R2 denial surfaces inline without blocking study", async ({ page }) => {
 
   // Denial, part 2 (UI): the study card announces the audio failure inline
   // and the journey continues — familiarity and the next word still work.
-  await loginViaUi(page, alice(state));
+  await loginViaUi(page, bob(state));
   await page.goto("/learn");
-  const groupSize = await groupSizeOf(page);
+  const groupSize = await groupSizeOf(page, false);
   expect(groupSize).toBeGreaterThan(0);
   await page.getByRole("button", { name: "开始学习" }).click();
   await expect(page.getByText(`第 1 词 / 共 ${groupSize} 词`)).toBeVisible();
-  await expect(page.getByRole("heading", { name: "harbour", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "anchor", exact: true })).toBeVisible();
   await expect(page.getByText("音频暂时无法播放，可先继续学习。")).toBeVisible();
   await page.getByRole("button", { name: "很陌生" }).click();
   if (groupSize > 1) {
@@ -167,8 +170,10 @@ test("R2 denial surfaces inline without blocking study", async ({ page }) => {
     await expect(page.getByText(`第 2 词 / 共 ${groupSize} 词`)).toBeVisible();
   }
 
-  // The flow itself is untouched by the denial: drift (already introduced
-  // by the earlier journeys) still resolves its canonical progress row.
-  const drift = await api.get(`/api/progress/words/${HARBOUR_V1.wordKey}`);
-  expect(drift.status).toBe(200);
+  // The flow itself is untouched by the denial: the presentation landed and
+  // the studied word's personal state is readable afterwards.
+  const anchorProgress = (await api.get(`/api/progress/words/${ANCHOR_V1.wordKey}`)).body as {
+    progress: { stage: string } | null;
+  };
+  expect(anchorProgress.progress?.stage).toBe("IN_PROGRESS");
 });
