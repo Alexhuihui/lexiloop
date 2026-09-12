@@ -1,10 +1,15 @@
 /**
  * StudyPatch handling (spec 8.3/9.3): WORD_PRESENTED and FAMILIARITY_SET.
  *
- * Both actions validate that the patched word is the CURRENT item of the
- * session's pinned queue (both sides alias-resolved to their canonical
- * words), are idempotent by `event_id` (processed ids are recorded on the
- * session snapshot), and run as ONE atomic batch: the word_progress upsert
+ * Both actions validate that the patched word BELONGS TO THE SESSION'S GROUP
+ * in the pinned release — the group derived from the snapshot's card entries'
+ * word definitions, the same derivation the initial queue build used. Spec
+ * 9.3 makes the three-value familiarity a first-sorting choice for EVERY
+ * studied word (controller ruling on the Task 13 current-item wording), so
+ * patches do NOT validate the live queue position; grades keep full
+ * current-position validation. Both sides alias-resolve to their canonical
+ * words. Patches are idempotent by `event_id` (processed ids are recorded on
+ * the session snapshot) and run as ONE atomic batch: the word_progress upsert
  * plus the snapshot bookkeeping commit together or not at all.
  *
  * WORD_PRESENTED atomically creates/updates word_progress, sets
@@ -16,7 +21,7 @@
 
 import { sql } from "drizzle-orm";
 import { z } from "zod";
-import type { Familiarity, UserContext, WordProgressRow } from "@lexiloop/db";
+import type { Familiarity, StudySessionRecord, UserContext, WordProgressRow } from "@lexiloop/db";
 import { StudyHttpError, StudyService } from "./service";
 
 /** The plan's binding StudyPatch discriminated body. */
@@ -67,8 +72,27 @@ export interface PatchResult {
 }
 
 /**
- * Applies one patch. The patched word must own the queue item at the
- * session's current position. Replayed event ids return the word's current
+ * The session's group: canonical word keys of every card in the pinned
+ * snapshot — the same cards the initial queue build derived from the group's
+ * word definitions. Alias-resolved so membership stays correct across
+ * renames (spec 6.4), evaluated against the session's pinned release only.
+ */
+async function groupWordKeys(service: StudyService, session: StudySessionRecord): Promise<Set<string>> {
+  const keys = new Set<string>();
+  for (const card of session.queue.cards) {
+    const definition = await service.content.getCard(session.releaseId, card.presented_card_key);
+    if (!definition) {
+      continue;
+    }
+    keys.add(await service.aliases.resolve({ releaseId: session.releaseId, key: definition.wordKey }));
+  }
+  return keys;
+}
+
+/**
+ * Applies one patch. The patched word must belong to the session's group
+ * (spec 9.3: familiarity is first-sorting for every studied word, not tied
+ * to the live queue position). Replayed event ids return the word's current
  * progress with `replayed: true` and perform no write — idempotent by
  * construction, since the first application already committed.
  */
@@ -91,13 +115,9 @@ export async function applyStudyPatch(
     };
   }
 
-  const current = service.currentCard(session);
-  if (!current) {
-    throw new StudyHttpError(409, "STUDY_QUEUE_EXHAUSTED", "Every card in this session has been answered");
-  }
-  const resolved = await service.resolvePresented(session, current.presented_card_key);
-  if (canonicalWordKey !== resolved.canonicalWordKey) {
-    throw new StudyHttpError(409, "STUDY_WORD_NOT_CURRENT", "Patched word is not the current queue item");
+  const group = await groupWordKeys(service, session);
+  if (!group.has(canonicalWordKey)) {
+    throw new StudyHttpError(409, "STUDY_WORD_NOT_IN_GROUP", "Patched word is not part of this session's group");
   }
 
   const now = service.now();

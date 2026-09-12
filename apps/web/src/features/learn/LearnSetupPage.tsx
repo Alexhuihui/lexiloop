@@ -17,14 +17,19 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import type { ApiClient, UnitContentResponse, WordProgressResponse } from "../../lib/api-client";
+import type {
+  ApiClient,
+  MeResponse,
+  UnitContentResponse,
+  WordProgressResponse,
+} from "../../lib/api-client";
 import {
   AUTH_ME_QUERY_KEY,
   CONTENT_BOOTSTRAP_QUERY_KEY,
   STUDY_SESSIONS_QUERY_KEY,
   unitContentQueryKey,
 } from "../../lib/query-cache";
-import { useStudySession, type LearnSettings, type StudySessionControls } from "./useStudySession";
+import { useStudySession, type StudySessionControls } from "./useStudySession";
 import { WordStudyCard } from "./WordStudyCard";
 import { QuickRecall } from "./QuickRecall";
 
@@ -36,6 +41,15 @@ type SetupWord = UnitContentResponse["words"][number];
 type ProgressMap = Record<string, WordProgressResponse["progress"]>;
 
 const ALL_TIERS = "ALL";
+
+/** True when the session's derived group equals the expected group (sets). */
+function sameGroup(sessionWordKeys: readonly string[], expectedWordKeys: ReadonlySet<string>): boolean {
+  const sessionKeys = new Set(sessionWordKeys);
+  return (
+    sessionKeys.size === expectedWordKeys.size &&
+    [...expectedWordKeys].every((key) => sessionKeys.has(key))
+  );
+}
 
 /** Status tag of one preview word (personal stage comes from progress only). */
 function stageTag(word: SetupWord, progress: ProgressMap, inGroup: boolean): string {
@@ -65,7 +79,7 @@ function expectedGroup(
 
 interface SetupViewProps {
   api: ApiClient;
-  settings: LearnSettings;
+  settings: MeResponse["settings"];
   study: StudySessionControls;
 }
 
@@ -122,9 +136,14 @@ function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element 
   const group = expectedGroup(words, progressMap, tierFilter, settings?.new_words_per_group ?? 10);
   const groupKeys = new Set(group.map((word) => word.word_key));
   const tiers = [...new Set(words.map((word) => word.tier))];
-  const resumable = sessions.data?.find(
+  const resumableSessions = (sessions.data ?? []).filter(
     (session) => session.mode === "NEW_WORDS" && session.expires_at > Date.now(),
   );
+  // Only a session whose snapshot group matches the current selection is
+  // resumable here; anything else would continue against the wrong words.
+  const resumable = resumableSessions.find((session) => sameGroup(session.word_keys, groupKeys));
+  const hasUnmatched = resumableSessions.length > 0 && !resumable;
+  const expectedGroupWords = group.map(toGroupWord);
 
   return (
     <section>
@@ -179,9 +198,17 @@ function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element 
       </ul>
 
       {resumable ? (
-        <button type="button" className="btn" disabled={study.starting} onClick={() => void study.resumeSession()}>
+        <button
+          type="button"
+          className="btn"
+          disabled={study.starting}
+          onClick={() => void study.resumeSession(expectedGroupWords)}
+        >
           继续上次学习
         </button>
+      ) : null}
+      {hasUnmatched ? (
+        <p role="status">已有一个进行中的学习会话，但与当前选择的单元或分层不一致，无法继续。</p>
       ) : null}
       <button
         type="button"
@@ -240,19 +267,47 @@ function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls
   );
 }
 
+/**
+ * A deferred/failed WORD_PRESENTED must never strand a word: its introduction
+ * (stage flip) only happens server-side once the presentation lands, so the
+ * recall and complete views keep a retry control until every group word is
+ * recorded. Retries replay the word's SAME event id.
+ */
+function PendingPresentationsNotice({ study }: { study: StudySessionControls }): React.JSX.Element | null {
+  const pending = study.words.filter(
+    (word) => word.presentation === "failed" || word.presentation === "deferred",
+  );
+  if (pending.length === 0) {
+    return null;
+  }
+  return (
+    <div role="status">
+      <p>
+        有 {pending.length} 个单词的学习记录未提交，可随时重试，不影响已提交的评分。
+      </p>
+      <button type="button" className="btn" onClick={() => void study.retryPendingPresentations()}>
+        重试学习记录
+      </button>
+    </div>
+  );
+}
+
 function RecallView({ study }: { study: StudySessionControls }): React.JSX.Element {
   const total = study.session?.cards.length ?? 0;
   return (
-    <QuickRecall
-      cardIndex={study.queueIndex}
-      total={total}
-      card={study.recallCards?.[study.queueIndex] ?? null}
-      revealed={study.phase === "QUICK_RECALL_REVEALED"}
-      gradePending={study.gradePending}
-      gradeError={study.gradeError}
-      onReveal={study.reveal}
-      onRate={(rating) => void study.rate(rating)}
-    />
+    <div>
+      <QuickRecall
+        cardIndex={study.queueIndex}
+        total={total}
+        card={study.recallCards?.[study.queueIndex] ?? null}
+        revealed={study.phase === "QUICK_RECALL_REVEALED"}
+        gradePending={study.gradePending}
+        gradeError={study.gradeError}
+        onReveal={study.reveal}
+        onRate={(rating) => void study.rate(rating)}
+      />
+      <PendingPresentationsNotice study={study} />
+    </div>
   );
 }
 
@@ -265,6 +320,7 @@ function CompleteView({ study }: { study: StudySessionControls }): React.JSX.Ele
       ) : (
         <p role="status">正在获取学习结果…</p>
       )}
+      <PendingPresentationsNotice study={study} />
       <p>之后这些词的卡片将进入正常复习计划。</p>
       <Link className="btn btn--primary" to="/today">
         回到今日
@@ -275,7 +331,7 @@ function CompleteView({ study }: { study: StudySessionControls }): React.JSX.Ele
 
 export function LearnSetupPage({ api }: LearnSetupPageProps): React.JSX.Element {
   const me = useQuery({ queryKey: AUTH_ME_QUERY_KEY, queryFn: () => api.me() });
-  const study = useStudySession({ api, settings: me.data?.settings ?? null });
+  const study = useStudySession({ api });
 
   return (
     <section>

@@ -4,14 +4,16 @@
  *
  * - `POST /api/study/sessions` builds the fixed NEW_WORDS queue in the 5.7
  *   order (WORD_MEANING cards of both words first, then CONTEXT_MEANING,
- *   then PHRASE) and serves `SessionView` shapes.
- * - `PATCH /api/study/sessions/:id` only accepts the word owning the CURRENT
- *   queue item (409 `STUDY_WORD_NOT_CURRENT` otherwise, no side effects),
- *   is idempotent by `event_id`, and upserts word_progress like
+ *   PHRASE, SENSE_DISCRIMINATION) and serves `SessionView` shapes, including
+ *   the derived `unit_keys`/`word_keys` group fields.
+ * - `PATCH /api/study/sessions/:id` accepts any word of the session's GROUP
+ *   (membership validation per the spec 9.3 controller ruling; 409
+ *   `STUDY_WORD_NOT_IN_GROUP` outside the group, no side effects), is
+ *   idempotent by `event_id`, and upserts word_progress like
  *   `applyStudyPatch` (UNSEEN -> IN_PROGRESS only, first_seen_at once).
- * - `POST /api/reviews/grade` validates the presented card against the
- *   current position, advances it, flips a word to INTRODUCED when its last
- *   queue card is graded, and replays seen `event_id`s.
+ * - `POST /api/reviews/grade` keeps full current-position validation,
+ *   advances the position, flips a word to INTRODUCED when its last queue
+ *   card is graded, and replays seen `event_id`s.
  */
 
 export const GROUP_SIZE = 2;
@@ -32,14 +34,8 @@ export const UNIT_WORDS = [
 /** The NEW_WORDS queue snapshot for the group [w-1, w-2] (spec 5.7 order). */
 export const QUEUE: readonly string[] = ["k-wm-1", "k-wm-2", "k-cm-1", "k-ph-1", "k-sd-1"];
 
-/** The word each queued presented key belongs to (server-internal knowledge). */
-export const QUEUE_WORD: Readonly<Record<string, string>> = {
-  "k-wm-1": "w-1",
-  "k-wm-2": "w-2",
-  "k-cm-1": "w-1",
-  "k-ph-1": "w-1",
-  "k-sd-1": "w-1",
-};
+/** The session's group (release-local keys): every queued card's word. */
+export const GROUP_WORD_KEYS: ReadonlySet<string> = new Set(["w-1", "w-2"]);
 
 /** Queue cards per word — the INTRODUCED flip completes per word. */
 export const WORD_CARDS: Readonly<Record<string, readonly string[]>> = {
@@ -214,7 +210,13 @@ export interface ProgressRow {
   last_seen_at: number;
 }
 
-export function sessionOf(sessionId: string, position: number): unknown {
+export interface SessionGroup {
+  unit_keys?: string[];
+  word_keys?: string[];
+}
+
+export function sessionOf(sessionId: string, position: number, group: SessionGroup = {}): unknown {
+  const { unit_keys = ["u-1"], word_keys = ["w-1", "w-2"] } = group;
   return {
     session_id: sessionId,
     mode: "NEW_WORDS",
@@ -224,6 +226,8 @@ export function sessionOf(sessionId: string, position: number): unknown {
     expires_at: 4_102_444_800_000,
     cards: QUEUE.map((key) => ({ canonical_card_key: key, presented_card_key: key })),
     current_card_key: QUEUE[position] ?? null,
+    unit_keys,
+    word_keys,
   };
 }
 
@@ -254,6 +258,8 @@ const AFTER_STATE = {
 export interface FakeServerOptions {
   /** Session list preset (resume tests); created sessions are appended. */
   presetSessions?: string[];
+  /** Group overrides per preset session id (e.g. a foreign-unit session). */
+  presetGroups?: Record<string, SessionGroup>;
   /** Throw a network error once on the next PATCH. */
   failNextPatchOnce?: boolean;
   /** Throw a network error once on the next grade POST. */
@@ -275,6 +281,9 @@ export interface FakeServer {
     reviewEventIds(): string[];
   };
   resolveGrade(): void;
+  /** Arms a one-shot network failure on the next PATCH (tests call this
+   *  mid-journey to strand a presentation and exercise recovery). */
+  failNextPatch(): void;
 }
 
 /**
@@ -290,6 +299,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
     sessionPositions.set(preset, 0);
     sessionOrder.push(preset);
   }
+  const presetGroups = options.presetGroups ?? {};
   const patchEventIds: string[] = [];
   const reviewEventIds: string[] = [];
   const reviewedRatings = new Map<string, number>();
@@ -302,6 +312,9 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
   let gradeGate: (() => void) | null = null;
 
   const now = () => 1_700_000_060_000;
+
+  const sessionView = (sessionId: string, position: number): unknown =>
+    sessionOf(sessionId, position, presetGroups[sessionId] ?? {});
 
   function flipIntroduced(): void {
     for (const [wordKey, cards] of Object.entries(WORD_CARDS)) {
@@ -404,11 +417,11 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       const sessionId = `sess-created-${createdCount}`;
       sessionPositions.set(sessionId, 0);
       sessionOrder.push(sessionId);
-      return jsonResponse(sessionOf(sessionId, 0), 201);
+      return jsonResponse(sessionView(sessionId, 0), 201);
     }
     if (path === "/api/study/sessions" && method === "GET") {
       return jsonResponse({
-        sessions: sessionOrder.map((id) => sessionOf(id, sessionPositions.get(id) ?? 0)),
+        sessions: sessionOrder.map((id) => sessionView(id, sessionPositions.get(id) ?? 0)),
       });
     }
     if (path.startsWith("/api/study/sessions/") && method === "GET") {
@@ -416,7 +429,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       const position = sessionPositions.get(sessionId);
       return position === undefined
         ? errorEnvelope("STUDY_SESSION_INVALID", 400)
-        : jsonResponse(sessionOf(sessionId, position));
+        : jsonResponse(sessionView(sessionId, position));
     }
     if (path.startsWith("/api/study/sessions/") && method === "PATCH") {
       const body = JSON.parse(String(init?.body)) as {
@@ -451,11 +464,10 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
             : { stage: "IN_PROGRESS", initial_familiarity: null, first_seen_at: 0, last_seen_at: 0 },
         });
       }
-      // The real Worker only accepts patches for the CURRENT queue item's
-      // word and writes nothing on rejection (apps/worker familiarity.ts).
-      const currentWord = QUEUE_WORD[QUEUE[position] ?? ""];
-      if (wordKey !== currentWord) {
-        return errorEnvelope("STUDY_WORD_NOT_CURRENT", 409);
+      // The real Worker accepts patches for any word of the session's group
+      // and writes nothing on rejection (apps/worker familiarity.ts).
+      if (!GROUP_WORD_KEYS.has(wordKey)) {
+        return errorEnvelope("STUDY_WORD_NOT_IN_GROUP", 409);
       }
       patchEventIds.push(body.event_id);
       const existing = progress.get(wordKey);
@@ -521,6 +533,9 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
     resolveGrade: () => {
       gradeGate?.();
       gradeGate = null;
+    },
+    failNextPatch: () => {
+      failPatch = true;
     },
   };
 }

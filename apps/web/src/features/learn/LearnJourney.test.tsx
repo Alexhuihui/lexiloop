@@ -86,13 +86,13 @@ afterEach(() => {
 });
 
 describe("new-word learning journey", () => {
-  it("runs the full journey: study with familiarity (no grade), deferred second word, multi-card quick recall in queue order, reveal before rating, and group completion", async () => {
+  it("runs the full journey: familiarity for every studied word without grades, multi-card quick recall in queue order, reveal before rating, and group completion", async () => {
     const server = createFakeServer();
     const user = userEvent.setup();
     renderLearn(server.stub);
     await startSession();
 
-    // --- STUDY_WORDS: word 1 is the current queue word and acks immediately.
+    // --- STUDY_WORDS: word 1's presentation acks and enables familiarity.
     await screen.findByRole("heading", { name: "abandon" });
     expect(screen.getByText("əˈbændən")).toBeTruthy();
     expect(screen.getByText(/放弃；抛弃/)).toBeTruthy();
@@ -107,7 +107,6 @@ describe("new-word learning journey", () => {
     const presents = patchRequests(server.requests);
     expect(presents).toHaveLength(1);
     expect(presents[0]).toMatchObject({ action: "WORD_PRESENTED", word_key: "w-1" });
-    const word1EventId = presents[0]?.event_id;
 
     // Three familiarity choices exist; a choice (and a change) never grades.
     await user.click(screen.getByRole("button", { name: "有印象" }));
@@ -132,24 +131,30 @@ describe("new-word learning journey", () => {
       word_key: "w-1",
       familiarity: "FAMILIAR",
     });
-    // Every familiarity change is its own event; the presentation event stays.
+    // Every familiarity change is its own event.
     expect(new Set(familiarity.map((patch) => patch.event_id)).size).toBe(2);
-    expect(word1EventId).toBeTruthy();
 
-    // --- Word 2 becomes visible: presented, but the Worker only accepts the
-    // current queue word, so the client defers and keeps familiarity off.
+    // --- Word 2 becomes visible: presentation and familiarity reach the
+    // server for EVERY group word (spec 9.3 membership validation), still
+    // without any grade call.
     await user.click(screen.getByRole("button", { name: "下一词" }));
     await screen.findByRole("heading", { name: "ability" });
     await waitFor(() => {
-      expect(screen.getByText(/学习记录将在快速回忆时同步/)).toBeTruthy();
+      expect((screen.getByRole("button", { name: "很陌生" }) as HTMLButtonElement).disabled).toBe(false);
     });
-    expect((screen.getByRole("button", { name: "很陌生" }) as HTMLButtonElement).disabled).toBe(true);
-    const deferredPresent = patchRequests(server.requests).at(-1);
-    expect(deferredPresent).toMatchObject({ action: "WORD_PRESENTED", word_key: "w-2" });
-    const word2EventId = deferredPresent?.event_id;
-    expect(server.state.progressOf("w-2")).toBeNull(); // 409 wrote nothing
+    const presentations = patchRequests(server.requests).filter(
+      (patch) => patch.action === "WORD_PRESENTED",
+    );
+    expect(presentations).toHaveLength(2);
+    expect(presentations[1]).toMatchObject({ action: "WORD_PRESENTED", word_key: "w-2" });
+    expect(server.state.progressOf("w-2")).toMatchObject({ stage: "IN_PROGRESS" });
+    await user.click(screen.getByRole("button", { name: "有印象" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "有印象" }).getAttribute("aria-pressed")).toBe("true");
+    });
+    expect(gradeRequests(server.requests)).toHaveLength(0);
 
-    // --- QUICK_RECALL: four cards in the server's snapshot order.
+    // --- QUICK_RECALL: five cards in the server's snapshot order.
     await user.click(screen.getByRole("button", { name: "开始快速回忆" }));
     expect(screen.getByText(/第 1 张 \/ 共 5 张/)).toBeTruthy();
     expect(screen.getByRole("heading", { name: "abandon" })).toBeTruthy();
@@ -163,8 +168,7 @@ describe("new-word learning journey", () => {
 
     await user.click(screen.getByRole("button", { name: "良好" }));
     // The grade advances the session position server-side; the client
-    // re-reads the session and syncs the deferred presentation with the
-    // SAME event id.
+    // re-reads the session before enabling the next card.
     await screen.findByText(/第 2 张 \/ 共 5 张/);
     const grades = gradeRequests(server.requests);
     expect(grades).toHaveLength(1);
@@ -173,13 +177,10 @@ describe("new-word learning journey", () => {
       card_key: QUEUE[0],
       rating: 3,
     });
-    const syncedPresent = patchRequests(server.requests).find(
-      (patch) => patch.word_key === "w-2",
-    );
-    expect(syncedPresent?.event_id).toBe(word2EventId);
-    await waitFor(() => {
-      expect(server.state.progressOf("w-2")).toMatchObject({ stage: "IN_PROGRESS" });
-    });
+    // Nothing is left to sync: every group word presented during study.
+    expect(
+      patchRequests(server.requests).filter((patch) => patch.action === "WORD_PRESENTED"),
+    ).toHaveLength(2);
     expect(server.state.positionOf("sess-created-1")).toBe(1);
 
     // Card 2 in the same deterministic order, then the CONTEXT_MEANING card
@@ -291,6 +292,46 @@ describe("new-word learning journey", () => {
     expect(server.state.progressOf("w-1")).toMatchObject({ stage: "IN_PROGRESS" });
   });
 
+  it("keeps a failed presentation recoverable from the recall view until it is recorded", async () => {
+    const server = createFakeServer();
+    const user = userEvent.setup();
+    renderLearn(server.stub);
+    await startSession();
+    await screen.findByRole("button", { name: "很陌生" });
+
+    // Word 2's presentation fails with a network error during study; the
+    // user moves on to quick recall with the word unrecorded.
+    server.failNextPatch();
+    await user.click(screen.getByRole("button", { name: "下一词" }));
+    await screen.findByRole("heading", { name: "ability" });
+    await screen.findByRole("button", { name: /重试学习记录/ });
+
+    // The recall-time sync retries the failed word — and fails too — but
+    // grading continues and the retry control surfaces in the recall view.
+    server.failNextPatch();
+    await user.click(screen.getByRole("button", { name: "开始快速回忆" }));
+    await user.click(screen.getByRole("button", { name: "揭示答案" }));
+    await user.click(screen.getByRole("button", { name: "良好" }));
+    await screen.findByText(/第 2 张 \/ 共 5 张/);
+    const recallRetry = await screen.findByRole("button", { name: /重试学习记录/ });
+    expect(screen.getByText(/学习记录未提交/)).toBeTruthy();
+    expect(server.state.progressOf("w-2")).toBeNull();
+
+    // A later successful retry presents the word with the SAME event id.
+    await user.click(recallRetry);
+    await waitFor(() => {
+      expect(server.state.progressOf("w-2")).toMatchObject({ stage: "IN_PROGRESS" });
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /重试学习记录/ })).toBeNull();
+    });
+    const w2Patches = patchRequests(server.requests).filter(
+      (patch) => patch.action === "WORD_PRESENTED" && patch.word_key === "w-2",
+    );
+    expect(w2Patches).toHaveLength(3); // study fail, sync fail, final success
+    expect(new Set(w2Patches.map((patch) => patch.event_id)).size).toBe(1);
+  });
+
   it("shows word-content failures without discarding the position and recovers on retry", async () => {
     const server = createFakeServer({ failNextWordContentOnce: true });
     const user = userEvent.setup();
@@ -347,7 +388,7 @@ describe("new-word learning journey", () => {
     // Second visit: the setup offers the interrupted session.
     renderLearn(server.stub);
     await screen.findByRole("heading", { name: "学习" });
-    await user.click(screen.getByRole("button", { name: /继续上次学习/ }));
+    await user.click(await screen.findByRole("button", { name: /继续上次学习/ }));
 
     // Study resumes at word 2 (word 1 is already presented server-side).
     await screen.findByText(/第 2 词 \/ 共 2 词/);

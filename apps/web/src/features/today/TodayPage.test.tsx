@@ -64,6 +64,8 @@ const SESSION_NEW = {
     { canonical_card_key: "k-cm-1", presented_card_key: "k-cm-1" },
   ],
   current_card_key: "k-wm-2",
+  unit_keys: ["u-1"],
+  word_keys: ["w-1", "w-2"],
 };
 
 const SESSION_SUPPLEMENTAL = {
@@ -78,6 +80,8 @@ const SESSION_SUPPLEMENTAL = {
     { canonical_card_key: "k-ph-5", presented_card_key: "k-ph-5" },
   ],
   current_card_key: "k-sd-6",
+  unit_keys: ["u-1"],
+  word_keys: ["w-1"],
 };
 
 function jsonResponse(body: unknown, status = 200): Response {

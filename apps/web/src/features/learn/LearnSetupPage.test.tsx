@@ -93,7 +93,9 @@ describe("LearnSetupPage", () => {
     const { requests } = renderLearn(server.stub);
     await screen.findByRole("heading", { name: "学习" });
 
-    await userEvent.setup().click(screen.getByRole("button", { name: /继续上次学习/ }));
+    // The offer appears once the session's group is verified against the
+    // expected group (both are [w-1, w-2]).
+    await userEvent.setup().click(await screen.findByRole("button", { name: /继续上次学习/ }));
 
     // The study view opens on the first group word without a new session.
     await screen.findByText(/第 1 词 \/ 共 2 词/);
@@ -108,6 +110,27 @@ describe("LearnSetupPage", () => {
         ({ url }) => new URL(url).pathname === "/api/study/sessions/sess-resume-1",
       ),
     ).toBe(true);
+  });
+
+  it("does not offer resume for a session whose group does not match the current selection", async () => {
+    const server = createFakeServer({
+      presetSessions: ["sess-unit-9-1"],
+      presetGroups: {
+        "sess-unit-9-1": { unit_keys: ["u-9"], word_keys: ["x-1", "x-2"] },
+      },
+    });
+    const { requests } = renderLearn(server.stub);
+    await screen.findByRole("heading", { name: "学习" });
+
+    // The mismatching session is not offered; a clear note explains instead.
+    expect(await screen.findByText(/与当前选择的单元或分层不一致/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /继续上次学习/ })).toBeNull();
+    // And nothing was resumed behind the user's back.
+    expect(
+      requests.some(
+        ({ url }) => new URL(url).pathname === "/api/study/sessions/sess-unit-9-1",
+      ),
+    ).toBe(false);
   });
 
   it("starts a NEW_WORDS session through POST /api/study/sessions and shows the server card count", async () => {

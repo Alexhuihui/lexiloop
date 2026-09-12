@@ -11,14 +11,18 @@
  * - When a word becomes visible, exactly ONE stable WORD_PRESENTED patch
  *   event (one `event_id` per word, generated once) is sent; familiarity
  *   controls stay disabled until the Worker acknowledges it.
- * - The Worker only accepts patches for the CURRENT queue item's word; a
- *   409 `STUDY_WORD_NOT_CURRENT` marks the word "deferred" and the SAME
- *   event id is retried after each successful grade advances the position.
- *   A 409 writes nothing server-side, so retrying it is safe.
- * - A failed (network) patch is retried through `retryPresentation` with the
- *   SAME event id — no second event is ever generated for one presentation.
+ * - The Worker validates patches against the session's GROUP (spec 9.3
+ *   ruling: familiarity is first-sorting for every studied word), so every
+ *   group word's presentation acks during study. A 409
+ *   `STUDY_WORD_NOT_IN_GROUP` marks a word "deferred" as a pure fallback;
+ *   deferred AND network-failed words are retried after each successful
+ *   grade advances the position, with the SAME event id. A 409 writes
+ *   nothing server-side, so retrying it is safe.
+ * - A failed (network) patch is retried through `retryPresentation` — or the
+ *   recall/complete-phase retry control — with the SAME event id; no second
+ *   event is ever generated for one presentation.
  * - A familiarity choice sends FAMILIARITY_SET (fresh event id per choice;
- *   it may be changed while the word remains current) and NEVER calls the
+ *   it may be changed while the word is current) and NEVER calls the
  *   grade endpoint.
  * - Grading happens only in QUICK_RECALL_REVEALED: one client-generated
  *   `event_id` per reveal->rating cycle; the SAME id is replayed when the
@@ -32,7 +36,6 @@ import {
   type ApiClient,
   type FamiliarityChoice,
   type GradeRating,
-  type MeResponse,
   type SessionView,
   type WordContentResponse,
 } from "../../lib/api-client";
@@ -67,8 +70,6 @@ export interface StudyWordState extends GroupWord {
   familiarity: FamiliarityChoice | null;
 }
 
-export type LearnSettings = MeResponse["settings"];
-
 export interface StudySessionControls {
   phase: LearnPhase;
   session: SessionView | null;
@@ -83,8 +84,11 @@ export interface StudySessionControls {
   queueIndex: number;
   summary: { introduced: number; total: number } | null;
   startGroup(group: readonly GroupWord[]): Promise<void>;
-  resumeSession(): Promise<void>;
+  resumeSession(expected: readonly GroupWord[]): Promise<void>;
   retryPresentation(wordKey: string): Promise<void>;
+  /** Retries every deferred/failed presentation with its SAME event id;
+   *  refreshes the completion summary when already complete. */
+  retryPendingPresentations(): Promise<void>;
   retryContent(wordKey: string): void;
   chooseFamiliarity(wordKey: string, choice: FamiliarityChoice): Promise<void>;
   advanceStudy(): Promise<void>;
@@ -370,10 +374,9 @@ function toStudyWord(word: GroupWord): StudyWordState {
 
 export interface UseStudySessionOptions {
   api: ApiClient;
-  settings: LearnSettings;
 }
 
-export function useStudySession({ api, settings }: UseStudySessionOptions): StudySessionControls {
+export function useStudySession({ api }: UseStudySessionOptions): StudySessionControls {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -413,9 +416,9 @@ export function useStudySession({ api, settings }: UseStudySessionOptions): Stud
         });
         dispatch({ type: "PRESENT_ACKED", wordKey });
       } catch (cause) {
-        if (cause instanceof ApiError && cause.code === "STUDY_WORD_NOT_CURRENT") {
-          // The Worker only accepts the current queue word and wrote nothing;
-          // the same event id is retried once grading advances the position.
+        if (cause instanceof ApiError && cause.code === "STUDY_WORD_NOT_IN_GROUP") {
+          // Membership rejection writes nothing server-side; kept as a
+          // defensive fallback (the spec 9.3 path accepts every group word).
           dispatch({ type: "PRESENT_DEFERRED", wordKey });
         } else {
           dispatch({ type: "PRESENT_FAILED", wordKey, message: messageFor(cause) });
@@ -425,9 +428,10 @@ export function useStudySession({ api, settings }: UseStudySessionOptions): Stud
     [api],
   );
 
-  const syncDeferredPresentations = useCallback(async () => {
+  const syncPendingPresentations = useCallback(async () => {
     for (const word of stateRef.current.words) {
-      if (word.presentation === "deferred") {
+      if (word.presentation === "deferred" || word.presentation === "failed") {
+        // Both states carry the word's SAME, never-recorded event id.
         await attemptPresentation(word.wordKey);
       }
     }
@@ -475,95 +479,90 @@ export function useStudySession({ api, settings }: UseStudySessionOptions): Stud
     [api],
   );
 
-  const resumeSession = useCallback(async () => {
-    dispatch({ type: "START" });
-    try {
-      const sessions = await api.listStudySessions();
-      const target = sessions.find(
-        (candidate) => candidate.mode === "NEW_WORDS" && candidate.expires_at > Date.now(),
-      );
-      if (!target) {
-        throw new Error("没有可继续的学习会话");
-      }
-      const session = await api.getStudySession(target.session_id);
-      let unitKey = settings?.start_unit_key ?? "";
-      if (!unitKey) {
-        const bootstrap = await api.bootstrap();
-        unitKey = bootstrap.units[0]?.unit_key ?? "";
-      }
-      if (!unitKey) {
-        throw new Error("没有可用的学习内容");
-      }
-      const unit = await api.unitContent(unitKey);
-      const progressRows = await Promise.all(
-        unit.words.map(async (word) => {
-          try {
-            return (await api.wordProgress(word.word_key)).progress;
-          } catch {
-            return null;
-          }
-        }),
-      );
-      const groupSize = settings?.new_words_per_group ?? 10;
-      const words: StudyWordState[] = [];
-      for (const [index, word] of unit.words.entries()) {
-        const row = progressRows[index] ?? null;
-        if (row?.stage === "INTRODUCED" || words.length >= groupSize) {
-          continue;
+  const resumeSession = useCallback(
+    async (expected: readonly GroupWord[]) => {
+      dispatch({ type: "START" });
+      try {
+        const sessions = await api.listStudySessions();
+        const target = sessions.find(
+          (candidate) => candidate.mode === "NEW_WORDS" && candidate.expires_at > Date.now(),
+        );
+        if (!target) {
+          throw new Error("没有可继续的学习会话");
         }
-        const prepared = toStudyWord({
-          wordKey: word.word_key,
-          headword: word.headword,
-          phonetic: word.phonetic,
-          tier: word.tier,
-          sourceOrder: word.source_order,
+        const session = await api.getStudySession(target.session_id);
+        // The resume must continue EXACTLY the group the user is set to
+        // study: the Worker derives the session's word keys from its pinned
+        // snapshot, and a mismatch (e.g. a session started in another unit
+        // or tier selection) must not be resumed against a wrong word list.
+        const sessionWords = new Set(session.word_keys);
+        const expectedWords = new Set(expected.map((word) => word.wordKey));
+        const sameGroup =
+          sessionWords.size === expectedWords.size &&
+          [...expectedWords].every((key) => sessionWords.has(key));
+        if (!sameGroup) {
+          throw new Error("当前学习会话与所选单元或分层不一致，无法继续");
+        }
+        const progressRows = await Promise.all(
+          expected.map(async (word) => {
+            try {
+              return (await api.wordProgress(word.wordKey)).progress;
+            } catch {
+              return null;
+            }
+          }),
+        );
+        const words: StudyWordState[] = expected.map((word, index) => {
+          const row = progressRows[index] ?? null;
+          const prepared = toStudyWord(word);
+          // A word_progress row exists only after an acknowledged presentation.
+          return {
+            ...prepared,
+            presentation: row ? "acked" : "untried",
+            familiarity: familiarityFromStored(row?.initial_familiarity ?? null),
+          };
         });
-        // A word_progress row exists only after an acknowledged presentation.
-        words.push({
-          ...prepared,
-          presentation: row ? "acked" : "untried",
-          familiarity: familiarityFromStored(row?.initial_familiarity ?? null),
-        });
-      }
-      if (words.length === 0) {
-        throw new Error("没有可继续的学习内容");
-      }
-      const firstUnpresented = words.findIndex((word) => word.presentation !== "acked");
-      if (firstUnpresented === -1) {
-        // Every group word was presented: continue directly in quick recall.
-        const loaded: StudyWordState[] = [];
-        for (const word of words) {
-          try {
-            loaded.push({
-              ...word,
-              content: await api.wordContent(word.wordKey, session.session_id),
-            });
-          } catch {
-            loaded.push(word);
+        if (words.length === 0) {
+          throw new Error("没有可继续的学习内容");
+        }
+        const firstUnpresented = words.findIndex((word) => word.presentation !== "acked");
+        if (firstUnpresented === -1) {
+          // Every group word was presented: continue directly in quick recall.
+          const loaded: StudyWordState[] = [];
+          for (const word of words) {
+            try {
+              loaded.push({
+                ...word,
+                content: await api.wordContent(word.wordKey, session.session_id),
+              });
+            } catch {
+              loaded.push(word);
+            }
           }
+          dispatch({
+            type: "SESSION_STARTED",
+            session,
+            words: loaded,
+            studyIndex: 0,
+            phase: "QUICK_RECALL_QUESTION",
+            recallCards: buildQuickRecallCards(loaded, session.cards),
+          });
+          return;
         }
         dispatch({
           type: "SESSION_STARTED",
           session,
-          words: loaded,
-          studyIndex: 0,
-          phase: "QUICK_RECALL_QUESTION",
-          recallCards: buildQuickRecallCards(loaded, session.cards),
+          words,
+          studyIndex: firstUnpresented,
+          phase: "STUDY_WORDS",
+          recallCards: null,
         });
-        return;
+      } catch (cause) {
+        dispatch({ type: "START_FAILED", message: messageFor(cause) });
       }
-      dispatch({
-        type: "SESSION_STARTED",
-        session,
-        words,
-        studyIndex: firstUnpresented,
-        phase: "STUDY_WORDS",
-        recallCards: null,
-      });
-    } catch (cause) {
-      dispatch({ type: "START_FAILED", message: messageFor(cause) });
-    }
-  }, [api, settings]);
+    },
+    [api],
+  );
 
   const chooseFamiliarity = useCallback(
     async (wordKey: string, choice: FamiliarityChoice) => {
@@ -642,6 +641,32 @@ export function useStudySession({ api, settings }: UseStudySessionOptions): Stud
     dispatch({ type: "CONTENT_RETRY", wordKey });
   }, []);
 
+  const refreshSummary = useCallback(async () => {
+    const progressRows = await Promise.all(
+      stateRef.current.words.map(async (word) => {
+        try {
+          return (await api.wordProgress(word.wordKey)).progress;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    dispatch({
+      type: "SUMMARY",
+      introduced: progressRows.filter((row) => row?.stage === "INTRODUCED").length,
+      total: progressRows.length,
+    });
+  }, [api]);
+
+  const retryPendingPresentations = useCallback(async () => {
+    await syncPendingPresentations();
+    // A late presentation can complete a word's introduction (its cards were
+    // already graded), so the completion summary must be re-read.
+    if (stateRef.current.phase === "COMPLETE") {
+      await refreshSummary();
+    }
+  }, [syncPendingPresentations, refreshSummary]);
+
   const rate = useCallback(
     async (rating: GradeRating) => {
       const current = stateRef.current;
@@ -668,29 +693,16 @@ export function useStudySession({ api, settings }: UseStudySessionOptions): Stud
         // The client advances only on success, after re-reading the session
         // (the advanced position lives server-side).
         const refreshed = await api.getStudySession(sessionId);
-        await syncDeferredPresentations();
+        await syncPendingPresentations();
         dispatch({ type: "GRADE_ADVANCED", session: refreshed });
         if (refreshed.position >= refreshed.cards.length) {
-          const progressRows = await Promise.all(
-            stateRef.current.words.map(async (word) => {
-              try {
-                return (await api.wordProgress(word.wordKey)).progress;
-              } catch {
-                return null;
-              }
-            }),
-          );
-          dispatch({
-            type: "SUMMARY",
-            introduced: progressRows.filter((row) => row?.stage === "INTRODUCED").length,
-            total: progressRows.length,
-          });
+          await refreshSummary();
         }
       } catch (cause) {
         dispatch({ type: "GRADE_FAILED", message: messageFor(cause) });
       }
     },
-    [api, syncDeferredPresentations],
+    [api, syncPendingPresentations, refreshSummary],
   );
 
   return {
@@ -709,6 +721,7 @@ export function useStudySession({ api, settings }: UseStudySessionOptions): Stud
     startGroup,
     resumeSession,
     retryPresentation: attemptPresentation,
+    retryPendingPresentations,
     retryContent,
     chooseFamiliarity,
     advanceStudy,

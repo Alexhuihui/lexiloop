@@ -215,6 +215,11 @@ const sessionViewSchema = z.object({
   cards: z.array(studyQueueCardSchema),
   /** Presented key at the current position; null when the queue is done. */
   current_card_key: z.string().nullable(),
+  /** Distinct release-local unit keys of the snapshot's cards (sorted). */
+  unit_keys: z.array(z.string()),
+  /** Distinct release-local word keys of the snapshot's cards (sorted);
+   *  lets a resuming client verify the session matches its selection. */
+  word_keys: z.array(z.string()),
 });
 
 export type SessionView = z.infer<typeof sessionViewSchema>;

@@ -113,9 +113,29 @@ export interface SessionView {
   cards: StudyQueueCard[];
   /** Presented key of the item at the current position; null when done. */
   current_card_key: string | null;
+  /** Distinct release-local unit keys of the snapshot's cards (sorted).
+   *  Derived at read time from the card definitions; no new storage. */
+  unit_keys: string[];
+  /** Distinct release-local word keys of the snapshot's cards (sorted).
+   *  Lets a resuming client verify the session matches its study selection. */
+  word_keys: string[];
 }
 
-function toSessionView(record: StudySessionRecord): SessionView {
+async function toSessionView(service: StudyService, record: StudySessionRecord): Promise<SessionView> {
+  // The snapshot stores card keys only; the pinned release's definitions
+  // recover the group's words and units (spec 6.4: pinned-release reads).
+  const definitions = await Promise.all(
+    record.queue.cards.map((card) => service.content.getCard(record.releaseId, card.presented_card_key)),
+  );
+  const unitKeys = new Set<string>();
+  const wordKeys = new Set<string>();
+  for (const definition of definitions) {
+    if (!definition) {
+      continue;
+    }
+    unitKeys.add(definition.unitKey);
+    wordKeys.add(definition.wordKey);
+  }
   return {
     session_id: record.sessionId,
     mode: record.mode,
@@ -128,6 +148,8 @@ function toSessionView(record: StudySessionRecord): SessionView {
       presented_card_key: card.presented_card_key,
     })),
     current_card_key: record.queue.cards[record.position]?.presented_card_key ?? null,
+    unit_keys: [...unitKeys].sort(),
+    word_keys: [...wordKeys].sort(),
   };
 }
 
@@ -177,11 +199,12 @@ export class StudyService {
   }
 
   async listSessions(ctx: UserContext): Promise<SessionView[]> {
-    return (await this.sessions.listActive(ctx, this.now())).map(toSessionView);
+    const records = await this.sessions.listActive(ctx, this.now());
+    return await Promise.all(records.map((record) => toSessionView(this, record)));
   }
 
   async getSession(ctx: UserContext, sessionId: string): Promise<SessionView> {
-    return toSessionView(await this.requireSession(ctx, sessionId));
+    return await toSessionView(this, await this.requireSession(ctx, sessionId));
   }
 
   /** The queue item at the session's current position. */
@@ -220,7 +243,7 @@ export class StudyService {
       createdAt: now,
       expiresAt: sessionExpiry(now),
     });
-    return toSessionView(record);
+    return await toSessionView(this, record);
   }
 
   /**

@@ -270,6 +270,8 @@ interface SessionBody {
   expires_at: number;
   cards: Array<{ canonical_card_key: string; presented_card_key: string }>;
   current_card_key: string | null;
+  unit_keys: string[];
+  word_keys: string[];
 }
 
 interface GradeBody {
@@ -538,6 +540,11 @@ describe("session resume (GET)", () => {
     expect(resumed.body.current_card_key).toBe("k-wm-3");
     // The queue is FROZEN: still the presented keys of the pinned release.
     expect(resumed.body.cards.map((card) => card.presented_card_key)).toEqual([...BOB_QUEUE]);
+    // The session's group is recoverable from the snapshot (release-local
+    // keys, sorted): unit + word keys let a resuming client verify the
+    // session matches its study selection.
+    expect(resumed.body.unit_keys).toEqual(["u-1"]);
+    expect(resumed.body.word_keys).toEqual(["w-old", "w1", "w2"]);
   });
 
   it("lists only the caller's unexpired sessions", async () => {
@@ -612,24 +619,47 @@ describe("PATCH /api/study/sessions/:id (StudyPatch)", () => {
     });
   });
 
-  it("validates the word against the current queue item", async () => {
+  it("validates the patched word against the session's group, not the queue position", async () => {
     const created = await createSession(fx.bobAuth, "NEW_WORDS");
-    const wrong = await patchSession(fx.bobAuth, created.body.session_id, {
-      event_id: "patch-wrong",
+    // w2 belongs to the group but does not own the current queue item; spec
+    // 9.3 first-sorting familiarity must reach EVERY studied word, so
+    // membership — not the live position — decides (controller ruling).
+    const sameGroup = await patchSession(fx.bobAuth, created.body.session_id, {
+      event_id: "patch-group-w2",
       action: "WORD_PRESENTED",
       word_key: "w2",
     });
-    expect(wrong.status).toBe(409);
-    expect((wrong.json as ErrorCode).code).toBe("STUDY_WORD_NOT_CURRENT");
+    expect(sameGroup.status).toBe(200);
+    expect(sameGroup.json).toMatchObject({ word_key: "w2", replayed: false });
 
-    // After grading w1's first two cards, w2 owns the current item.
-    await gradePositions(fx.bobAuth, created.body.session_id, 0, 1);
-    const right = await patchSession(fx.bobAuth, created.body.session_id, {
-      event_id: "patch-right",
+    // Alice's next NEW_WORDS group skips her INTRODUCED w1: a patch for w1
+    // is outside the session's group and is rejected with a stable code.
+    const aliceSession = await createSession(fx.aliceAuth, "NEW_WORDS");
+    const outside = await patchSession(fx.aliceAuth, aliceSession.body.session_id, {
+      event_id: "patch-outside",
       action: "WORD_PRESENTED",
-      word_key: "w2",
+      word_key: "w1",
     });
-    expect(right.status).toBe(200);
+    expect(outside.status).toBe(409);
+    expect((outside.json as ErrorCode).code).toBe("STUDY_WORD_NOT_IN_GROUP");
+  });
+
+  it("records familiarity for any group word without any FSRS write", async () => {
+    const created = await createSession(fx.bobAuth, "NEW_WORDS");
+    // w2 is not the current queue item; the familiarity choice is still a
+    // first-sorting write for the studied word and never touches grading.
+    const outcome = await patchSession(fx.bobAuth, created.body.session_id, {
+      event_id: "fam-w2",
+      action: "FAMILIARITY_SET",
+      word_key: "w2",
+      familiarity: "SOMEWHAT_FAMILIAR",
+    });
+    expect(outcome.status).toBe(200);
+    expect(outcome.json).toMatchObject({
+      progress: { stage: "IN_PROGRESS", initial_familiarity: "SOMEWHAT_FAMILIAR" },
+    });
+    expect(reviewLogRows(fx.bob.userId)).toHaveLength(0);
+    expect(cardStateRow(fx.bob.userId, "k-wm-3")).toBeUndefined();
   });
 
   it("persists all three familiarity values with last_seen_at and never writes FSRS state", async () => {
