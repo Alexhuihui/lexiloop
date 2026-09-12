@@ -981,3 +981,39 @@ describe("llcy-2024 tab misread tolerance", () => {
     expect(output.words.map((w) => w.unit_key)).toEqual(["u7", "u7", "u7"]);
   });
 });
+
+describe("llcy-2024 monotonic unit invariant", () => {
+  it("fails closed when the FIRST tab run misreads into a phantom higher-ordered unit", () => {
+    const blocks = [
+      // First tab page misread ("7" -> "40"): run 0 is never collapsed by the
+      // single-run tolerance, so without a monotonic guard u40 would silently
+      // keep this unit's opener pages' words.
+      makeBlock("p1.tab", 1, [0.9396, 0.8327, 0.9767, 0.8536], "40"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      makeBlock("p2.tab", 2, [0.9327, 0.8306, 0.9719, 0.8532], "7"),
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+    ];
+    expect(() => segmentStructure(assignReadingOrder(blocks), normalizeConfig())).toThrow(
+      /must strictly increase/,
+    );
+  });
+
+  it("passes a legitimate strictly-increasing unit sequence", () => {
+    const blocks = [
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "8"),
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+      makeBlock("p3.tab", 3, [0.9359, 0.8278, 0.9709, 0.8478], "9"),
+      makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units.map((unit) => unit.unit_key)).toEqual(["u7", "u8", "u9"]);
+    expect(output.unitBoundaries.map((b) => [b.first_page, b.last_page])).toEqual([
+      [1, 1],
+      [2, 2],
+      [3, 3],
+    ]);
+    expect(output.words.map((word) => word.unit_key)).toEqual(["u7", "u8", "u9"]);
+  });
+});

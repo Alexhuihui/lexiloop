@@ -249,6 +249,19 @@ function startUnit(
         `${state.currentUnit?.unit_key ?? "?"} opened; banner numbers must be monotonic`,
     );
   }
+  if (state.currentUnit !== null && unitNumber < state.currentUnit.unit_order) {
+    // The llcy-2024 numbering is global and strictly increasing across the
+    // whole book (calibrated: Unit 08 opens Chapter 02, Unit 15 opens
+    // Chapter 03). A decreasing banner is therefore always a misread — e.g.
+    // the run-0 tab misread that the single-run tolerance cannot collapse —
+    // and must fail closed instead of silently opening a phantom unit that
+    // keeps the real unit's opener pages' words.
+    throw new Error(
+      `unit banner ${unitKey} on page ${block.page} is lower than the open unit ` +
+        `${state.currentUnit.unit_key} (order ${state.currentUnit.unit_order}); unit numbers ` +
+        "must strictly increase — a first-run tab misread must not open a phantom unit",
+    );
+  }
   const unit: UnitT = {
     unit_key: unitKey,
     book_key: state.config.book_key,
