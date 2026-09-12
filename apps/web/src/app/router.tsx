@@ -12,25 +12,19 @@ import type { RouteObject } from "react-router-dom";
 import { createBrowserRouter } from "react-router-dom";
 import type { ApiClient } from "../lib/api-client";
 import { AUTH_ME_QUERY_KEY, type AppQueryClient } from "../lib/query-cache";
-import { AppShell, PlaceholderPage } from "./AppShell";
+import { AppShell } from "./AppShell";
 import { LoginPage } from "../features/auth/LoginPage";
 import { TodayPage } from "../features/today/TodayPage";
 import { LearnSetupPage } from "../features/learn/LearnSetupPage";
+import { ReviewPage } from "../features/review/ReviewPage";
+import { SearchPage } from "../features/dictionary/SearchPage";
+import { WordDetailPage } from "../features/dictionary/WordDetailPage";
+import { StatsPage } from "../features/stats/StatsPage";
 
 export interface AppRoutesOptions {
   api: ApiClient;
   queryClient: AppQueryClient;
 }
-
-/**
- * `/today` and `/learn` are the Task 16 feature pages; review, dictionary,
- * and stats land with Task 17 and keep placeholder pages until then.
- */
-export const PLACEHOLDER_PAGES = [
-  { path: "review", title: "复习" },
-  { path: "dictionary", title: "词典" },
-  { path: "stats", title: "数据" },
-] as const;
 
 /**
  * Gate for every authenticated route. Pending shows a live status; a 401
@@ -59,6 +53,11 @@ function RequireAuth({ api }: { api: ApiClient }): React.JSX.Element {
   return <Outlet />;
 }
 
+/**
+ * The five destinations plus the word-detail route reached from search
+ * results and review cards. `/today` and `/learn` landed with Task 16;
+ * review, dictionary (search + word entry), and stats land with Task 17.
+ */
 export function createAppRoutes({ api, queryClient }: AppRoutesOptions): RouteObject[] {
   return [
     {
@@ -75,10 +74,10 @@ export function createAppRoutes({ api, queryClient }: AppRoutesOptions): RouteOb
           children: [
             { path: "today", element: <TodayPage api={api} /> },
             { path: "learn", element: <LearnSetupPage api={api} /> },
-            ...PLACEHOLDER_PAGES.map((page) => ({
-              path: page.path,
-              element: <PlaceholderPage title={page.title} />,
-            })),
+            { path: "review", element: <ReviewPage api={api} /> },
+            { path: "dictionary", element: <SearchPage api={api} /> },
+            { path: "dictionary/words/:wordKey", element: <WordDetailPage api={api} /> },
+            { path: "stats", element: <StatsPage api={api} /> },
           ],
         },
       ],

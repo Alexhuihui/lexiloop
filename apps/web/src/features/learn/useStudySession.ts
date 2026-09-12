@@ -327,8 +327,9 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
   }
 }
 
-/** Worker error -> stable user-facing message (never raw server text). */
-function messageFor(cause: unknown): string {
+/** Worker error -> stable user-facing message (never raw server text).
+ *  Shared with the review flow so both surfaces report identically. */
+export function messageFor(cause: unknown): string {
   if (cause instanceof ApiError) {
     if (cause.status === 0) {
       return "网络连接失败，请检查网络后重试";

@@ -47,17 +47,18 @@ const EXAM_ORIGIN = "exam";
 
 const BLANK = "＿";
 
+/** Blanks the target range of an example sentence (shared with review). */
+export function blanked(text: string, start: number, end: number): string {
+  const safeStart = Math.max(0, Math.min(start, text.length));
+  const safeEnd = Math.max(safeStart, Math.min(end, text.length));
+  return `${text.slice(0, safeStart)}${BLANK.repeat(safeEnd - safeStart)}${text.slice(safeEnd)}`;
+}
+
 interface ExpectedEntry {
   rank: number;
   sourceOrder: number;
   target: string;
   card: QuickRecallCard;
-}
-
-function blanked(text: string, start: number, end: number): string {
-  const safeStart = Math.max(0, Math.min(start, text.length));
-  const safeEnd = Math.max(safeStart, Math.min(end, text.length));
-  return `${text.slice(0, safeStart)}${BLANK.repeat(safeEnd - safeStart)}${text.slice(safeEnd)}`;
 }
 
 function entriesForWord(word: StudyWordState, headwordOf: (wordKey: string) => string): ExpectedEntry[] {

@@ -123,16 +123,3 @@ export function AppShell({ api, queryClient }: AppShellProps): React.JSX.Element
     </div>
   );
 }
-
-/**
- * Minimal destination page used until the feature tasks (16/17) provide the
- * real Today/Learn/Review/Dictionary/Stats pages.
- */
-export function PlaceholderPage({ title }: { title: string }): React.JSX.Element {
-  return (
-    <section>
-      <h1>{title}</h1>
-      <p>此页面将在后续任务中实现。</p>
-    </section>
-  );
-}

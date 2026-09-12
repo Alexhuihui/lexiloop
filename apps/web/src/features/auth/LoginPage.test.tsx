@@ -232,6 +232,9 @@ describe("LoginPage", () => {
     });
 
     const user = userEvent.setup();
+    // Await the shell DOM itself: the router location can update one tick
+    // before the new route subtree commits under heavy parallel load.
+    await screen.findByRole("button", { name: "退出登录" });
     await user.click(screen.getByRole("button", { name: "退出登录" }));
     await waitFor(() => {
       expect(router.state.location.pathname).toBe("/login");

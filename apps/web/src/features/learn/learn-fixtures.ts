@@ -471,23 +471,44 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       }
       patchEventIds.push(body.event_id);
       const existing = progress.get(wordKey);
-      const familiarity = body.action === "FAMILIARITY_SET" ? (body.familiarity ?? null) : null;
+      // The Worker converts the API choice to the STORED enum before writing
+      // (UNKNOWN / RECOGNIZABLE / KNOWN) and returns the stored value on the
+      // progress route (apps/worker/src/study/familiarity.ts).
+      const familiarity =
+        body.action === "FAMILIARITY_SET" ? (body.familiarity ?? null) : null;
+      const storedFamiliarity =
+        familiarity === "VERY_UNFAMILIAR"
+          ? "UNKNOWN"
+          : familiarity === "SOMEWHAT_FAMILIAR"
+            ? "RECOGNIZABLE"
+            : familiarity === "FAMILIAR"
+              ? "KNOWN"
+              : null;
       const row: ProgressRow = {
         stage: existing ? existing.stage : "IN_PROGRESS",
-        initial_familiarity: familiarity ?? existing?.initial_familiarity ?? null,
+        initial_familiarity: storedFamiliarity ?? existing?.initial_familiarity ?? null,
         first_seen_at: existing?.first_seen_at ?? now(),
         introduced_release_id: existing?.introduced_release_id ?? null,
         introduced_at: existing?.introduced_at ?? null,
         last_seen_at: now(),
       };
       progress.set(wordKey, row);
+      // The patch response converts back to the API choice (apps/worker).
+      const apiFamiliarity =
+        row.initial_familiarity === "UNKNOWN"
+          ? "VERY_UNFAMILIAR"
+          : row.initial_familiarity === "RECOGNIZABLE"
+            ? "SOMEWHAT_FAMILIAR"
+            : row.initial_familiarity === "KNOWN"
+              ? "FAMILIAR"
+              : null;
       return jsonResponse({
         event_id: body.event_id,
         word_key: body.word_key,
         replayed: false,
         progress: {
           stage: row.stage,
-          initial_familiarity: familiarity,
+          initial_familiarity: apiFamiliarity,
           first_seen_at: row.first_seen_at,
           last_seen_at: row.last_seen_at,
         },

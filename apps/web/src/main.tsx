@@ -23,6 +23,15 @@ const api = createApiClient();
 const queryClient = createAppQueryClient();
 const router = createAppRouter({ api, queryClient });
 
+// Service Worker (spec 10): the static-shell-only precache and the strict
+// content/audio cache policy live in src/sw.ts; registration is
+// production-only and best-effort (tests and dev run without it).
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  void navigator.serviceWorker.register("/sw.js", { type: "module" }).catch(() => {
+    // Offline support is progressive: a failed registration is silent.
+  });
+}
+
 createRoot(rootElement).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>

@@ -183,6 +183,40 @@ const wordContentResponseSchema = z.object({
 export type WordContentResponse = z.infer<typeof wordContentResponseSchema>;
 
 // ---------------------------------------------------------------------------
+// Dictionary search (spec 9.5): exact headword > prefix > Chinese gloss >
+// phrase > example, with the matched-field metadata for highlighting.
+// ---------------------------------------------------------------------------
+
+export const searchMatchedFieldSchema = z.enum([
+  "headword_exact",
+  "headword_prefix",
+  "sense_gloss",
+  "phrase",
+  "example",
+]);
+export type SearchMatchedField = z.infer<typeof searchMatchedFieldSchema>;
+
+const searchHitSchema = z.object({
+  word_key: z.string(),
+  headword: z.string(),
+  phonetic: z.string().nullable(),
+  tier: z.string(),
+  unit_key: z.string(),
+  matched_field: searchMatchedFieldSchema,
+  matched_text: z.string(),
+});
+
+export type SearchHit = z.infer<typeof searchHitSchema>;
+
+const searchResponseSchema = z.object({
+  query: z.string(),
+  release_id: z.string(),
+  hits: z.array(searchHitSchema),
+});
+
+export type SearchResponse = z.infer<typeof searchResponseSchema>;
+
+// ---------------------------------------------------------------------------
 // Study and review (spec 8.3): sessions, the StudyPatch body, and grading.
 // ---------------------------------------------------------------------------
 
@@ -282,16 +316,34 @@ const gradeResultSchema = z.object({
 
 export type GradeResult = z.infer<typeof gradeResultSchema>;
 
+/** Result of the latest-only undo (apps/worker/src/study/undo.ts). */
+const undoResultSchema = z.object({
+  event_id: z.string(),
+  undone_at: z.number(),
+  card_key: z.string(),
+  restored_state: z.unknown().nullable(),
+  word_stage: z.string().nullable(),
+});
+
+export type UndoResult = z.infer<typeof undoResultSchema>;
+
 // ---------------------------------------------------------------------------
 // Personal progress and stats (spec 8.2/8.3).
 // ---------------------------------------------------------------------------
+
+/**
+ * The word-progress route returns the RAW stored familiarity value
+ * (UNKNOWN / RECOGNIZABLE / KNOWN — see apps/worker progress routes), unlike
+ * the patch/grade responses which convert to the API choice enum.
+ */
+export const storedFamiliaritySchema = z.enum(["UNKNOWN", "RECOGNIZABLE", "KNOWN"]);
 
 const wordProgressResponseSchema = z.object({
   word_key: z.string(),
   progress: z
     .object({
       stage: z.string(),
-      initial_familiarity: familiarityChoiceSchema.nullable(),
+      initial_familiarity: storedFamiliaritySchema.nullable(),
       first_seen_at: z.number(),
       introduced_release_id: z.string().nullable(),
       introduced_at: z.number().nullable(),
@@ -386,6 +438,8 @@ export interface ApiClient {
   unitContent(unitKey: string, sessionId?: string): Promise<UnitContentResponse>;
   /** Full dictionary entry for one word (spec 8.2). */
   wordContent(wordKey: string, sessionId?: string): Promise<WordContentResponse>;
+  /** Dictionary search across the release (spec 9.5). */
+  searchContent(query: string, limit?: number): Promise<SearchResponse>;
   /** URL for a private audio asset, optionally session-release-pinned. */
   audioUrl(assetKey: string, sessionId?: string): string;
   /** Word-level personal progress (spec 8.2): the ONLY personal word state. */
@@ -402,6 +456,8 @@ export interface ApiClient {
   patchStudySession(sessionId: string, patch: StudyPatchBody): Promise<PatchResult>;
   /** Server-side FSRS grade of the queue's current card (spec 8.3). */
   gradeReview(requestBody: GradeRequestBody): Promise<GradeResult>;
+  /** Revokes the caller's LATEST valid, un-undone review event (spec 8.3). */
+  undoReview(eventId: string): Promise<UndoResult>;
   /** Stores the session CSRF token in memory only (never persisted). */
   setCsrfToken(token: string | undefined): void;
   /** Wiring point for the app-wide 401 handler (see clearPersonalState). */
@@ -593,6 +649,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       );
     },
 
+    async searchContent(query: string, limit?: number): Promise<SearchResponse> {
+      const params = new URLSearchParams({ q: query });
+      if (limit !== undefined) {
+        params.set("limit", String(limit));
+      }
+      return searchResponseSchema.parse(await request(`/api/content/search?${params.toString()}`));
+    },
+
     audioUrl(assetKey: string, sessionId?: string): string {
       const url = new URL(
         `/api/audio/${assetKey.split("/").map(encodeURIComponent).join("/")}`,
@@ -648,6 +712,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     async gradeReview(requestBody: GradeRequestBody): Promise<GradeResult> {
       return gradeResultSchema.parse(
         await request("/api/reviews/grade", { method: "POST", body: requestBody }),
+      );
+    },
+
+    async undoReview(eventId: string): Promise<UndoResult> {
+      return undoResultSchema.parse(
+        await request(`/api/reviews/${encodeURIComponent(eventId)}/undo`, {
+          method: "POST",
+        }),
       );
     },
 
