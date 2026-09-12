@@ -31,6 +31,7 @@ const ME_OK = {
   user: { user_id: "u-1", username: "alice", status: "ACTIVE" },
   session: { expires_at: 4_102_444_800_000 },
   settings: null,
+  csrf_token: "csrf-token-1",
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -140,11 +141,11 @@ describe("shell routing", () => {
       stub: stubFor({ "/api/auth/me": () => errorEnvelope("AUTH_TOKEN_INVALID", 401) }),
     });
 
-    await waitFor(() => {
-      expect(router.state.location.pathname).toBe("/login");
-    });
+    // findBy* retries, so the assertion survives the gap between the router
+    // state updating and React committing the login page render.
+    await screen.findByRole("heading", { name: "登录 LexiLoop" });
+    expect(router.state.location.pathname).toBe("/login");
     expect(router.state.location.state).toMatchObject({ from: { pathname: "/learn" } });
-    expect(screen.getByRole("heading", { name: "登录 LexiLoop" })).toBeTruthy();
   });
 
   it("keeps the five destinations reachable from the navigation", async () => {
@@ -285,19 +286,20 @@ describe("auth expiry", () => {
 });
 
 describe("logout", () => {
-  it("attaches the CSRF token, clears personal state, notifies the worker, and returns to /login", async () => {
+  it("restores the CSRF token from the me bootstrap after a cold reload and uses it on logout", async () => {
     const fake = installFakeServiceWorker();
     restoreServiceWorker = fake.restore;
     localStorage.setItem("lexiloop:auth-probe", "1");
 
-    const { api, queryClient, router, requests } = renderApp({
+    const { queryClient, router, requests } = renderApp({
       initialEntries: ["/today"],
       stub: stubFor({
         "/api/auth/me": () => jsonResponse(ME_OK),
         "/api/auth/logout": () => jsonResponse({ user_id: "u-1" }),
       }),
     });
-    api.setCsrfToken("csrf-token-1");
+    // No login happened in this page session: the shell's me() bootstrap is
+    // the only source of the CSRF token, and logout must carry it.
     await screen.findByRole("heading", { name: "今日" });
 
     const user = userEvent.setup();

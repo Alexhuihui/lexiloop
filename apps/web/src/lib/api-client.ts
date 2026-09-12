@@ -10,9 +10,12 @@
  *   (default 3 total) with exponential backoff on 5xx/429 and network errors.
  * - 401 never retries: it means the session is gone, so the client signals
  *   `onUnauthorized` exactly once and the app clears personal state and
- *   redirects to /login preserving the attempted route.
- * - Nothing is persisted. The CSRF token lives in memory only; responses are
- *   handed to the caller (React Query cache is memory-only). No
+ *   redirects to /login preserving the attempted route. A 403 `CSRF_INVALID`
+ *   write response takes the same path: the session can no longer authorize
+ *   writes, so re-authentication is the only way forward.
+ * - Nothing is persisted. The CSRF token (delivered by `login()` and by the
+ *   `/api/auth/me` bootstrap) lives in memory only; responses are handed to
+ *   the caller (React Query cache is memory-only). No
  *   localStorage/IndexedDB/cookie writes anywhere in this module.
  */
 
@@ -56,6 +59,9 @@ const meResponseSchema = z.object({
       timezone: z.string(),
     })
     .nullable(),
+  // Returned alongside the session data so a returning client (valid cookie,
+  // cold page load) is write-ready without re-logging in.
+  csrf_token: z.string(),
 });
 
 export type MeResponse = z.infer<typeof meResponseSchema>;
@@ -205,12 +211,20 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       }
 
       if (!response.ok) {
+        const error = await toApiError(response);
+        if (error.status === 403 && error.code === "CSRF_INVALID") {
+          // The session can no longer authorize writes (e.g. a stale token
+          // after a server-side rotation). Retrying or re-issuing writes
+          // cannot help; the only way forward is re-authentication, so take
+          // the same path as a 401.
+          onUnauthorized?.();
+        }
         const retryable = !isWrite && (response.status >= 500 || response.status === 429);
         if (retryable && attempt + 1 < attempts) {
           await sleep(backoffDelay(attempt));
           continue;
         }
-        throw await toApiError(response);
+        throw error;
       }
 
       if (response.status === 204) {
@@ -244,7 +258,9 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     },
 
     async me(): Promise<MeResponse> {
-      return meResponseSchema.parse(await request("/api/auth/me"));
+      const parsed = meResponseSchema.parse(await request("/api/auth/me"));
+      csrfToken = parsed.csrf_token;
+      return parsed;
     },
 
     setCsrfToken(token: string | undefined): void {

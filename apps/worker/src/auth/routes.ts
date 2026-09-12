@@ -118,6 +118,11 @@ export function registerAuthRoutes(app: Hono<AppEnv>): void {
     const deps = c.var.deps;
     const auth = c.var.auth;
     const settings = await new UserSettingsRepository(deps.db).get({ userId: auth.userId });
+    // The session-derived CSRF token rides along with the session data so a
+    // returning client (valid cookie, cold page load) can write again without
+    // re-logging in. Same HMAC derivation as login; only ever returned to the
+    // caller whose cookie authorizes it, under `private, no-store`.
+    const csrfToken = await deriveCsrfToken(auth.rawToken, auth.sessionId);
     return c.json(
       {
         user: {
@@ -135,6 +140,7 @@ export function registerAuthRoutes(app: Hono<AppEnv>): void {
               timezone: settings.timezone,
             }
           : null,
+        csrf_token: csrfToken,
       },
       200,
       { "cache-control": "no-store" },

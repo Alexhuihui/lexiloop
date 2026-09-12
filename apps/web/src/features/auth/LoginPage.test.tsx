@@ -24,6 +24,7 @@ const ME_OK = {
   user: { user_id: "u-1", username: "alice", status: "ACTIVE" },
   session: { expires_at: 4_102_444_800_000 },
   settings: null,
+  csrf_token: "csrf-token-1",
 };
 const LOGIN_OK = {
   user: ME_OK.user,
@@ -363,6 +364,52 @@ describe("safe API client", () => {
 
     expect(failure).toBeInstanceOf(ApiError);
     expect((failure as ApiError).status).toBe(401);
+    expect(unauthorizedCalls).toBe(1);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("becomes write-ready from the me bootstrap alone after a cold reload", async () => {
+    // No login in this page session: a valid cookie plus GET /api/auth/me
+    // (which carries the session-derived csrf_token) must be enough to write.
+    const { api, requests } = makeClient({
+      responses: [
+        () =>
+          jsonResponse({
+            ...ME_OK,
+            csrf_token: "csrf-from-me",
+          }),
+        () => jsonResponse({ user_id: "u-1" }),
+      ],
+    });
+
+    await api.me();
+    await api.request("/api/progress/words/w-1", { method: "POST", body: { stage: 2 } });
+
+    const write = requests[1];
+    expect(new URL(write?.url ?? "https://x/").pathname).toBe("/api/progress/words/w-1");
+    expect(new Headers(write?.init?.headers).get("x-csrf-token")).toBe("csrf-from-me");
+  });
+
+  it("maps a 403 CSRF_INVALID write to the auth-expiry path instead of a dead-end error", async () => {
+    let unauthorizedCalls = 0;
+    const { api, requests } = makeClient({
+      responses: [() => errorEnvelope("CSRF_INVALID", 403)],
+      onUnauthorized: () => {
+        unauthorizedCalls += 1;
+      },
+    });
+
+    const failure = await api
+      .request("/api/auth/logout", { method: "POST" })
+      .then(
+        () => null,
+        (cause: unknown) => cause,
+      );
+
+    expect(failure).toBeInstanceOf(ApiError);
+    expect((failure as ApiError).status).toBe(403);
+    expect((failure as ApiError).code).toBe("CSRF_INVALID");
+    // Signalled once, and the write was not retried.
     expect(unauthorizedCalls).toBe(1);
     expect(requests).toHaveLength(1);
   });

@@ -1,7 +1,8 @@
 /**
  * Login page (spec 7/8.1, plan Task 15): username/password form for the
  * preseeded accounts. Login validates Origin only — the CSRF token arrives in
- * the login response and is kept in the API client's memory for later writes.
+ * the login response (and, for returning sessions, in the `/api/auth/me`
+ * bootstrap) and is kept in the API client's memory for later writes.
  *
  * The router state `{ from }` (set by the unauthenticated redirect and the
  * auth-expiry path) names the route to restore after a successful login, so
@@ -62,6 +63,7 @@ export function LoginPage({ api, queryClient }: LoginPageProps): React.JSX.Eleme
         user: login.user,
         session: login.session,
         settings: null,
+        csrf_token: login.csrf_token,
       });
       navigate(fromPathname, { replace: true });
     } catch (cause) {

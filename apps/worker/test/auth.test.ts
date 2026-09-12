@@ -294,18 +294,23 @@ describe("session validation on every authenticated request", () => {
       dailyGoal: 25,
       timezone: "Asia/Shanghai",
     });
-    const { token } = await loginAlice();
+    const { token, csrf } = await loginAlice();
     const res = await fx.app.request("/api/auth/me", { headers: { cookie: `${SESSION_COOKIE}=${token}` } });
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       user: { user_id: string; username: string; status: string };
       settings: { new_words_per_group: number; timezone: string } | null;
+      csrf_token: string;
     };
     expect(body.user.user_id).toBe(fx.alice.userId);
     expect(body.user.username).toBe("alice");
     expect(body.user.status).toBe("ACTIVE");
     expect(body.settings?.new_words_per_group).toBe(8);
     expect(body.settings?.timezone).toBe("Asia/Shanghai");
+    // The me response carries the session-derived CSRF token (same value the
+    // login response issued for this session), so a returning client with a
+    // valid cookie can write again after a cold page load.
+    expect(body.csrf_token).toBe(csrf);
   });
 
   it("rejects a missing cookie", async () => {
