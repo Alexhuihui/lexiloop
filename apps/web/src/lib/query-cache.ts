@@ -16,6 +16,20 @@ import { QueryClient } from "@tanstack/react-query";
 /** Cache key for the authenticated session probe (`GET /api/auth/me`). */
 export const AUTH_ME_QUERY_KEY = ["auth", "me"] as const;
 
+/** Cache key for the learning overview (`GET /api/stats/overview`). */
+export const STATS_OVERVIEW_QUERY_KEY = ["stats", "overview"] as const;
+
+/** Cache key for the shared release bootstrap (`GET /api/content/bootstrap`). */
+export const CONTENT_BOOTSTRAP_QUERY_KEY = ["content", "bootstrap"] as const;
+
+/** Cache key for one unit's shared teaching content. */
+export function unitContentQueryKey(unitKey: string): readonly ["content", "unit", string] {
+  return ["content", "unit", unitKey] as const;
+}
+
+/** Cache key for the caller's unexpired study sessions (resume). */
+export const STUDY_SESSIONS_QUERY_KEY = ["study", "sessions"] as const;
+
 /** Posted to the Service Worker on logout/expiry (matched by Task 17's sw). */
 export const SW_CACHE_CLEAR_MESSAGE = { type: "lexiloop:clear-caches" } as const;
 
@@ -85,6 +99,9 @@ export function clearPersonalState(
   queryClient: AppQueryClient,
   options: ClearPersonalStateOptions = {},
 ): void {
+  // Stop in-flight personal reads first: a fetch that settles after the
+  // cache is dropped must not leave a late entry behind.
+  queryClient.cancelQueries();
   queryClient.clear();
 
   const localStorageSink =

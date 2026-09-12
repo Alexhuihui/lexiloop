@@ -14,15 +14,19 @@ import type { ApiClient } from "../lib/api-client";
 import { AUTH_ME_QUERY_KEY, type AppQueryClient } from "../lib/query-cache";
 import { AppShell, PlaceholderPage } from "./AppShell";
 import { LoginPage } from "../features/auth/LoginPage";
+import { TodayPage } from "../features/today/TodayPage";
+import { LearnSetupPage } from "../features/learn/LearnSetupPage";
 
 export interface AppRoutesOptions {
   api: ApiClient;
   queryClient: AppQueryClient;
 }
 
+/**
+ * `/today` and `/learn` are the Task 16 feature pages; review, dictionary,
+ * and stats land with Task 17 and keep placeholder pages until then.
+ */
 export const PLACEHOLDER_PAGES = [
-  { path: "today", title: "今日" },
-  { path: "learn", title: "学习" },
   { path: "review", title: "复习" },
   { path: "dictionary", title: "词典" },
   { path: "stats", title: "数据" },
@@ -68,10 +72,14 @@ export function createAppRoutes({ api, queryClient }: AppRoutesOptions): RouteOb
         { index: true, element: <Navigate to="/today" replace /> },
         {
           element: <AppShell api={api} queryClient={queryClient} />,
-          children: PLACEHOLDER_PAGES.map((page) => ({
-            path: page.path,
-            element: <PlaceholderPage title={page.title} />,
-          })),
+          children: [
+            { path: "today", element: <TodayPage api={api} /> },
+            { path: "learn", element: <LearnSetupPage api={api} /> },
+            ...PLACEHOLDER_PAGES.map((page) => ({
+              path: page.path,
+              element: <PlaceholderPage title={page.title} />,
+            })),
+          ],
         },
       ],
     },

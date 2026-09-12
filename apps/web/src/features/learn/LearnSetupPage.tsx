@@ -1,0 +1,293 @@
+/**
+ * The /learn page (spec 9.3): the SETUP state of the learning state machine
+ * plus the host for the whole journey.
+ *
+ * Setup lets the user keep the last position (default: the settings'
+ * start unit), or pick a Unit and a tier, and previews the expected group in
+ * textbook order. The FIXED group itself is always the server's decision
+ * (the queue snapshot of POST /api/study/sessions) — the client only
+ * previews and never reshuffles; the card count shown after starting is the
+ * server's queue length.
+ *
+ * Phases render from useStudySession: SETUP -> STUDY_WORDS (WordStudyCard)
+ * -> QUICK_RECALL_QUESTION / QUICK_RECALL_REVEALED (QuickRecall) ->
+ * COMPLETE. All progress persists through the Worker Session APIs only.
+ */
+
+import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+import type { ApiClient, UnitContentResponse, WordProgressResponse } from "../../lib/api-client";
+import {
+  AUTH_ME_QUERY_KEY,
+  CONTENT_BOOTSTRAP_QUERY_KEY,
+  STUDY_SESSIONS_QUERY_KEY,
+  unitContentQueryKey,
+} from "../../lib/query-cache";
+import { useStudySession, type LearnSettings, type StudySessionControls } from "./useStudySession";
+import { WordStudyCard } from "./WordStudyCard";
+import { QuickRecall } from "./QuickRecall";
+
+export interface LearnSetupPageProps {
+  api: ApiClient;
+}
+
+type SetupWord = UnitContentResponse["words"][number];
+type ProgressMap = Record<string, WordProgressResponse["progress"]>;
+
+const ALL_TIERS = "ALL";
+
+/** Status tag of one preview word (personal stage comes from progress only). */
+function stageTag(word: SetupWord, progress: ProgressMap, inGroup: boolean): string {
+  const stage = progress[word.word_key]?.stage ?? null;
+  if (stage === "INTRODUCED") {
+    return "已学";
+  }
+  return inGroup ? "在本组" : "待学";
+}
+
+/**
+ * The expected group: the first `groupSize` words of the tier-filtered unit
+ * list that are not yet INTRODUCED, in the server's textbook order
+ * (tier, then source order).
+ */
+function expectedGroup(
+  words: readonly SetupWord[],
+  progress: ProgressMap,
+  tierFilter: string,
+  groupSize: number,
+): SetupWord[] {
+  return words
+    .filter((word) => tierFilter === ALL_TIERS || word.tier === tierFilter)
+    .filter((word) => progress[word.word_key]?.stage !== "INTRODUCED")
+    .slice(0, groupSize);
+}
+
+interface SetupViewProps {
+  api: ApiClient;
+  settings: LearnSettings;
+  study: StudySessionControls;
+}
+
+function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element {
+  const [unitKey, setUnitKey] = useState("");
+  const [tierFilter, setTierFilter] = useState<string>(ALL_TIERS);
+
+  const bootstrap = useQuery({
+    queryKey: CONTENT_BOOTSTRAP_QUERY_KEY,
+    queryFn: () => api.bootstrap(),
+  });
+  const sessions = useQuery({
+    queryKey: STUDY_SESSIONS_QUERY_KEY,
+    queryFn: () => api.listStudySessions(),
+  });
+
+  // 沿用上次位置: default the unit to the settings' start unit, else the
+  // first textbook unit.
+  useEffect(() => {
+    if (unitKey === "") {
+      const fallback =
+        settings?.start_unit_key ?? bootstrap.data?.units[0]?.unit_key ?? "";
+      if (fallback !== "") {
+        setUnitKey(fallback);
+      }
+    }
+  }, [unitKey, settings, bootstrap.data]);
+
+  const unit = useQuery({
+    queryKey: unitContentQueryKey(unitKey),
+    queryFn: () => api.unitContent(unitKey),
+    enabled: unitKey !== "",
+  });
+  const progress = useQuery({
+    queryKey: ["progress", "unit", unitKey],
+    queryFn: async (): Promise<ProgressMap> => {
+      const words = unit.data?.words ?? [];
+      const entries = await Promise.all(
+        words.map(async (word) => {
+          try {
+            return [word.word_key, (await api.wordProgress(word.word_key)).progress] as const;
+          } catch {
+            return [word.word_key, null] as const;
+          }
+        }),
+      );
+      return Object.fromEntries(entries);
+    },
+    enabled: unitKey !== "" && unit.data !== undefined,
+  });
+
+  const words = unit.data?.words ?? [];
+  const progressMap = progress.data ?? {};
+  const group = expectedGroup(words, progressMap, tierFilter, settings?.new_words_per_group ?? 10);
+  const groupKeys = new Set(group.map((word) => word.word_key));
+  const tiers = [...new Set(words.map((word) => word.tier))];
+  const resumable = sessions.data?.find(
+    (session) => session.mode === "NEW_WORDS" && session.expires_at > Date.now(),
+  );
+
+  return (
+    <section>
+      <h2>开始新词学习</h2>
+      {bootstrap.isPending || sessions.isPending ? <p role="status">正在加载…</p> : null}
+      {bootstrap.isError || sessions.isError ? (
+        <p role="alert">学习内容加载失败，请稍后重试。</p>
+      ) : null}
+      {study.setupError ? <p role="alert">{study.setupError}</p> : null}
+
+      <div>
+        <label htmlFor="learn-unit">选择单元</label>
+        <select
+          id="learn-unit"
+          value={unitKey}
+          onChange={(event) => setUnitKey(event.target.value)}
+        >
+          {bootstrap.data?.units.map((unitOption) => (
+            <option key={unitOption.unit_key} value={unitOption.unit_key}>
+              {unitOption.title}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label htmlFor="learn-tier">选择分层</label>
+        <select
+          id="learn-tier"
+          value={tierFilter}
+          onChange={(event) => setTierFilter(event.target.value)}
+        >
+          <option value={ALL_TIERS}>全部分层</option>
+          {tiers.map((tier) => (
+            <option key={tier} value={tier}>
+              {tier}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <p>预计本组 {group.length} 个新词（按教材顺序学习）。</p>
+      <ul aria-label="本单元单词顺序">
+        {words
+          .filter((word) => tierFilter === ALL_TIERS || word.tier === tierFilter)
+          .map((word) => (
+            <li key={word.word_key}>
+              {word.headword}
+              {word.phonetic ? ` /${word.phonetic}/` : ""} ·{" "}
+              {stageTag(word, progressMap, groupKeys.has(word.word_key))}
+            </li>
+          ))}
+      </ul>
+
+      {resumable ? (
+        <button type="button" className="btn" disabled={study.starting} onClick={() => void study.resumeSession()}>
+          继续上次学习
+        </button>
+      ) : null}
+      <button
+        type="button"
+        className="btn btn--primary"
+        disabled={study.starting || group.length === 0}
+        onClick={() => void study.startGroup(group.map(toGroupWord))}
+      >
+        开始学习
+      </button>
+      {study.starting ? <p role="status">正在准备学习…</p> : null}
+    </section>
+  );
+}
+
+function toGroupWord(word: SetupWord) {
+  return {
+    wordKey: word.word_key,
+    headword: word.headword,
+    phonetic: word.phonetic,
+    tier: word.tier,
+    sourceOrder: word.source_order,
+  };
+}
+
+function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls }): React.JSX.Element {
+  const word = study.words[study.studyIndex];
+  if (!word || !study.session) {
+    return (
+      <p role="status">正在准备学习…</p>
+    );
+  }
+  const wordAudio = word.content?.audio.find(
+    (asset) => asset.entity_type === "word" && asset.entity_key === word.wordKey,
+  );
+  const isLastWord = study.studyIndex === study.words.length - 1;
+  return (
+    <div>
+      <p>
+        本组共 {study.session.cards.length} 张卡（完成学习后逐卡快速回忆）。
+      </p>
+      <WordStudyCard
+        key={word.wordKey}
+        position={study.studyIndex}
+        total={study.words.length}
+        word={word}
+        familiarityPending={study.familiarityPending}
+        audioUrl={wordAudio ? api.audioUrl(wordAudio.asset_key, study.session.session_id) : null}
+        onFamiliarity={(choice) => void study.chooseFamiliarity(word.wordKey, choice)}
+        onRetryPresentation={() => void study.retryPresentation(word.wordKey)}
+        onRetryContent={() => study.retryContent(word.wordKey)}
+        onNext={() => void study.advanceStudy()}
+        nextLabel={isLastWord ? "开始快速回忆" : "下一词"}
+        nextDisabled={study.starting}
+      />
+    </div>
+  );
+}
+
+function RecallView({ study }: { study: StudySessionControls }): React.JSX.Element {
+  const total = study.session?.cards.length ?? 0;
+  return (
+    <QuickRecall
+      cardIndex={study.queueIndex}
+      total={total}
+      card={study.recallCards?.[study.queueIndex] ?? null}
+      revealed={study.phase === "QUICK_RECALL_REVEALED"}
+      gradePending={study.gradePending}
+      gradeError={study.gradeError}
+      onReveal={study.reveal}
+      onRate={(rating) => void study.rate(rating)}
+    />
+  );
+}
+
+function CompleteView({ study }: { study: StudySessionControls }): React.JSX.Element {
+  return (
+    <section>
+      <h2>本组学习完成</h2>
+      {study.summary ? (
+        <p>已引入 {study.summary.introduced} / {study.summary.total} 个单词。</p>
+      ) : (
+        <p role="status">正在获取学习结果…</p>
+      )}
+      <p>之后这些词的卡片将进入正常复习计划。</p>
+      <Link className="btn btn--primary" to="/today">
+        回到今日
+      </Link>
+    </section>
+  );
+}
+
+export function LearnSetupPage({ api }: LearnSetupPageProps): React.JSX.Element {
+  const me = useQuery({ queryKey: AUTH_ME_QUERY_KEY, queryFn: () => api.me() });
+  const study = useStudySession({ api, settings: me.data?.settings ?? null });
+
+  return (
+    <section>
+      <h1>学习</h1>
+      {study.phase === "SETUP" ? (
+        <SetupView api={api} settings={me.data?.settings ?? null} study={study} />
+      ) : null}
+      {study.phase === "STUDY_WORDS" ? <StudyView api={api} study={study} /> : null}
+      {study.phase === "QUICK_RECALL_QUESTION" || study.phase === "QUICK_RECALL_REVEALED" ? (
+        <RecallView study={study} />
+      ) : null}
+      {study.phase === "COMPLETE" ? <CompleteView study={study} /> : null}
+    </section>
+  );
+}

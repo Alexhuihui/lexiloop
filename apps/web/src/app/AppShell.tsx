@@ -68,8 +68,16 @@ export function AppShell({ api, queryClient }: AppShellProps): React.JSX.Element
   // Central auth-expiry handling: every 401 from any API call lands here.
   useEffect(() => {
     api.setOnUnauthorized(() => {
+      // Redirect first and commit synchronously (flushSync), so authenticated
+      // pages and their query observers unmount BEFORE the cache is dropped —
+      // otherwise a still-mounted observer immediately re-creates and
+      // refetches a personal query with a dead session.
+      navigate("/login", {
+        replace: true,
+        state: { from: locationRef.current },
+        flushSync: true,
+      });
       clearPersonalState(queryClient);
-      navigate("/login", { replace: true, state: { from: locationRef.current } });
     });
     return () => {
       api.setOnUnauthorized(undefined);
