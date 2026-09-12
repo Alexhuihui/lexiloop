@@ -53,3 +53,18 @@ export function gradeCard(input: GradeInput): GradeOutcome {
   const { card } = scheduler.next(current, at, RATING_BY_NUMBER[input.rating]);
   return { before: input.before, after: cardToState(card) };
 }
+
+/**
+ * Estimated memory retention (spec 9.6): the scheduler's predicted
+ * retrievability of a stored card at `nowMs`, in [0, 1]. Reuses the locked
+ * ts-fsrs forgetting curve R = (1 + FACTOR * t / S)^DECAY over whole days
+ * since `last_review_at`; cards without review history (never graded) report
+ * 0. Statistics aggregate these per-card values; no other approximation of
+ * retention exists in the codebase.
+ */
+export function estimateRetrievability(state: FsrsStateV1, nowMs: number): number {
+  if (state.last_review_at === null) {
+    return 0;
+  }
+  return scheduler.get_retrievability(stateToCard(state), new Date(nowMs), false);
+}

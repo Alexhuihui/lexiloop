@@ -28,6 +28,9 @@ namespace_id = "1001"
 limit = 5
 period = 60
 
-# Daily application backup, 03:30 UTC.
+# Daily application-level user-data backup (gzip JSONL + manifest to the
+# private R2 bucket), 19:00 UTC = 03:00 Asia/Shanghai. The scheduled handler
+# lives in apps/worker/src/scheduled.ts; restore drills run via
+# scripts/restore-drill.ts (docs/runbooks/backup-and-restore.md).
 [triggers]
-crons = ["30 3 * * *"]
+crons = ["0 19 * * *"]

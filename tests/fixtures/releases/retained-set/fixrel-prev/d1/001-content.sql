@@ -1,0 +1,5 @@
+-- LexiLoop release fixrel-prev: synthetic fixture content (no real textbook data).
+INSERT INTO book (release_id, book_key, title, edition, provenance_json) VALUES ('fixrel-prev', 'bk-1', 'Synthetic Fixture Book', '1st', '{"source_pdf_sha256":"1111111111111111111111111111111111111111111111111111111111111111","page_number":1}');
+INSERT INTO unit (release_id, unit_key, book_key, level, unit_order, title, provenance_json) VALUES ('fixrel-prev', 'u-1', 'bk-1', 1, 1, 'Fixture Unit', '{"source_pdf_sha256":"1111111111111111111111111111111111111111111111111111111111111111","page_number":1}');
+INSERT INTO word (release_id, word_key, unit_key, headword, phonetic, tier, source_order, provenance_json) VALUES ('fixrel-prev', 'w-haven', 'u-1', 'haven', NULL, 'CORE', 1, '{"source_pdf_sha256":"1111111111111111111111111111111111111111111111111111111111111111","page_number":1}');
+INSERT INTO sense (release_id, sense_key, word_key, pos, gloss, sense_order, provenance_json) VALUES ('fixrel-prev', 's-w-haven-1', 'w-haven', 'noun', 'synthetic haven', 1, '{"source_pdf_sha256":"1111111111111111111111111111111111111111111111111111111111111111","page_number":1}');

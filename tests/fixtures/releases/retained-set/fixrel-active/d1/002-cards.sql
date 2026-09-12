@@ -1,0 +1,1 @@
+-- LexiLoop release fixrel-active: card definitions (none in fixture).

@@ -12,16 +12,18 @@
  *
  * The app (and its instrumented deps) is built per request because the usage
  * counters are per request by design; Workers invoke fetch once per request,
- * so this is one small object graph per request. Optional deployment vars:
- * `ALLOWED_ORIGINS` (comma-separated extra write-request origins),
- * `SESSION_IDLE_HOURS` (default 168), and `WORKER_RELEASE_ID` (stamped into
- * request logs).
+ * so this is one small object graph per request. The same entry point carries
+ * the `scheduled` handler for the daily user-data backup cron. Optional
+ * deployment vars: `ALLOWED_ORIGINS` (comma-separated extra write-request
+ * origins), `SESSION_IDLE_HOURS` (default 168), and `WORKER_RELEASE_ID`
+ * (stamped into request logs).
  */
 
 import { drizzle } from "drizzle-orm/d1";
 import { schema } from "@lexiloop/db";
 import { buildApp, type WorkerDeps } from "./app";
 import { createLoginRateLimiter, type RateLimitBinding } from "./auth/routes";
+import { scheduled } from "./scheduled";
 import {
   createRequestLogContext,
   instrumentD1,
@@ -81,4 +83,7 @@ export default {
     };
     return buildApp(deps).fetch(request);
   },
+  // Daily user-data backup on the Wrangler cron `0 19 * * *` (03:00
+  // Asia/Shanghai); same exporter as scripts/backup-user-data.ts.
+  scheduled,
 } satisfies ExportedHandler<Env>;
