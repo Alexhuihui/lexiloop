@@ -1,0 +1,260 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+ * LexiLoop visual system (plan Task 15, mobile-first).
+ * Accessibility contract that AppShell tests assert: 44px touch targets,
+ * high-contrast focus states, reduced-motion support, and a font stack tuned
+ * for mixed English/Chinese reading.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  --brand: #0f766e;
+  --brand-strong: #115e59;
+  --brand-soft: #ccfbf1;
+  --ink: #1c1917;
+  --ink-soft: #57534e;
+  --paper: #fafaf9;
+  --line: #e7e5e4;
+  --danger: #b91c1c;
+  --focus-ring: #1d4ed8;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--paper);
+  /* System UI Latin faces first, then the common Chinese platform faces. */
+  font-family:
+    system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  font-size: 16px;
+  /* Generous leading keeps dense mixed English/Chinese text readable. */
+  line-height: 1.7;
+  letter-spacing: 0.01em;
+}
+
+/* High-contrast focus states: visible against both light surfaces and the
+ * brand-colored header, independent of pointer type. */
+:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* 44px minimum touch targets for every interactive control. */
+.app-nav__item,
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+/* Skip link: hidden until focused, then highly visible. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+}
+.skip-link:focus-visible {
+  left: 8px;
+  top: 8px;
+  z-index: 50;
+  padding: 8px 16px;
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 8px;
+}
+
+/* Respect reduced-motion preferences (no animations/transitions to speak of
+ * yet, but the contract is in place for later features). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Layout shell ------------------------------------------------------------- */
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: var(--brand);
+  color: #ffffff;
+}
+
+.app-title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.app-header .btn {
+  color: #ffffff;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 8px;
+  padding: 0 14px;
+  font: inherit;
+  font-weight: 600;
+}
+
+.app-header .btn:disabled {
+  opacity: 0.6;
+}
+
+.app-body {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  min-height: 0;
+}
+
+.app-main {
+  flex: 1;
+  min-width: 0;
+  padding: 16px;
+  /* Clear the fixed bottom bar on mobile (incl. notched safe areas). */
+  padding-bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+}
+
+/* Responsive navigation ---------------------------------------------------- */
+
+.app-nav__list {
+  display: flex;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.app-nav__item {
+  width: 100%;
+  color: var(--ink-soft);
+  font-weight: 500;
+  text-decoration: none;
+  border-radius: 10px;
+}
+
+.app-nav__item--active {
+  color: var(--brand-strong);
+  background: var(--brand-soft);
+}
+
+/* Mobile: fixed bottom bar (spec 9.1). */
+.app-nav--bottom {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: #ffffff;
+  border-top: 1px solid var(--line);
+}
+
+.app-nav--bottom .app-nav__list {
+  padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px));
+}
+
+.app-nav--bottom li {
+  flex: 1;
+}
+
+/* Desktop: left sidebar beside a two-column content area (spec 9.1). */
+@media (min-width: 768px) {
+  .app-nav--side {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    width: 15rem;
+    flex-shrink: 0;
+    align-items: stretch;
+    background: #ffffff;
+    border-right: 1px solid var(--line);
+  }
+
+  .app-nav--side .app-nav__list {
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+    padding: 16px 12px;
+  }
+
+  .app-main {
+    padding: 24px 32px;
+  }
+}
+
+/* Forms -------------------------------------------------------------------- */
+
+.login-page {
+  max-width: 24rem;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+.login-page h1 {
+  font-size: 1.5rem;
+  line-height: 1.4;
+}
+
+.login-form {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.login-form label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.login-form input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  font: inherit;
+  color: var(--ink);
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+
+.login-form input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.form-error {
+  margin: 0;
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.btn--primary {
+  background: var(--brand);
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 0 20px;
+  font: inherit;
+  font-weight: 600;
+}
+
+.btn--primary:disabled {
+  opacity: 0.6;
+}
