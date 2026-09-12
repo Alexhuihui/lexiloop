@@ -21,7 +21,11 @@
  *   content from the network).
  * - Audio (`/api/audio/*`) is content-hash addressed and release-independent
  *   (spec 5.8), so it is cached first under the URL with the `session` query
- *   stripped — instant replays, no session ids in cache keys.
+ *   stripped — instant replays, no session ids in cache keys. Media range
+ *   requests are answered with the whole object (the assets are tiny and a
+ *   200 is valid HTTP for a ranged request): Chromium forbids the Range
+ *   header on a SW-initiated fetch(), so it must be stripped before the
+ *   network passthrough (audioPassthroughRequest).
  * - The logout message (`lexiloop:clear-caches`, posted by
  *   `clearPersonalState` in lib/query-cache.ts) deletes every content and
  *   audio cache; the static shell precache survives.
@@ -146,6 +150,23 @@ export function audioCacheKey(url: URL): string {
   const key = new URL(url.toString());
   key.searchParams.delete("session");
   return key.toString();
+}
+
+/**
+ * A fetch()-able Request without the media `Range` header. Chromium forbids
+ * the Range header on a Service-Worker-initiated fetch() (forbidden header
+ * name), so an `<audio>` range request handed back to `fetch(request)` fails
+ * with "Failed to fetch" before the network is reached. Audio assets are
+ * tiny content-addressed WAVs, so answering a ranged media request with the
+ * whole 200 object is valid HTTP (RFC 9110 allows servers to ignore Range).
+ */
+export function audioPassthroughRequest(request: Request): Request {
+  if (!request.headers.has("range")) {
+    return request;
+  }
+  const headers = new Headers(request.headers);
+  headers.delete("range");
+  return new Request(request.url, { method: request.method, headers });
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +299,10 @@ function registerHandlers(): void {
           if (cached) {
             return cached;
           }
-          const response = await fetch(request);
+          // Range must be stripped (see audioPassthroughRequest): Chromium
+          // rejects a SW fetch() that carries it, which would fail every
+          // first `<audio>` play before the network is reached.
+          const response = await fetch(audioPassthroughRequest(request));
           if (response.ok) {
             const cache = await caches.open(AUDIO_CACHE);
             await cache.put(key, response.clone());

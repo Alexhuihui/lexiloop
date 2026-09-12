@@ -24,6 +24,7 @@ import {
   SHELL_CACHE,
   SHELL_DOCUMENT,
   audioCacheKey,
+  audioPassthroughRequest,
   cachesToDeleteOnLogout,
   classifyRequest,
   contentCacheName,
@@ -165,5 +166,23 @@ describe("logout cache deletion", () => {
     expect(SHELL_CACHE).toBe("lexiloop-shell-v1");
     expect(AUDIO_CACHE).toBe("lexiloop-audio-v1");
     expect(CONTENT_CACHE_PREFIX).toBe("lexiloop-content-");
+  });
+});
+
+describe("audioPassthroughRequest", () => {
+  it("strips the media Range header so the SW fetch() is not rejected", () => {
+    const request = new Request("https://lexiloop.example/api/audio/audio/ab/x.wav?session=s1", {
+      headers: { range: "bytes=0-" },
+    });
+    expect(request.headers.has("range")).toBe(true);
+    const passthrough = audioPassthroughRequest(request);
+    expect(passthrough.url).toBe(request.url);
+    expect(passthrough.method).toBe("GET");
+    expect(passthrough.headers.has("range")).toBe(false);
+  });
+
+  it("returns the original request untouched when it has no Range header", () => {
+    const request = new Request("https://lexiloop.example/api/audio/audio/ab/x.wav");
+    expect(audioPassthroughRequest(request)).toBe(request);
   });
 });

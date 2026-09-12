@@ -26,5 +26,8 @@ export default defineConfig({
     // Component tests run under happy-dom (plan Task 1); no browser-only APIs
     // without guards, so the suite stays runnable in CI without a real browser.
     environment: "happy-dom",
+    // The Playwright specs in e2e/ are driven by apps/web/playwright.config.ts
+    // (Task 18) — they must never run inside the vitest suite.
+    exclude: ["e2e/**", "node_modules/**", "dist/**"],
   },
 });
