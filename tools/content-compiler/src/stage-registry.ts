@@ -727,10 +727,13 @@ function packetForReview(review: NormalizeOutput["fieldReviews"][number]) {
  * no path can be bypassed by any flag.
  */
 export function createStructureNormalizeStage(options: MediaStageOptions): AnyStage {
-  // v2: banner calibration for the real raster (opener banners + right-rail
-  // side tabs with captured unit numbers; left-rail chapter tab widened to
-  // furniture). Bumped so cached ledgers invalidate and re-segment.
-  const configVersion = "2";
+  // v3: chapter-aware calibration for the full 440-page raster. Chapter
+  // openers establish authoritative chapter context; front matter (before the
+  // first opener) and back matter (from the index opener) are signal-inert;
+  // unit keys are chapter-qualified (c<chapter>.u<number>) with unit_order as
+  // the global encounter ordinal; the monotonic guard is chapter-scoped.
+  // Bumped so cached ledgers invalidate and re-segment.
+  const configVersion = "3";
   return {
     name: "STRUCTURE_NORMALIZE",
     configVersion,

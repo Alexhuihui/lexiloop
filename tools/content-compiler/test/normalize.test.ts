@@ -91,7 +91,8 @@ function governmentPageBlocks(): NormalizeInputBlock[] {
   return [
     makeBlock("p1.footer", 1, [0.1, 0.94, 0.9, 0.975], "18 你知道什么叫作意外吗？就是我从来没想过遇见你，但我遇见了。"),
     makeBlock("p1.sidebar", 1, [0.0, 0.2, 0.04, 0.35], "Chapter\n01"),
-    makeBlock("p1.unit", 1, [0.08, 0.07, 0.92, 0.12], "Unit 1"),
+    makeBlock("p1.chapter.opener", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+    makeBlock("p1.unit", 1, [0.08, 0.11, 0.92, 0.16], "Unit 1"),
     makeBlock(
       "p1.gov.head",
       1,
@@ -200,8 +201,14 @@ function normalizeConfig(): NormalizeBookConfig {
     book_edition: "2024",
     default_tier: "core",
     unit_title_patterns: ["^Unit\\s*(\\d+)$"],
-    unit_tab_number_pattern: "^\\d{1,2}$",
+    unit_tab_number_pattern: "^\\d{2}$",
     unit_tab_x_min: 0.9,
+    unit_tab_y_min: 0.1,
+    unit_tab_y_max: 0.9,
+    chapter_opener_pattern: "^Chapter\\s*0?([1-9])$",
+    chapter_opener_y_max: 0.25,
+    back_matter_patterns: ["^索引$"],
+    back_matter_y_max: 0.5,
     pos_markers: [
       "n.",
       "v.",
@@ -398,8 +405,8 @@ describe("structure segmentation", () => {
     output = normalizeAll();
     expect(output.units.map((u) => u.title)).toEqual(["Unit 1", "Unit 2"]);
     expect(output.unitBoundaries).toEqual([
-      { unit_key: "u1", unit_order: 1, title: "Unit 1", first_page: 1, last_page: 2 },
-      { unit_key: "u2", unit_order: 2, title: "Unit 2", first_page: 2, last_page: 2 },
+      { unit_key: "c1.u1", unit_order: 1, title: "Unit 1", first_page: 1, last_page: 2 },
+      { unit_key: "c1.u2", unit_order: 2, title: "Unit 2", first_page: 2, last_page: 2 },
     ]);
   });
 
@@ -414,12 +421,12 @@ describe("structure segmentation", () => {
       "abandon",
     ]);
     const gov = output.words[0]!;
-    expect(gov.word_key).toBe("w.u1.0001.government");
-    expect(gov.unit_key).toBe("u1");
+    expect(gov.word_key).toBe("w.c1.u1.0001.government");
+    expect(gov.unit_key).toBe("c1.u1");
     expect(gov.source_order).toBe(1);
     expect(gov.phonetic).toBe("/ɡʌvənmənt/");
     const abandon = output.words[5]!;
-    expect(abandon.unit_key).toBe("u2");
+    expect(abandon.unit_key).toBe("c1.u2");
     expect(abandon.source_order).toBe(1);
   });
 
@@ -807,12 +814,14 @@ describe("LAYOUT_OCR + STRUCTURE_NORMALIZE stages", () => {
 
   it("fails BLOCKED when words reference a unit that no banner emitted", async () => {
     await seedCleanArtifacts();
-    // Word entries without any unit-title block: the synthetic fallback unit
-    // would dangle, so the stage must fail closed instead of emitting a
-    // structurally invalid book (review finding: unit detection fails open).
+    // Word entries without any unit signal: with the chapter opener also
+    // stripped there is no chapter context at all (no unit may open, and no
+    // chapter-level fallback applies), so the synthetic fallback unit would
+    // dangle and the stage must fail closed instead of emitting a structurally
+    // invalid book (review finding: unit detection fails open).
     const rows = (
       ocrRows() as Array<{ page: number; text: string; confidence: number }>
-    ).filter((row) => !row.text.startsWith("Unit"));
+    ).filter((row) => !row.text.startsWith("Unit") && !/^Chapter \d$/.test(row.text));
     expect(rows.length).toBeGreaterThan(0);
     const stages = await makeStagesWithRows(rows);
 
@@ -1136,55 +1145,57 @@ describe("llcy-2024 banner calibration", () => {
 
   it("starts units from right-rail tab digits and keeps one unit per number", () => {
     const blocks = [
-      // Page 1: right-rail tab "7" + one entry.
-      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      // Page 1: chapter 1 opener + right-rail tab "7" + one entry.
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
       makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
       // Page 2: same tab digit -> the same unit stays open.
-      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
       makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
       // Page 3: tab flips to 8 -> a new unit starts.
-      makeBlock("p3.tab", 3, [0.9359, 0.8278, 0.9709, 0.8478], "8"),
+      makeBlock("p3.tab", 3, [0.9359, 0.8278, 0.9709, 0.8478], "08"),
       makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
     ];
     const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
     expect(output.unitBoundaries).toEqual([
-      { unit_key: "u7", unit_order: 7, title: "Unit 7", first_page: 1, last_page: 2 },
-      { unit_key: "u8", unit_order: 8, title: "Unit 8", first_page: 3, last_page: 3 },
+      { unit_key: "c1.u7", unit_order: 1, title: "Unit 7", first_page: 1, last_page: 2 },
+      { unit_key: "c1.u8", unit_order: 2, title: "Unit 8", first_page: 3, last_page: 3 },
     ]);
     expect(output.units.map((u) => [u.unit_key, u.unit_order, u.title])).toEqual([
-      ["u7", 7, "Unit 7"],
-      ["u8", 8, "Unit 8"],
+      ["c1.u7", 1, "Unit 7"],
+      ["c1.u8", 2, "Unit 8"],
     ]);
     expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
-      ["alpha", "u7"],
-      ["beta", "u7"],
-      ["gamma", "u8"],
+      ["alpha", "c1.u7"],
+      ["beta", "c1.u7"],
+      ["gamma", "c1.u8"],
     ]);
   });
 
   it("starts units from the opener banner with the captured number, not discovery order", () => {
     const blocks = [
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
       // Unit opener: a single large "Unit 12" banner block on the first page.
-      makeBlock("p1.opener", 1, [0.16, 0.07, 0.46, 0.13], "Unit 12"),
+      makeBlock("p1.opener", 1, [0.16, 0.16, 0.46, 0.22], "Unit 12"),
       makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "12"),
-      makeBlock("p1.head", 1, [0.1, 0.2, 0.48, 0.26], "delta /ˈdeltə/ n. 德尔塔"),
+      makeBlock("p1.head", 1, [0.1, 0.26, 0.48, 0.32], "delta /ˈdeltə/ n. 德尔塔"),
     ];
     const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
     expect(output.units).toHaveLength(1);
-    expect(output.units[0]).toMatchObject({ unit_key: "u12", unit_order: 12 });
-    expect(output.words[0]!.unit_key).toBe("u12");
+    expect(output.units[0]).toMatchObject({ unit_key: "c1.u12", unit_order: 1 });
+    expect(output.words[0]!.unit_key).toBe("c1.u12");
   });
 
   it("never starts units from entry numbers, chapter tabs, or chapter openers", () => {
     const blocks = [
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
       makeBlock("p1.entrynum", 1, [0.1262, 0.095, 0.1877, 0.1224], "118"),
-      makeBlock("p1.chapter.opener", 1, [0.2038, 0.2021, 0.4453, 0.2542], "Chapter 2"),
-      makeBlock("p1.opener", 1, [0.16, 0.07, 0.46, 0.13], "Unit 9"),
+      makeBlock("p1.opener", 1, [0.16, 0.16, 0.46, 0.22], "Unit 9"),
       makeBlock("p1.head", 1, [0.1, 0.3, 0.48, 0.36], "epsilon /ˈepsɪlɒn/ n. 艾普西隆"),
     ];
     const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
     expect(output.units).toHaveLength(1);
-    expect(output.units[0]).toMatchObject({ unit_key: "u9", unit_order: 9 });
+    expect(output.units[0]).toMatchObject({ unit_key: "c1.u9", unit_order: 1 });
   });
 });
 
@@ -1197,44 +1208,46 @@ describe("llcy-2024 signal-less page attribution", () => {
   // unit's last tab page.
   it("attributes a signal-less opener page to the unit the following tab names", () => {
     const blocks = [
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
       // Page 1: unit opener page — no tab survived OCR, content only.
       makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
       // Page 2: first tabbed page of unit 7.
-      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
       makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
     ];
     const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
     expect(output.unitBoundaries).toEqual([
-      { unit_key: "u7", unit_order: 7, title: "Unit 7", first_page: 1, last_page: 2 },
+      { unit_key: "c1.u7", unit_order: 1, title: "Unit 7", first_page: 1, last_page: 2 },
     ]);
     expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
-      ["alpha", "u7"],
-      ["beta", "u7"],
+      ["alpha", "c1.u7"],
+      ["beta", "c1.u7"],
     ]);
   });
 
   it("keeps a trailing signal-less page with the unit that most recently signaled", () => {
     const blocks = [
-      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
       makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
       // Page 2: trailing signal-less page of unit 7.
       makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
       // Page 3: next unit's opener (signal-less)...
       makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
       // Page 4: ...named by its first tab page.
-      makeBlock("p4.tab", 4, [0.9359, 0.8278, 0.9709, 0.8478], "8"),
+      makeBlock("p4.tab", 4, [0.9359, 0.8278, 0.9709, 0.8478], "08"),
       makeBlock("p4.head", 4, [0.1, 0.14, 0.48, 0.2], "delta /ˈdeltə/ n. 德尔塔"),
     ];
     const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
     expect(output.unitBoundaries).toEqual([
-      { unit_key: "u7", unit_order: 7, title: "Unit 7", first_page: 1, last_page: 2 },
-      { unit_key: "u8", unit_order: 8, title: "Unit 8", first_page: 3, last_page: 4 },
+      { unit_key: "c1.u7", unit_order: 1, title: "Unit 7", first_page: 1, last_page: 2 },
+      { unit_key: "c1.u8", unit_order: 2, title: "Unit 8", first_page: 3, last_page: 4 },
     ]);
     expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
-      ["alpha", "u7"],
-      ["beta", "u7"],
-      ["gamma", "u8"],
-      ["delta", "u8"],
+      ["alpha", "c1.u7"],
+      ["beta", "c1.u7"],
+      ["gamma", "c1.u8"],
+      ["delta", "c1.u8"],
     ]);
   });
 });
@@ -1242,29 +1255,47 @@ describe("llcy-2024 signal-less page attribution", () => {
 describe("llcy-2024 tab misread tolerance", () => {
   it("treats a single misread tab between two runs of one unit as noise", () => {
     const blocks = [
-      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
       makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
       makeBlock("p2.tab", 2, [0.9396, 0.8327, 0.9767, 0.8536], "40"), // OCR misread of "07"
       makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
-      makeBlock("p3.tab", 3, [0.9327, 0.8306, 0.9719, 0.8532], "7"),
+      makeBlock("p3.tab", 3, [0.9327, 0.8306, 0.9719, 0.8532], "07"),
       makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
     ];
     const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
     expect(output.units).toHaveLength(1);
-    expect(output.units[0]).toMatchObject({ unit_key: "u7", unit_order: 7 });
-    expect(output.words.map((w) => w.unit_key)).toEqual(["u7", "u7", "u7"]);
+    expect(output.units[0]).toMatchObject({ unit_key: "c1.u7", unit_order: 1 });
+    expect(output.words.map((w) => w.unit_key)).toEqual(["c1.u7", "c1.u7", "c1.u7"]);
+  });
+
+  it("never reads a one-digit truncated tab (real tabs always print two digits)", () => {
+    // Real case: the tail page of a unit run truncates its tab to a single
+    // digit ("6" for "19"). Real tabs are zero-padded two-digit blocks, so a
+    // lone digit is truncation noise, not a unit signal.
+    const blocks = [
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+      makeBlock("p1.tab", 1, [0.9376, 0.6135, 0.9765, 0.6335], "19"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      makeBlock("p2.tab", 2, [0.9384, 0.6168, 0.9752, 0.6368], "6"),
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+      makeBlock("p3.tab", 3, [0.9398, 0.6178, 0.9798, 0.6378], "19"),
+      makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units.map((u) => u.unit_key)).toEqual(["c1.u19"]);
+    expect(output.words.map((w) => w.unit_key)).toEqual(["c1.u19", "c1.u19", "c1.u19"]);
   });
 });
 
 describe("llcy-2024 monotonic unit invariant", () => {
-  it("fails closed when the FIRST tab run misreads into a phantom higher-ordered unit", () => {
+  it("fails closed when a later tab decreases within the same chapter", () => {
     const blocks = [
-      // First tab page misread ("7" -> "40"): run 0 is never collapsed by the
-      // single-run tolerance, so without a monotonic guard u40 would silently
-      // keep this unit's opener pages' words.
-      makeBlock("p1.tab", 1, [0.9396, 0.8327, 0.9767, 0.8536], "40"),
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
       makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
-      makeBlock("p2.tab", 2, [0.9327, 0.8306, 0.9719, 0.8532], "7"),
+      // A decreasing tab inside chapter 1 is always a misread: fail closed.
+      makeBlock("p2.tab", 2, [0.9327, 0.8306, 0.9719, 0.8532], "02"),
       makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
     ];
     expect(() => segmentStructure(assignReadingOrder(blocks), normalizeConfig())).toThrow(
@@ -1272,22 +1303,270 @@ describe("llcy-2024 monotonic unit invariant", () => {
     );
   });
 
+  it("fails closed when a closed unit's number re-appears in the same chapter", () => {
+    const blocks = [
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
+      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "08"),
+      makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
+      makeBlock("p3.tab", 3, [0.9359, 0.8278, 0.9709, 0.8478], "08"),
+      makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
+      // Unit 7 is closed (its run ended); its number re-appearing on a
+      // multi-page run is not a repeating tab misread.
+      makeBlock("p4.tab", 4, [0.9327, 0.8306, 0.9719, 0.8532], "07"),
+      makeBlock("p4.head", 4, [0.1, 0.14, 0.48, 0.2], "delta /ˈdeltə/ n. 德尔塔"),
+      makeBlock("p5.tab", 5, [0.9327, 0.8306, 0.9719, 0.8532], "07"),
+      makeBlock("p5.head", 5, [0.1, 0.14, 0.48, 0.2], "epsilon /ˈepsɪlɒn/ n. 艾普西隆"),
+    ];
+    expect(() => segmentStructure(assignReadingOrder(blocks), normalizeConfig())).toThrow(
+      /re-appeared/,
+    );
+  });
+
   it("passes a legitimate strictly-increasing unit sequence", () => {
     const blocks = [
-      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "7"),
+      makeBlock("p1.chapter", 1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+      makeBlock("p1.tab", 1, [0.9359, 0.8278, 0.9709, 0.8478], "07"),
       makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "alpha /ˈælfə/ n. 阿尔法"),
-      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "8"),
+      makeBlock("p2.tab", 2, [0.9359, 0.8278, 0.9709, 0.8478], "08"),
       makeBlock("p2.head", 2, [0.1, 0.14, 0.48, 0.2], "beta /ˈbiːtə/ n. 贝塔"),
-      makeBlock("p3.tab", 3, [0.9359, 0.8278, 0.9709, 0.8478], "9"),
+      makeBlock("p3.tab", 3, [0.9359, 0.8278, 0.9709, 0.8478], "09"),
       makeBlock("p3.head", 3, [0.1, 0.14, 0.48, 0.2], "gamma /ˈɡæmə/ n. 伽马"),
     ];
     const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
-    expect(output.units.map((unit) => unit.unit_key)).toEqual(["u7", "u8", "u9"]);
+    expect(output.units.map((unit) => unit.unit_key)).toEqual(["c1.u7", "c1.u8", "c1.u9"]);
     expect(output.unitBoundaries.map((b) => [b.first_page, b.last_page])).toEqual([
       [1, 1],
       [2, 2],
       [3, 3],
     ]);
-    expect(output.words.map((word) => word.unit_key)).toEqual(["u7", "u8", "u9"]);
+    expect(output.words.map((word) => word.unit_key)).toEqual(["c1.u7", "c1.u8", "c1.u9"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chapter-aware calibration (config v3): measured on the full 440-page raster.
+//
+// Unit tabs are GLOBAL book-wide numbers (chapter 1 = units 1-7, chapter 2 =
+// 8-14, ...), printed as a bare 1-2 digit thumb-tab in the RIGHT rail
+// (x0 >= 0.9, y in [0.1, 0.9]) that slides DOWN the rail as the unit
+// advances. The LEFT-rail digits are chapter tabs (sidebar furniture, never
+// unit signals), and the bare digits at y >= 0.9 on the outer edges are PAGE
+// numbers (footer furniture) — never unit tabs. Chapter openers ("Chapter N"
+// near the page top) are authoritative chapter context; the contents page
+// lists unit lines that must yield nothing (front-matter suppression before
+// the first opener). Synthetic lookalikes only.
+// ---------------------------------------------------------------------------
+
+describe("llcy-2024 chapter-aware calibration (v3)", () => {
+  const chapterOpener = (page: number, n: number): NormalizeInputBlock =>
+    makeBlock(`p${page}.chapter`, page, [0.2, 0.065, 0.44, 0.1], `Chapter ${n}`);
+  const unitTab = (page: number, digits: string): NormalizeInputBlock =>
+    makeBlock(`p${page}.tab`, page, [0.9359, 0.8278, 0.9709, 0.8478], digits);
+  const head = (page: number, word: string, gloss: string): NormalizeInputBlock =>
+    makeBlock(`p${page}.head`, page, [0.1, 0.14, 0.48, 0.2], `${word} /ˈwɜːd/ n. ${gloss}`);
+
+  it("qualifies unit keys with the chapter and keeps restarts legal", () => {
+    const blocks = [
+      chapterOpener(1, 1),
+      unitTab(1, "01"),
+      head(1, "alpha", "阿尔法"),
+      unitTab(2, "01"),
+      head(2, "alkali", "碱"),
+      unitTab(3, "02"),
+      head(3, "beta", "贝塔"),
+      unitTab(4, "02"),
+      head(4, "basil", "罗勒"),
+      // Chapter 2 legally restarts at unit 1.
+      chapterOpener(5, 2),
+      unitTab(5, "01"),
+      head(5, "gamma", "伽马"),
+      unitTab(6, "01"),
+      head(6, "guest", "客人"),
+      unitTab(7, "02"),
+      head(7, "delta", "德尔塔"),
+      unitTab(8, "02"),
+      head(8, "dawn", "黎明"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.unitBoundaries).toEqual([
+      { unit_key: "c1.u1", unit_order: 1, title: "Unit 1", first_page: 1, last_page: 2 },
+      { unit_key: "c1.u2", unit_order: 2, title: "Unit 2", first_page: 3, last_page: 4 },
+      { unit_key: "c2.u1", unit_order: 3, title: "Unit 1", first_page: 5, last_page: 6 },
+      { unit_key: "c2.u2", unit_order: 4, title: "Unit 2", first_page: 7, last_page: 8 },
+    ]);
+    expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
+      ["alpha", "c1.u1"],
+      ["alkali", "c1.u1"],
+      ["beta", "c1.u2"],
+      ["basil", "c1.u2"],
+      ["gamma", "c2.u1"],
+      ["guest", "c2.u1"],
+      ["delta", "c2.u2"],
+      ["dawn", "c2.u2"],
+    ]);
+  });
+
+  it("numbers units globally across a chapter change when the tabs keep counting", () => {
+    // The real raster: chapter 2 opens with unit 8 (global numbering).
+    const blocks = [
+      chapterOpener(1, 1),
+      unitTab(1, "07"),
+      head(1, "alpha", "阿尔法"),
+      chapterOpener(2, 2),
+      unitTab(2, "08"),
+      head(2, "beta", "贝塔"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units.map((u) => [u.unit_key, u.unit_order])).toEqual([
+      ["c1.u7", 1],
+      ["c2.u8", 2],
+    ]);
+    // unit_order is the global encounter ordinal: textbook reading order.
+    expect(output.unitBoundaries.map((b) => b.unit_order)).toEqual([1, 2]);
+  });
+
+  it("yields no units from front-matter noise before the first chapter opener", () => {
+    const blocks = [
+      // Contents-page lookalike: a TOC listing chapter + unit lines mid-page
+      // (the real page 13 lists Unit01..Unit 21 this way) plus stray digits.
+      makeBlock("p1.toc.chapter", 1, [0.092, 0.256, 0.254, 0.281], "Chapter01"),
+      makeBlock("p1.toc.u1", 1, [0.092, 0.326, 0.181, 0.346], "Unit01"),
+      makeBlock("p1.toc.u2", 1, [0.093, 0.367, 0.183, 0.386], "Unit 02"),
+      makeBlock("p1.toc.u3", 1, [0.532, 0.255, 0.623, 0.275], "Unit 03"),
+      makeBlock("p1.stray", 1, [0.208, 0.619, 0.257, 0.64], "00"),
+      unitTab(1, "04"), // even a tab-zone digit is noise before any opener
+      // Preface word-family sampler (the real pages 11-12): entry-shaped
+      // lines that are book apparatus, not unit vocabulary.
+      makeBlock("p1.preface.head", 1, [0.1, 0.4, 0.48, 0.46], "workplace /ˈwɜːkpleɪs/ n. 职场"),
+      // Chapter 1's opener page: the first legal signal source.
+      chapterOpener(2, 1),
+      unitTab(2, "01"),
+      head(2, "alpha", "阿尔法"),
+      unitTab(3, "01"),
+      head(3, "beta", "贝塔"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units).toHaveLength(1);
+    expect(output.units[0]).toMatchObject({ unit_key: "c1.u1", unit_order: 1 });
+    expect(output.units[0]!.title).toBe("Unit 1"); // the "Unit01" TOC line never titles a unit
+    expect(output.unitBoundaries[0]).toMatchObject({ first_page: 2, last_page: 3 });
+    // The preface sampler is apparatus in a calibrated (chaptered) book: no
+    // word records from front matter, hence nothing dangling in u0.
+    expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
+      ["alpha", "c1.u1"],
+      ["beta", "c1.u1"],
+    ]);
+  });
+
+  it("tolerates digit-reversed tabs of the open unit across spreads", () => {
+    const blocks = [
+      chapterOpener(1, 1),
+      // "10" is the 180° misread of "01": the chapter's first tab resolves to
+      // the only sub-10 candidate, then every reversed repeat is a no-op.
+      unitTab(1, "10"),
+      head(1, "alpha", "阿尔法"),
+      unitTab(2, "01"),
+      head(2, "beta", "贝塔"),
+      unitTab(3, "10"),
+      head(3, "gamma", "伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units).toHaveLength(1);
+    expect(output.units[0]).toMatchObject({ unit_key: "c1.u1", unit_order: 1 });
+    expect(output.words.map((w) => w.unit_key)).toEqual(["c1.u1", "c1.u1", "c1.u1"]);
+  });
+
+  it("never opens a unit from the left-rail chapter tab digits", () => {
+    const blocks = [
+      chapterOpener(1, 1),
+      // Left-rail chapter tab pair, measured geometry (sidebar furniture).
+      makeBlock("p1.chapter.tab", 1, [0.0286, 0.7825, 0.0536, 0.8308], "Chapter"),
+      makeBlock("p1.chapter.num", 1, [0.0249, 0.8371, 0.0599, 0.8571], "02"),
+      unitTab(1, "07"),
+      head(1, "alpha", "阿尔法"),
+      unitTab(2, "07"),
+      head(2, "beta", "贝塔"),
+    ];
+    const { content, furniture } = partitionPageFurniture(blocks, DEFAULT_FURNITURE_CONFIG);
+    expect(content.map((b) => b.blockKey)).not.toContain("p1.chapter.num");
+    expect(furniture.map((b) => b.blockKey)).toContain("p1.chapter.num");
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units.map((u) => u.unit_key)).toEqual(["c1.u7"]); // not c1.u2
+  });
+
+  it("ignores rail digits after the back-matter (index) opener", () => {
+    const blocks = [
+      chapterOpener(1, 1),
+      unitTab(1, "01"),
+      head(1, "alpha", "阿尔法"),
+      // Index opener page with stray rail digits (the real index pages carry
+      // them); everything after it must be signal-inert.
+      makeBlock("p2.index.opener", 2, [0.54, 0.37, 0.68, 0.4], "索引"),
+      unitTab(2, "18"),
+      head(2, "beta", "贝塔"),
+      unitTab(3, "02"),
+      head(3, "gamma", "伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units.map((u) => u.unit_key)).toEqual(["c1.u1"]);
+    expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
+      ["alpha", "c1.u1"],
+      ["beta", "c1.u1"],
+      ["gamma", "c1.u1"],
+    ]);
+  });
+
+  it("never reads the y>=0.9 outer-edge digits (page numbers) as unit tabs", () => {
+    const blocks = [
+      chapterOpener(1, 1),
+      unitTab(1, "07"),
+      head(1, "alpha", "阿尔法"),
+      // Bottom-outer corner page number in the right rail (y0 >= 0.9).
+      makeBlock("p2.pagenum", 2, [0.9381, 0.9152, 0.9741, 0.9352], "26"),
+      head(2, "beta", "贝塔"),
+      unitTab(3, "07"),
+      head(3, "gamma", "伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.units.map((u) => u.unit_key)).toEqual(["c1.u7"]); // not c1.u26
+  });
+
+  it("opens one chapter-level unit when a chapter carries no unit signal at all", () => {
+    const blocks = [
+      chapterOpener(1, 1),
+      unitTab(1, "01"),
+      head(1, "alpha", "阿尔法"),
+      // Chapter 2: opener + entries, but the stylized tabs defeat OCR entirely
+      // (the real chapter 4). Its pages must not drain into chapter 1's unit.
+      chapterOpener(2, 2),
+      head(2, "beta", "贝塔"),
+      head(3, "gamma", "伽马"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.unitBoundaries).toEqual([
+      { unit_key: "c1.u1", unit_order: 1, title: "Unit 1", first_page: 1, last_page: 1 },
+      { unit_key: "c2.u1", unit_order: 2, title: "Chapter 2", first_page: 2, last_page: 3 },
+    ]);
+    expect(output.words.map((w) => [w.headword, w.unit_key])).toEqual([
+      ["alpha", "c1.u1"],
+      ["beta", "c2.u1"],
+      ["gamma", "c2.u1"],
+    ]);
+  });
+
+  it("fails closed when a chapter opener skips a chapter number", () => {
+    const blocks = [
+      chapterOpener(1, 1),
+      unitTab(1, "01"),
+      head(1, "alpha", "阿尔法"),
+      chapterOpener(2, 3), // chapter 2 never opened: the sequence must be contiguous
+      unitTab(2, "01"),
+      head(2, "beta", "贝塔"),
+    ];
+    expect(() => segmentStructure(assignReadingOrder(blocks), normalizeConfig())).toThrow(
+      /chapter opener/,
+    );
   });
 });

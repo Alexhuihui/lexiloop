@@ -21,13 +21,43 @@ export interface NormalizeBookConfig {
    */
   unit_title_patterns: string[];
   /**
-   * Anchored regex for the per-page side-tab number. Calibrated: every page
-   * of a unit carries its unit number as a bare 1-2 digit block in the right
-   * rail (the "Unit" word is rotated rail text and usually not OCR'd).
+   * Anchored regex for the per-page side-tab number. Calibrated on the full
+   * raster: every odd printed page of a unit carries its unit number as a
+   * zero-padded two-digit thumb-tab block in the RIGHT rail (the tab slides
+   * down the rail as the unit advances; the LEFT rail carries the chapter
+   * number). Exactly two digits — every one-character rail digit in the book
+   * is a truncation misread ("6" for "19") and must not signal.
    */
   unit_tab_number_pattern: string;
   /** Right-rail x0 at or beyond which a bare number block is a unit tab. */
   unit_tab_x_min: number;
+  /**
+   * Vertical band a unit tab must start in. Calibrated: tabs slide from
+   * y0 ~= 0.18 to ~= 0.86, while the bare digits at the outer bottom corners
+   * (y0 >= 0.9) are PAGE numbers and must never signal a unit.
+   */
+  unit_tab_y_min: number;
+  unit_tab_y_max: number;
+  /**
+   * Anchored regex detecting a chapter-opener block; group 1 = chapter
+   * number. Chapter openers establish the authoritative chapter context for
+   * all following unit keys.
+   */
+  chapter_opener_pattern: string;
+  /**
+   * A chapter-opener candidate must start at or above this y. Calibrated:
+   * real openers sit at y0 ~= 0.20, while the contents page's chapter lines
+   * start at y0 >= 0.25 and must never open a chapter.
+   */
+  chapter_opener_y_max: number;
+  /** Anchored regexes detecting the back-matter (index) opener block. */
+  back_matter_patterns: string[];
+  /**
+   * A back-matter marker must start at or above this y: the index opener sits
+   * mid-page (y0 ~= 0.37) while the contents page's index line sits at the
+   * bottom (y0 ~= 0.87) and must not start back matter.
+   */
+  back_matter_y_max: number;
   /** Part-of-speech markers, longest-first matching (trailing dot included). */
   pos_markers: string[];
   /** Block prefix marking an exam-derived example, e.g. 真. */
@@ -47,8 +77,14 @@ export const LLCY_2024_NORMALIZE_CONFIG: NormalizeBookConfig = {
   book_edition: "2024",
   default_tier: "core",
   unit_title_patterns: ["^Unit\\s*(\\d+)$"],
-  unit_tab_number_pattern: "^\\d{1,2}$",
+  unit_tab_number_pattern: "^\\d{2}$",
   unit_tab_x_min: 0.9,
+  unit_tab_y_min: 0.1,
+  unit_tab_y_max: 0.9,
+  chapter_opener_pattern: "^Chapter\\s*0?([1-9])$",
+  chapter_opener_y_max: 0.25,
+  back_matter_patterns: ["^索引$"],
+  back_matter_y_max: 0.5,
   pos_markers: [
     "n.",
     "v.",
