@@ -192,6 +192,64 @@ def test_ocr_pages_filter_processes_subset(
     assert {row["page"] for row in rows} == {2}
 
 
+def test_ocr_chunked_runs_compose_into_the_full_run_artifact(
+    fixture_pdf_path: Path, tmp_path: Path
+) -> None:
+    """Chunks run in any order must compose into the single-run bytes.
+
+    The merge must sort rows by page ascending (stable within-page reading
+    order), so ``--pages 2`` followed by ``--pages 1`` is byte-equivalent to
+    one full run — chunking stays an execution detail downstream.
+    """
+    full_dir = _prepare_clean_fixture(fixture_pdf_path, tmp_path / "full")
+    _run_ocr(full_dir)
+    expected = (full_dir / "ocr.jsonl").read_bytes()
+
+    chunked_dir = _prepare_clean_fixture(fixture_pdf_path, tmp_path / "chunked")
+    _run_ocr(chunked_dir, ["--pages", "2"])
+    _run_ocr(chunked_dir, ["--pages", "1"])
+    assert (chunked_dir / "ocr.jsonl").read_bytes() == expected
+
+    rows = pdf_images.read_jsonl(chunked_dir / "ocr.jsonl")
+    pages_in_order = [row["page"] for row in rows]
+    assert pages_in_order == sorted(pages_in_order)
+    assert set(pages_in_order) == {1, 2}
+
+
+def test_ocr_chunked_rerun_replaces_rows_without_duplicates(
+    fixture_pdf_path: Path, tmp_path: Path
+) -> None:
+    """Re-running a chunk replaces exactly that chunk's rows."""
+    work_dir = _prepare_clean_fixture(fixture_pdf_path, tmp_path)
+    _run_ocr(work_dir, ["--pages", "1"])
+    after_first = (work_dir / "ocr.jsonl").read_bytes()
+
+    _run_ocr(work_dir, ["--pages", "1"])
+    rows = pdf_images.read_jsonl(work_dir / "ocr.jsonl")
+    assert (work_dir / "ocr.jsonl").read_bytes() == after_first
+    assert {row["page"] for row in rows} == {1}
+    texts = [row["text"] for row in rows]
+    assert len(texts) == len(set(texts)), "re-run chunk must not duplicate rows"
+
+
+def test_ocr_pages_filter_first_run_without_existing_artifact_unchanged(
+    fixture_pdf_path: Path, tmp_path: Path
+) -> None:
+    """First run with --pages and no prior ocr.jsonl: fresh subset write.
+
+    The merge path only applies when ocr.jsonl already exists; the unknown-file
+    first run keeps the historical behavior (fresh write of just the chunk) and
+    leaves no temp files behind.
+    """
+    work_dir = _prepare_clean_fixture(fixture_pdf_path, tmp_path)
+    assert not (work_dir / "ocr.jsonl").exists()
+    _run_ocr(work_dir, ["--pages", "2"])
+    rows = pdf_images.read_jsonl(work_dir / "ocr.jsonl")
+    assert {row["page"] for row in rows} == {2}
+    leftovers = [p.name for p in work_dir.iterdir() if p.name.startswith(".ocr.jsonl.tmp")]
+    assert leftovers == []
+
+
 def test_ocr_paddle_engine_unavailable_is_machine_readable(
     fixture_pdf_path: Path,
     tmp_path: Path,

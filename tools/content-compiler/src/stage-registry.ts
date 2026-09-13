@@ -37,14 +37,18 @@ import {
   sha256File,
   validateCleanArtifacts,
   validateExtractArtifacts,
+  type CleanRecord,
   type SpawnPythonFn,
 } from "./media";
 import {
   DEFAULT_OCR_CONFIG_PATH,
+  OCR_JSONL,
+  OcrBlockRecordSchema,
   ocrJsonlHash,
   ocrSpawnArgs,
   toNormalizeInputBlocks,
   validateOcrArtifacts,
+  type OcrBlockRecord,
 } from "./ocr-adapter";
 import { assignReadingOrder } from "./normalize/reading-order";
 import { LLCY_2024_NORMALIZE_CONFIG } from "./normalize/config";
@@ -348,17 +352,41 @@ export interface MediaStageOptions {
   rulePath?: string;
   /** Versioned PP-StructureV3 config for LAYOUT_OCR. */
   ocrConfigPath?: string;
+  /**
+   * LAYOUT_OCR chunk size: pages per worker spawn. The full book is never
+   * OCR'd in one spawn (a 440-page PaddleOCR run takes hours); missing pages
+   * are filled chunk-by-chunk with per-chunk timeouts. Default 12.
+   */
+  ocrChunkPages?: number;
+  /** Per-chunk spawn timeout (ms) for LAYOUT_OCR. Default 15 minutes. */
+  ocrChunkTimeoutMs?: number;
 }
+
+/** Default LAYOUT_OCR pages per worker spawn. */
+export const DEFAULT_OCR_CHUNK_PAGES = 12;
+/** Default per-chunk LAYOUT_OCR spawn timeout (15 minutes). */
+export const DEFAULT_OCR_CHUNK_TIMEOUT_MS = 15 * 60 * 1000;
 
 /** Fill defaults for optional media wiring; the runner is never optional. */
 export function resolveMediaStageOptions(
-  options: { privateRoot?: string; runPython?: SpawnPythonFn; rulePath?: string; ocrConfigPath?: string } = {},
+  options: {
+    privateRoot?: string;
+    runPython?: SpawnPythonFn;
+    rulePath?: string;
+    ocrConfigPath?: string;
+    ocrChunkPages?: number;
+    ocrChunkTimeoutMs?: number;
+  } = {},
 ): MediaStageOptions {
   return {
     privateRoot: options.privateRoot ?? DEFAULT_PRIVATE_ROOT,
     runPython: options.runPython ?? createPythonRunner(),
     ...(options.rulePath !== undefined ? { rulePath: options.rulePath } : {}),
     ...(options.ocrConfigPath !== undefined ? { ocrConfigPath: options.ocrConfigPath } : {}),
+    ...(options.ocrChunkPages !== undefined ? { ocrChunkPages: options.ocrChunkPages } : {}),
+    ...(options.ocrChunkTimeoutMs !== undefined
+      ? { ocrChunkTimeoutMs: options.ocrChunkTimeoutMs }
+      : {}),
   };
 }
 
@@ -555,13 +583,63 @@ export const StructureNormalizeOutputSchema = z.object({
 export type StructureNormalizeOutput = z.output<typeof StructureNormalizeOutputSchema>;
 
 /**
+ * Pages of `ocr.jsonl` considered COMPLETE for a resume: the page is in scope,
+ * rows exist for it, and every row's `page_image_sha256` matches the clean
+ * record's cleaned image hash. Anything else (missing rows, stale hashes, an
+ * unreadable artifact) counts as missing, so the reconcile-then-fill loop
+ * re-spawns exactly the pages a previous run never finished.
+ */
+async function completedOcrPages(
+  workDir: string,
+  expectedPages: readonly number[],
+  cleanByPage: ReadonlyMap<number, CleanRecord>,
+): Promise<Set<number>> {
+  let rows: OcrBlockRecord[];
+  try {
+    rows = await readJsonl(path.join(workDir, OCR_JSONL), OcrBlockRecordSchema);
+  } catch {
+    return new Set(); // no artifact yet (or unreadable): nothing counts as complete
+  }
+  const rowsByPage = new Map<number, OcrBlockRecord[]>();
+  for (const row of rows) {
+    const pageRows = rowsByPage.get(row.page) ?? [];
+    pageRows.push(row);
+    rowsByPage.set(row.page, pageRows);
+  }
+  const complete = new Set<number>();
+  for (const page of expectedPages) {
+    const clean = cleanByPage.get(page);
+    const pageRows = rowsByPage.get(page);
+    if (!clean || !pageRows || pageRows.length === 0) continue;
+    if (pageRows.every((row) => row.page_image_sha256 === clean.cleaned_image_sha256)) {
+      complete.add(page);
+    }
+  }
+  return complete;
+}
+
+/**
  * LAYOUT_OCR: runs the versioned PP-StructureV3 worker over every cleaned
  * page image, then validates `ocr.jsonl` — schema, source/page-image hash
  * chain, and the private raw-text evidence — before the ledger may advance.
+ *
+ * Execution is chunked and resumable: the stage first reconciles the existing
+ * `ocr.jsonl` against the cleaned pages, then spawns the worker once per
+ * chunk of MISSING pages (`--pages`, per-chunk timeout) — the worker merges
+ * each chunk into the artifact, so a 440-page book survives spawn timeouts
+ * and retries only process what is actually missing. The final
+ * `validateOcrArtifacts` run covers every page exactly as a single-spawn run
+ * would: chunking changes nothing about the output schema or hashes.
  */
 export function createLayoutOcrStage(options: MediaStageOptions): AnyStage {
   const { runPython } = options;
   const ocrConfigPath = options.ocrConfigPath ?? DEFAULT_OCR_CONFIG_PATH;
+  const chunkPages =
+    options.ocrChunkPages ?? DEFAULT_OCR_CHUNK_PAGES;
+  if (!Number.isInteger(chunkPages) || chunkPages < 1) {
+    throw new Error(`ocrChunkPages must be a positive integer, got ${chunkPages}`);
+  }
+  const chunkTimeoutMs = options.ocrChunkTimeoutMs ?? DEFAULT_OCR_CHUNK_TIMEOUT_MS;
   const configVersion = "1";
   return {
     name: "LAYOUT_OCR",
@@ -581,9 +659,19 @@ export function createLayoutOcrStage(options: MediaStageOptions): AnyStage {
       try {
         const media = mediaConfig(ctx);
         const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
-        await runPython(ocrSpawnArgs(ocrConfigPath, workDir));
-        // The OCR chain is anchored in the cleaned pages: validate both.
+        // The OCR chain is anchored in the cleaned pages: validate them first
+        // (reconciliation needs each page's cleaned image hash), then fill
+        // only the pages the existing artifact does not already cover.
         const cleanRecords = await validateCleanArtifacts(workDir, ctx.sourceHash, media.pages);
+        const cleanByPage = new Map(cleanRecords.map((record) => [record.page, record]));
+        const complete = await completedOcrPages(workDir, media.pages, cleanByPage);
+        const missingPages = media.pages.filter((page) => !complete.has(page)).sort((a, b) => a - b);
+        for (let index = 0; index < missingPages.length; index += chunkPages) {
+          const chunk = missingPages.slice(index, index + chunkPages);
+          await runPython(ocrSpawnArgs(ocrConfigPath, workDir, chunk), {
+            timeoutMs: chunkTimeoutMs,
+          });
+        }
         const records = await validateOcrArtifacts(workDir, ctx.sourceHash, cleanRecords);
         const blockCounts = new Map<number, number>();
         for (const record of records) {
@@ -1798,6 +1886,8 @@ export function getProductionStages(
     runPython?: SpawnPythonFn;
     rulePath?: string;
     ocrConfigPath?: string;
+    ocrChunkPages?: number;
+    ocrChunkTimeoutMs?: number;
     cardsConfigPath?: string;
     ttsConfigPath?: string;
   } = {},

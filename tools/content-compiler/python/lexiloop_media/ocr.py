@@ -286,6 +286,50 @@ def _decode_image(path: Path) -> "np.ndarray":
     return image
 
 
+def _write_jsonl_atomic(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+    """Write JSONL through a temp file in the same directory, then replace.
+
+    A crashed worker must never leave a half-written ``ocr.jsonl`` behind: the
+    chunked-resume merge reads this artifact, so it is only ever swapped in
+    whole via ``os.replace``.
+    """
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        pdf_images.write_jsonl(tmp_path, rows)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _merge_or_write_records(
+    ocr_jsonl_path: Path, records: list[OcrBlockRecord], pages_filter: set[int] | None
+) -> None:
+    """Write ``ocr.jsonl``, merging into an existing artifact when chunked.
+
+    Full runs (no ``--pages``) rewrite the artifact from scratch exactly as
+    before. Chunked runs (``--pages`` given) whose artifact already exists
+    MERGE: drop the rows of the pages being re-run (so re-running a chunk
+    replaces its rows without duplicates), append this run's records, and sort
+    by page ascending — Python's sort is stable, so the within-page reading
+    order is preserved and the composed artifact is byte-identical to a
+    single full run over the same pages. Existing rows are re-validated
+    against the strict record model: a corrupt artifact fails closed instead
+    of poisoning the merge.
+    """
+    if pages_filter is not None and ocr_jsonl_path.is_file():
+        existing = (
+            OcrBlockRecord.model_validate(row)
+            for row in pdf_images.read_jsonl(ocr_jsonl_path)
+        )
+        merged = [record for record in existing if record.page not in pages_filter]
+        merged.extend(records)
+        merged.sort(key=lambda record: record.page)
+        _write_jsonl_atomic(ocr_jsonl_path, [record.model_dump() for record in merged])
+        return
+    pdf_images.write_jsonl(ocr_jsonl_path, [record.model_dump() for record in records])
+
+
 def run_ocr(
     clean_rows: list[dict[str, Any]],
     config: OcrConfig,
@@ -358,9 +402,7 @@ def run_ocr(
     if pages_filter is not None and not page_summaries:
         raise ValueError(f"no cleaned pages matched: {sorted(pages_filter)}")
 
-    pdf_images.write_jsonl(
-        out_dir / "ocr.jsonl", [record.model_dump() for record in records]
-    )
+    _merge_or_write_records(out_dir / "ocr.jsonl", records, pages_filter)
     return {
         "ok": True,
         "engine": engine,

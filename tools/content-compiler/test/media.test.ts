@@ -45,6 +45,7 @@ import {
 } from "../src/stage-registry";
 import type { SpawnPythonFn } from "../src/media";
 import type { AnyStage } from "../src/stage";
+import { ocrSpawnArgs } from "../src/ocr-adapter";
 
 const execFile = promisify(execFileCb);
 
@@ -232,6 +233,18 @@ describe("media bridge", () => {
     });
   }, 30_000);
 
+  it("accepts a per-call timeout override that wins over the runner default", async () => {
+    // Runner-level timeout (5s) is longer than the sleep; only the per-call
+    // override (300ms) can fire — if it were ignored the probe would resolve.
+    const runPython = createPythonRunner({ timeoutMs: 5_000 });
+    await expect(
+      runPython(["selftest-sleep", "--seconds", "2"], { timeoutMs: 300 }),
+    ).rejects.toMatchObject({
+      code: "MEDIA_TIMEOUT",
+      message: expect.stringContaining("timed out after 300ms"),
+    });
+  }, 30_000);
+
   it("surfaces the worker's JSON error code from stderr instead of a generic code", async () => {
     const dir = await makeTempDir("lexiloop-stderr-json-");
     const runPython = createPythonRunner();
@@ -240,6 +253,29 @@ describe("media bridge", () => {
       name: "MediaSpawnError",
     });
   }, 120_000);
+});
+
+describe("ocr spawn arguments", () => {
+  const expectedBase = (workDir: string) => [
+    "ocr",
+    "--clean-jsonl", path.join(workDir, "clean.jsonl"),
+    "--config", path.resolve("/cfg/ocr.json"),
+    "--out-dir", workDir,
+  ];
+
+  it("appends --pages with the comma-joined chunk when a page filter is present", () => {
+    expect(ocrSpawnArgs("/cfg/ocr.json", "/work/dir", [3, 1, 2])).toEqual([
+      ...expectedBase("/work/dir"),
+      "--pages", "3,1,2",
+    ]);
+  });
+
+  it("omits --pages entirely without a filter (full-run contract unchanged)", () => {
+    // An empty list must also omit the flag: `--pages ""` would disable the
+    // filter on the worker side and silently trigger a FULL re-run.
+    expect(ocrSpawnArgs("/cfg/ocr.json", "/work/dir")).toEqual(expectedBase("/work/dir"));
+    expect(ocrSpawnArgs("/cfg/ocr.json", "/work/dir", [])).toEqual(expectedBase("/work/dir"));
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -58,9 +58,22 @@ export function rawTextRelativePath(page: number): string {
   return `ocr-raw/page-${String(page).padStart(4, "0")}.txt`;
 }
 
-/** Argument array for `lexiloop_media ocr` on a per-source work directory. */
-export function ocrSpawnArgs(ocrConfigPath: string, workDir: string): string[] {
-  return [
+/**
+ * Argument array for `lexiloop_media ocr` on a per-source work directory.
+ *
+ * `pages` scopes the spawn to a chunk of the missing pages (chunked resumable
+ * OCR). An empty/undefined list omits the flag entirely: the worker treats
+ * `--pages ""` as no filter, which would silently re-run the whole book, so
+ * the flag is only ever appended with a non-empty chunk. The worker merges a
+ * chunked run into an existing `ocr.jsonl` (replacing the chunk's rows), so
+ * consecutive chunk spawns compose into one artifact.
+ */
+export function ocrSpawnArgs(
+  ocrConfigPath: string,
+  workDir: string,
+  pages?: readonly number[],
+): string[] {
+  const args = [
     "ocr",
     "--clean-jsonl",
     join(workDir, "clean.jsonl"),
@@ -69,6 +82,10 @@ export function ocrSpawnArgs(ocrConfigPath: string, workDir: string): string[] {
     "--out-dir",
     workDir,
   ];
+  if (pages !== undefined && pages.length > 0) {
+    args.push("--pages", pages.join(","));
+  }
+  return args;
 }
 
 /**

@@ -39,7 +39,20 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // Spawning (argument arrays only — never shell strings)
 // ---------------------------------------------------------------------------
 
-export type SpawnPythonFn = (args: readonly string[]) => Promise<{ stdout: string }>;
+/** Per-call overrides for a single Python spawn. */
+export interface SpawnCallOptions {
+  /**
+   * Timeout for THIS spawn in milliseconds; wins over the runner-level
+   * `timeoutMs`. Long-running workers (e.g. a full-book OCR chunk) raise this
+   * per call instead of growing the global default for every spawn.
+   */
+  timeoutMs?: number;
+}
+
+export type SpawnPythonFn = (
+  args: readonly string[],
+  callOptions?: SpawnCallOptions,
+) => Promise<{ stdout: string }>;
 
 export class MediaSpawnError extends Error {
   readonly code: string;
@@ -71,8 +84,11 @@ export interface PythonRunnerOptions {
 export function createPythonRunner(options: PythonRunnerOptions = {}): SpawnPythonFn {
   const pythonBin = options.pythonBin ?? process.env.LEXILOOP_PYTHON ?? "uv";
   const cwd = options.cwd ?? REPO_ROOT;
-  const timeoutMs = options.timeoutMs ?? 10 * 60 * 1000;
-  return async (args) => {
+  const defaultTimeoutMs = options.timeoutMs ?? 10 * 60 * 1000;
+  return async (args, callOptions) => {
+    // The per-call override wins: one long worker (an OCR chunk over a
+    // full-book slice) must not force raising the default for every spawn.
+    const timeoutMs = callOptions?.timeoutMs ?? defaultTimeoutMs;
     const moduleArgs = ["-m", "lexiloop_media", ...args];
     const argv =
       pythonBin === "uv" ? ["uv", "run", "python", ...moduleArgs] : [pythonBin, ...moduleArgs];

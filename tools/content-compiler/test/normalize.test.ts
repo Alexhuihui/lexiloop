@@ -10,6 +10,7 @@
  * chaining, resume-skip, and packet-gated normalization.
  */
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -42,11 +43,14 @@ import {
 import {
   createLayoutOcrStage,
   createStructureNormalizeStage,
+  LayoutOcrOutputSchema,
   type MediaStageOptions,
 } from "../src/stage-registry";
 import { createFileLedger } from "../src/ledger";
 import { silentLogger } from "../src/logging";
 import { runPipeline } from "../src/pipeline";
+import { MediaSpawnError, type SpawnPythonFn } from "../src/media";
+import type { StageRunContext } from "../src/stage";
 import { ingestResult, loadQueue } from "../src/agents/visual-ocr";
 
 // ---------------------------------------------------------------------------
@@ -831,6 +835,276 @@ describe("LAYOUT_OCR + STRUCTURE_NORMALIZE stages", () => {
     expect(second.status).toBe("BLOCKED");
     expect(second.results.map((r) => r.status)).toEqual(["SKIPPED", "BLOCKED"]);
     expect(second.results[1]!.error_code).toBe("DANGLING_UNIT_REFERENCE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LAYOUT_OCR chunked resumable execution: the worker is spawned once per chunk
+// of missing pages (`--pages`), so a 440-page book never needs one spawn to
+// cover the whole OCR in a single timeout window. Reconciliation reads the
+// existing ocr.jsonl first: a page counts as complete only when rows exist for
+// it and every row's page_image_sha256 matches the clean record, so retries
+// after a mid-chunk failure re-spawn exactly the missing pages. The fake
+// worker below emulates the Python merge (drop re-run pages, append, stable
+// page sort), so chunked composition stays byte-equivalent to a full run.
+// ---------------------------------------------------------------------------
+
+describe("LAYOUT_OCR chunked resumable OCR", () => {
+  let workDir = ""; // private root: holds work/<source-hash> like production
+  let sourceDir = ""; // the per-source work directory for this fixture
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  });
+
+  function sha256(data: Buffer | string): string {
+    return createHash("sha256").update(data).digest("hex");
+  }
+
+  /** Seed clean.jsonl + cleaned page images for the given pages. */
+  async function seedCleanPages(pages: number[]): Promise<void> {
+    workDir = await mkdtemp(path.join(tmpdir(), "ocr-chunk-"));
+    tempDirs.push(workDir);
+    sourceDir = path.join(workDir, "work", SOURCE_HASH);
+    const rows: unknown[] = [];
+    for (const page of pages) {
+      const imageBytes = Buffer.from(`cleaned-${page}`);
+      const rel = `pages-clean/page-${String(page).padStart(4, "0")}.cleaned.png`;
+      await mkdir(path.dirname(path.join(sourceDir, rel)), { recursive: true });
+      await writeFile(path.join(sourceDir, rel), imageBytes);
+      rows.push({
+        source_sha256: SOURCE_HASH,
+        page,
+        rule_version: 3,
+        original_image_path: `pages/page-${String(page).padStart(4, "0")}.original.png`,
+        original_image_sha256: sha256(Buffer.from(`original-${page}`)),
+        cleaned_image_sha256: sha256(imageBytes),
+        cleaned_image_path: rel,
+        mask_bounds: null,
+        region_names: [],
+        changed_pixels: 12,
+        changed_pixels_outside: 0,
+        body_overlap_detected: false,
+      });
+    }
+    await writeFile(
+      path.join(sourceDir, "clean.jsonl"),
+      rows.map((row) => JSON.stringify(row)).join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  function cleanedImageHash(page: number): string {
+    return sha256(Buffer.from(`cleaned-${page}`));
+  }
+
+  /** One deterministic OCR row (two blocks per page, in reading order). */
+  function ocrRow(page: number, index: number): { page: number; text: string } & Record<string, unknown> {
+    const text = `page ${page} block ${index} 词块`;
+    return {
+      schema_version: 1,
+      pipeline: "PP-StructureV3",
+      pipeline_version: "3.0.0",
+      model_version: "pp-structurev3-test",
+      config_version: 1,
+      source_sha256: SOURCE_HASH,
+      page,
+      page_image_sha256: cleanedImageHash(page),
+      bbox: [0.1, 0.1 + index * 0.05, 0.4, 0.14 + index * 0.05] as const,
+      layout_label: "text",
+      text,
+      confidence: 0.95,
+      source_raw_ref_hash: sha256(text),
+    };
+  }
+
+  function chunkPages(args: readonly string[]): number[] {
+    const index = args.indexOf("--pages");
+    return index === -1 ? [] : (args[index + 1] ?? "").split(",").map(Number);
+  }
+
+  /** Fake worker: records spawns and merges chunk pages like the Python worker. */
+  function makeFakeOcrWorker(options: { failPages?: ReadonlySet<number> } = {}) {
+    const calls: Array<{ args: string[]; timeoutMs?: number }> = [];
+    const runner: SpawnPythonFn = async (args, callOptions) => {
+      calls.push({
+        args: [...args],
+        ...(callOptions?.timeoutMs !== undefined ? { timeoutMs: callOptions.timeoutMs } : {}),
+      });
+      const chunk = chunkPages(args);
+      if (options.failPages !== undefined && chunk.some((page) => options.failPages!.has(page))) {
+        throw new MediaSpawnError("MEDIA_TIMEOUT", "fake chunk timed out", null, "");
+      }
+      await emulateOcrMerge(chunk);
+      return { stdout: `${JSON.stringify({ ok: true })}\n` };
+    };
+    return { calls, runner };
+  }
+
+  /** Emulate the Python merge: drop re-run pages, append rows, stable page sort. */
+  async function emulateOcrMerge(chunk: number[]): Promise<void> {
+    const ocrPath = path.join(sourceDir, "ocr.jsonl");
+    const existing = existsSync(ocrPath)
+      ? (await readFile(ocrPath, "utf8"))
+          .split("\n")
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as { page: number })
+      : [];
+    const kept = existing.filter((row) => !chunk.includes(row.page));
+    const fresh = chunk.map((page) => [ocrRow(page, 0), ocrRow(page, 1)]).flat();
+    const merged = [...kept, ...fresh].sort((a, b) => a.page - b.page);
+    await mkdir(path.join(sourceDir, "ocr-raw"), { recursive: true });
+    for (const page of chunk) {
+      const texts = fresh
+        .filter((row) => row.page === page)
+        .map((row) => String(row.text));
+      await writeFile(
+        path.join(sourceDir, `ocr-raw/page-${String(page).padStart(4, "0")}.txt`),
+        texts.join("\n") + "\n",
+        "utf8",
+      );
+    }
+    await writeFile(
+      ocrPath,
+      merged.map((row) => JSON.stringify(row)).join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  function stageContext(pages: number[]): StageRunContext {
+    return {
+      runId: "ocr-chunk-test",
+      sourceHash: SOURCE_HASH,
+      config: { media: { sourcePath: "unused.pdf", pages, dpi: 300 } },
+      ledger: createFileLedger({ directory: path.join(workDir, "ledger") }),
+      logger: silentLogger,
+      upstream: null,
+    };
+  }
+
+  function makeStage(runner: SpawnPythonFn, chunkOptions: Partial<MediaStageOptions> = {}) {
+    return createLayoutOcrStage({
+      privateRoot: workDir,
+      runPython: runner,
+      ...chunkOptions,
+    });
+  }
+
+  function runPipelineOnce(stages: unknown, pages: number[]) {
+    return runPipeline(
+      stages as never,
+      createFileLedger({ directory: path.join(workDir, "ledger") }),
+      {
+        sourceHash: SOURCE_HASH,
+        config: { media: { sourcePath: "unused.pdf", pages, dpi: 300 } },
+        logger: silentLogger,
+      },
+    );
+  }
+
+  it("chunks the missing pages with --pages lists and forwards the per-chunk timeout", async () => {
+    const pages = [1, 2, 3, 4, 5];
+    await seedCleanPages(pages);
+    const { calls, runner } = makeFakeOcrWorker();
+    const stage = makeStage(runner, { ocrChunkPages: 2, ocrChunkTimeoutMs: 42_000 });
+
+    const output = LayoutOcrOutputSchema.parse(await stage.run(undefined, stageContext(pages)));
+
+    expect(output.pages.map((p) => p.page)).toEqual(pages);
+    expect(calls.map((call) => chunkPages(call.args))).toEqual([[1, 2], [3, 4], [5]]);
+    expect(calls.map((call) => call.timeoutMs)).toEqual([42_000, 42_000, 42_000]);
+  });
+
+  it("applies the default chunk size of 12 pages and 15-minute per-chunk timeout", async () => {
+    const pages = Array.from({ length: 13 }, (_, index) => index + 1);
+    await seedCleanPages(pages);
+    const { calls, runner } = makeFakeOcrWorker();
+    const stage = makeStage(runner);
+
+    await stage.run(undefined, stageContext(pages));
+
+    expect(calls.map((call) => chunkPages(call.args))).toEqual([
+      Array.from({ length: 12 }, (_, index) => index + 1),
+      [13],
+    ]);
+    expect(calls.map((call) => call.timeoutMs)).toEqual([
+      15 * 60 * 1000,
+      15 * 60 * 1000,
+    ]);
+  });
+
+  it("spawns nothing when ocr.jsonl already covers every page with matching hashes", async () => {
+    const pages = [1, 2, 3];
+    await seedCleanPages(pages);
+    const first = makeFakeOcrWorker();
+    await makeStage(first.runner).run(undefined, stageContext(pages));
+    expect(first.calls).toHaveLength(1);
+
+    const second = makeFakeOcrWorker();
+    const output = LayoutOcrOutputSchema.parse(
+      await makeStage(second.runner).run(undefined, stageContext(pages)),
+    );
+
+    expect(second.calls).toEqual([]);
+    expect(output.pages.map((p) => p.page)).toEqual(pages);
+  });
+
+  it("spawns only chunks for the missing pages when some pages are complete", async () => {
+    const pages = [1, 2, 3];
+    await seedCleanPages(pages);
+    // Page 1 complete; page 2 carries stale rows whose image hash no longer
+    // matches the clean record; page 3 has no rows at all.
+    const stale = { ...ocrRow(2, 0), page_image_sha256: "a".repeat(64) };
+    const rows = [ocrRow(1, 0), ocrRow(1, 1), stale];
+    await mkdir(path.join(sourceDir, "ocr-raw"), { recursive: true });
+    await writeFile(
+      path.join(sourceDir, "ocr-raw/page-0001.txt"),
+      "page 1 block 0 词块\npage 1 block 1 词块\n",
+      "utf8",
+    );
+    await writeFile(
+      path.join(sourceDir, "ocr.jsonl"),
+      rows.map((row) => JSON.stringify(row)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const { calls, runner } = makeFakeOcrWorker();
+    const output = LayoutOcrOutputSchema.parse(
+      await makeStage(runner).run(undefined, stageContext(pages)),
+    );
+
+    expect(calls.map((call) => chunkPages(call.args))).toEqual([[2, 3]]);
+    expect(output.pages.map((p) => p.page)).toEqual(pages);
+  });
+
+  it("resumes after a mid-chunk failure and re-spawns only the remainder", async () => {
+    const pages = [1, 2, 3, 4];
+    await seedCleanPages(pages);
+    const chunkOptions = { ocrChunkPages: 2, ocrChunkTimeoutMs: 42_000 };
+    const failing = makeFakeOcrWorker({ failPages: new Set([3, 4]) });
+    const firstStage = makeStage(failing.runner, chunkOptions);
+
+    const first = await runPipelineOnce([firstStage], pages);
+    expect(first.status).toBe("FAILED");
+    expect(first.results[0]!.error_code).toBe("MEDIA_TIMEOUT");
+    expect(failing.calls.map((call) => chunkPages(call.args))).toEqual([[1, 2], [3, 4]]);
+
+    // Retry with a healthy worker: the reconcile step re-spawns exactly the
+    // pages the failed run never completed.
+    const retry = makeFakeOcrWorker();
+    const retryStage = makeStage(retry.runner, chunkOptions);
+    const report = await runPipelineOnce([retryStage], pages);
+    expect(report.status).toBe("COMPLETED");
+    expect(retry.calls.map((call) => chunkPages(call.args))).toEqual([[3, 4]]);
+
+    // Composition equivalence: the merged artifact must be byte-identical to
+    // a single full OCR run over the same pages.
+    const mergedArtifact = await readFile(path.join(sourceDir, "ocr.jsonl"), "utf8");
+    await seedCleanPages(pages);
+    const single = makeFakeOcrWorker();
+    await makeStage(single.runner).run(undefined, stageContext(pages));
+    expect(await readFile(path.join(sourceDir, "ocr.jsonl"), "utf8")).toBe(mergedArtifact);
   });
 });
 
