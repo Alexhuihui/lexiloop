@@ -424,6 +424,21 @@ function parsePageList(value: string): number[] {
   return pages;
 }
 
+/** Comma-separated unit-key list for the cards/release target scope. */
+function parseUnitList(value: string): string[] {
+  const units = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  if (units.length === 0) {
+    throw new Error(`--units must be a comma-separated list of unit keys`);
+  }
+  if (new Set(units).size !== units.length) {
+    throw new Error(`--units contains duplicate unit keys`);
+  }
+  return units;
+}
+
 async function resolveMediaSource(
   source: string | undefined,
   sourceHashOption: string | undefined,
@@ -868,6 +883,8 @@ interface CardsGenerateOptions {
   sourceHash: string;
   privateRoot?: string;
   config?: string;
+  /** Optional comma-separated target unit scope (spec 5.6); default: all. */
+  units?: string;
 }
 
 async function executeCardsGenerate(deps: CliDeps, options: CardsGenerateOptions): Promise<void> {
@@ -879,9 +896,11 @@ async function executeCardsGenerate(deps: CliDeps, options: CardsGenerateOptions
     const workDir = workDirFor(deps, options.privateRoot, sourceHash);
     const configOption = options.config ?? DEFAULT_CARDS_CONFIG_PATH;
     const cardsConfigPath = path.isAbsolute(configOption) ? configOption : path.join(REPO_ROOT, configOption);
+    const units = options.units !== undefined ? parseUnitList(options.units) : undefined;
     const stage = createCardGenerateStage({
       privateRoot: path.resolve(options.privateRoot ?? path.join(deps.workRoot, "..")),
       cardsConfigPath,
+      ...(units !== undefined ? { units } : {}),
     });
     const ledger = deps.createLedger(sourceHash);
     await withWorkLock(deps, workDir, async () => {
@@ -1182,6 +1201,8 @@ interface ReleasePackageOptions {
   privateRoot?: string;
   previousRelease?: string;
   metadata?: string;
+  /** Optional comma-separated declared target unit scope (spec 5.6). */
+  units?: string;
 }
 
 interface ReleaseVerifyOptions {
@@ -1244,10 +1265,12 @@ async function executeReleasePackage(deps: CliDeps, options: ReleasePackageOptio
     if (options.metadata !== undefined) {
       metadata = ReleaseMetadataConfigSchema.parse(JSON.parse(await readFile(options.metadata, "utf8")));
     }
+    const units = options.units !== undefined ? parseUnitList(options.units) : undefined;
     const stage = createReleasePackageStage({
       privateRoot,
       ...(metadata !== undefined ? { metadata } : {}),
       ...(options.previousRelease !== undefined ? { previousReleaseId: options.previousRelease } : {}),
+      ...(units !== undefined ? { units } : {}),
     });
     const ledger = deps.createLedger(sourceHash);
     const upstreamEntry = await ledger.load("AUDIO_VALIDATE");
@@ -1564,6 +1587,10 @@ export function buildCli(deps: CliDeps): Command {
     .description("derive card definitions from fully-passed units and write cards.jsonl")
     .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
     .option("--config <path>", "versioned card rules JSON", DEFAULT_CARDS_CONFIG_PATH)
+    .option(
+      "--units <list>",
+      "comma-separated target unit scope: only these units are carded and card-checked (default: all units)",
+    )
     .option("--private-root <dir>", "private root holding work/<source-hash> directories")
     .action(async (options: CardsGenerateOptions) => {
       await executeCardsGenerate(deps, options);
@@ -1615,6 +1642,10 @@ export function buildCli(deps: CliDeps): Command {
     .requiredOption("--source-hash <hash>", "source content hash (PDF SHA-256)")
     .option("--private-root <dir>", "private root holding work/ and releases/ directories")
     .option("--previous-release <id>", "previous compatible release recorded in rollback.json")
+    .option(
+      "--units <list>",
+      "comma-separated declared target unit scope recorded in the manifest (default: all units)",
+    )
     .option("--metadata <path>", "release metadata JSON (schema/prompt/model ids)", )
     .action(async (options: ReleasePackageOptions) => {
       await executeReleasePackage(deps, options);

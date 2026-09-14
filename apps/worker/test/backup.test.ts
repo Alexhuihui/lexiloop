@@ -251,6 +251,7 @@ async function writeBundle(bundleDir: string, releaseId: string, options: Backup
     created_at: new Date(NOW - 5 * DAY).toISOString(),
     book: { book_key: "bk-1", edition: "1st" },
     source_pdf_sha256: "a".repeat(64),
+    target_units: ["u-1"],
     config_versions: {
       schema_version: "schema-v1",
       watermark_rules_version: "1",

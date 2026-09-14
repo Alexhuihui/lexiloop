@@ -19,6 +19,9 @@
  * refused); every target Unit's deterministic validation report must be
  * PASSED (BLOCKED units can never enter a release); 100% of the audio
  * manifest's assets must exist on disk with matching hashes and gate results.
+ * A declared target unit scope (spec 5.6) narrows the release: manifest,
+ * unit statuses, and D1 import cover EXACTLY the scoped units — the same
+ * scope `cards generate --units` recorded, enforced by the freshness gate.
  * Provenance written into the bundle keeps only private hash references —
  * the full OCR/source text never leaves the private work directory.
  *
@@ -128,6 +131,15 @@ export type ReleasePackageOutput = z.output<typeof ReleasePackageOutputSchema>;
 export interface ReleasePackageStageOptions {
   /** Private root holding `work/<source-hash>` and `releases/<release-id>`. */
   privateRoot: string;
+  /**
+   * Declared release target unit scope (spec 5.6): when given, the bundle's
+   * manifest, unit statuses, and D1 import cover EXACTLY these units — a
+   * unit outside the scope never enters the release, so a BLOCKED unit's
+   * content cannot ship. Unknown scope keys fail closed
+   * (RELEASE_SCOPE_INVALID). Default: every unit in normalized.jsonl
+   * (unchanged behavior).
+   */
+  units?: readonly string[];
   /** Deployment metadata for the manifest (defaults to the repo constants). */
   metadata?: ReleaseMetadataConfig;
   /** Previous compatible release recorded in rollback.json, when one exists. */
@@ -634,6 +646,7 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
         sourceHash: ctx.sourceHash,
         metadata: options.metadata ?? null,
         previous_release_id: options.previousReleaseId ?? null,
+        units: options.units ? [...options.units].sort() : null,
         artifacts: await artifactHashes(workDir),
         upstream: ctx.upstream?.outputHash ?? null,
       });
@@ -678,9 +691,30 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
       const workDir = workDirectoryFor(privateRoot, ctx.sourceHash);
 
       // -- 3. Deterministic validation reports: BLOCKED can never ship. -----
+      // Declared release target scope (spec 5.6): the bundle covers exactly
+      // the scoped units; unknown scope keys fail closed. Default: every
+      // unit recovered by STRUCTURE_NORMALIZE (unchanged behavior).
       const content = await parseNormalizedRows(workDir);
       const cards = await parseCards(workDir);
-      const unitKeys = content.units.map((unit) => unit.unit_key);
+      const allUnitKeys = content.units.map((unit) => unit.unit_key);
+      if (options.units !== undefined) {
+        if (options.units.length === 0) {
+          throw new StageError(
+            "RELEASE_SCOPE_INVALID",
+            "declared release target scope is empty; omit --units to target every unit",
+          );
+        }
+        const unknown = [...new Set(options.units)].filter((unitKey) => !allUnitKeys.includes(unitKey));
+        if (unknown.length > 0) {
+          throw new StageError(
+            "RELEASE_SCOPE_INVALID",
+            `declared release target scope references unknown unit(s): ${unknown.join(",")} ` +
+              `(recovered units: ${allUnitKeys.join(",")})`,
+          );
+        }
+      }
+      const scopeSet = options.units !== undefined ? new Set(options.units) : null;
+      const unitKeys = scopeSet ? allUnitKeys.filter((unitKey) => scopeSet.has(unitKey)) : allUnitKeys;
       const unitStatuses: Array<z.output<typeof UnitValidationReport>> = [];
       for (const unitKey of unitKeys) {
         const reportPath = path.join(workDir, "validation", `${unitKey}.json`);
@@ -741,7 +775,12 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
 
       // -- 5. Audio links: derived with the same planner as the TTS gate. ---
       const ttsConfig = await readTtsConfig(ttsConfigPath);
-      const workloads = await loadUnitWorkloads(workDir);
+      // Scoped releases plan audio for the scoped workloads only, so links
+      // (and the audio rows imported below) cover exactly the target scope.
+      const workloads = await loadUnitWorkloads(
+        workDir,
+        scopeSet !== null ? { units: [...scopeSet] } : {},
+      );
       const plan = buildTtsPlan({ items: collectTtsItems(workloads), config: ttsConfig, existing: audioRows });
       const audioLinks: ContentRows["audioLinks"] = [];
       for (const entry of plan.entries) {
@@ -805,6 +844,7 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
       const explanationCounts = countBy(explanations);
 
       const unitEntries = [...content.units]
+        .filter((unit) => scopeSet === null || scopeSet.has(unit.unit_key))
         .sort((a, b) => a.unit_order - b.unit_order || (a.unit_key < b.unit_key ? -1 : 1))
         .map((unit) => ({
           unit_key: unit.unit_key,
@@ -862,15 +902,32 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
       if (!createdAt) {
         throw new StageError("RELEASE_INPUT_INVALID", "AUDIO_VALIDATE ledger entry has no timestamps");
       }
+      // Content rows cover exactly the declared target scope (spec 5.6): a
+      // unit outside the scope — BLOCKED or simply not declared — never
+      // enters the D1 import. Senses/phrases/examples hang off scoped words.
+      const wordInScope = (wordKey: string): boolean => {
+        if (scopeSet === null) return true;
+        const unitKey = unitByWord.get(wordKey);
+        return unitKey !== undefined && scopeSet.has(unitKey);
+      };
+      // Scoped releases import only the audio the scoped links require; the
+      // full manifest stays the validated r2/audio-manifest.jsonl artifact.
+      const linkedAssetKeys = new Set(audioLinks.map((link) => link.asset_key));
+      const importedAudioRows =
+        scopeSet === null ? audioRows : audioRows.filter((row) => linkedAssetKeys.has(row.object_key));
       const contentRows: ContentRows = {
         books: [content.book],
-        units: content.units.map((unit) => ({ ...unit })),
-        words: content.words.map((word) => ({ ...word })),
-        senses: content.senses.map((sense) => ({ ...sense })),
-        phrases: content.phrases.map((phrase) => ({ ...phrase })),
-        examples: content.examples.map((example) => ({ ...example })),
-        explanations,
-        audioAssets: audioRows.map((row) => ({
+        units: content.units
+          .filter((unit) => scopeSet === null || scopeSet.has(unit.unit_key))
+          .map((unit) => ({ ...unit })),
+        words: content.words
+          .filter((word) => scopeSet === null || scopeSet.has(word.unit_key))
+          .map((word) => ({ ...word })),
+        senses: content.senses.filter((sense) => wordInScope(sense.word_key)).map((sense) => ({ ...sense })),
+        phrases: content.phrases.filter((phrase) => wordInScope(phrase.word_key)).map((phrase) => ({ ...phrase })),
+        examples: content.examples.filter((example) => wordInScope(example.word_key)).map((example) => ({ ...example })),
+        explanations: explanations.filter((explanation) => scopeSet === null || scopeSet.has(explanation.unit_key)),
+        audioAssets: importedAudioRows.map((row) => ({
           asset_key: row.object_key,
           content_sha256: row.sha256,
           text_hash: row.text_sha256,
@@ -931,6 +988,9 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
         created_at: createdAt,
         book: { book_key: content.book.book_key, edition: content.book.edition },
         source_pdf_sha256: ctx.sourceHash,
+        // The declared release target scope (spec 5.6): exactly the units
+        // this bundle's statuses and D1 import cover.
+        target_units: [...unitKeys].sort(),
         ...(options.previousReleaseId !== undefined ? { previous_release_id: options.previousReleaseId } : {}),
         config_versions: {
           schema_version: metadata.schema_version,
@@ -958,7 +1018,7 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
           units_blocked: unitStatuses.filter((report) => report.status === "BLOCKED").length,
           words: unitEntries.reduce((acc, unit) => acc + unit.counts.words, 0),
           cards: unitEntries.reduce((acc, unit) => acc + unit.counts.cards, 0),
-          audio_assets: audioRows.length,
+          audio_assets: importedAudioRows.length,
         },
         files,
         gates: [
@@ -994,7 +1054,7 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
         manifest_sha256: manifestSha256,
         file_count: files.length + 1,
         units: unitEntries.length,
-        audio_assets: audioRows.length,
+        audio_assets: importedAudioRows.length,
       } satisfies z.output<typeof ReleasePackageOutputSchema>;
     },
   };

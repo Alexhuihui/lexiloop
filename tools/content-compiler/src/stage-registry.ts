@@ -915,8 +915,9 @@ async function assessTargetUnits(
   gate: AgentGatePaths,
   options: AgentGateOptions,
   ctx: StageRunContext,
+  units?: readonly string[],
 ): Promise<Array<{ workload: UnitWorkload; assessment: UnitAssessment }>> {
-  const workloads = await loadUnitWorkloads(gate.workDir);
+  const workloads = await loadUnitWorkloads(gate.workDir, units !== undefined ? { units } : {});
   const entries = await loadSemanticQueue(gate.queueDir);
   const states = collectUnitStates(
     entries,
@@ -1254,6 +1255,14 @@ export interface CardGenerateStageOptions {
   privateRoot: string;
   /** Versioned card-rules config; defaults to `config/cards/v1.json`. */
   cardsConfigPath?: string;
+  /**
+   * Declared target unit scope (spec 5.6): when given, card generation and
+   * the every-learnable-word-has-a-card check cover ONLY these units —
+   * out-of-scope units produce no cards and are not assessed. Unknown scope
+   * keys fail closed (UNIT_SCOPE_UNKNOWN). Default: every unit in the work
+   * directory (unchanged behavior).
+   */
+  units?: readonly string[];
 }
 
 /** Read + strictly validate the versioned card rules (fail closed). */
@@ -1301,8 +1310,10 @@ function toCardStageError(err: unknown): StageError {
  * input hash covers the versioned card config plus every validated Unit
  * input — the semantic queue digest folds each packet (unit source evidence)
  * and each ingested agent result — so any config or content change re-runs
- * card generation and nothing downstream can run on stale cards. The stage
- * only passes when every target Unit exited the four agent gates as PASSED.
+ * card generation and nothing downstream can run on stale cards. A declared
+ * target unit scope folds into the hash too, so scoped and unscoped ledger
+ * entries never alias. The stage only passes when every target Unit exited
+ * the four agent gates as PASSED.
  */
 export function createCardGenerateStage(options: CardGenerateStageOptions): AnyStage {
   const cardsConfigPath = options.cardsConfigPath ?? DEFAULT_CARDS_CONFIG_PATH;
@@ -1317,6 +1328,7 @@ export function createCardGenerateStage(options: CardGenerateStageOptions): AnyS
         configVersion: CARD_GENERATE_CONFIG_VERSION,
         sourceHash: ctx.sourceHash,
         cards_config_sha256: await sha256File(cardsConfigPath),
+        units: options.units ? [...options.units].sort() : null,
         queue: await semanticQueueDigest(agentGatePaths(options, ctx.sourceHash).queueDir),
         upstream: ctx.upstream?.outputHash ?? null,
       }),
@@ -1324,9 +1336,16 @@ export function createCardGenerateStage(options: CardGenerateStageOptions): AnyS
       try {
         const gate = agentGatePaths(options, ctx.sourceHash);
         const config = await readCardsConfig(cardsConfigPath);
+        if (options.units !== undefined && options.units.length === 0) {
+          throw new StageError(
+            "CARD_SCOPE_INVALID",
+            "declared card target scope is empty; omit --units to target every unit",
+          );
+        }
         // Re-assess through the gates' own state machine: a Unit that is not
-        // passed fails the stage closed — cards never precede review.
-        const assessed = await assessTargetUnits(gate, options, ctx);
+        // passed fails the stage closed — cards never precede review. Out-of-
+        // scope units (spec 5.6 target scope) are not assessed at all.
+        const assessed = await assessTargetUnits(gate, options, ctx, options.units);
         const generated: Array<{ workload: UnitWorkload; generation: AgentGenerationOutputT }> = [];
         for (const entry of assessed) {
           const { assessment } = entry;

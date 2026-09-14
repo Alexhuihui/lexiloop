@@ -203,6 +203,8 @@ const makeManifest = () => ({
   created_at: "2026-09-10T06:00:00Z",
   book: { book_key: "llcy", edition: "2024" },
   source_pdf_sha256: sha("source.pdf"),
+  // The declared release target scope (spec 5.6): exactly the shipped units.
+  target_units: ["u01"],
   config_versions: {
     schema_version: "schema-v1",
     watermark_rules_version: "wm-v1",
@@ -479,9 +481,24 @@ describe("unit validation and release manifest (spec 5.1/5.6/5.9)", () => {
     expect(() =>
       ReleaseManifest.parse({
         ...makeManifest(),
+        target_units: ["u01", "u02"],
         units: [unit, { ...unit, unit_key: "u02", status: "BLOCKED" }],
         totals: { ...makeManifest().totals, units: 2, units_blocked: 0, words: 60, cards: 160 },
       }),
     ).toThrow();
+  });
+
+  it("parses a manifest whose declared target scope covers exactly its units", () => {
+    const manifest = ReleaseManifest.parse(makeManifest());
+    expect(manifest.target_units).toEqual(["u01"]);
+  });
+
+  it("rejects manifests whose target scope contradicts the declared units", () => {
+    // Scope naming a unit the manifest does not ship: no phantom scope.
+    expect(() => ReleaseManifest.parse({ ...makeManifest(), target_units: ["u02"] })).toThrow();
+    // Scope narrower than the declared units: no undeclared partial release.
+    expect(() => ReleaseManifest.parse({ ...makeManifest(), target_units: ["u01", "u02"] })).toThrow();
+    // Duplicate scope entries are never a deterministic declaration.
+    expect(() => ReleaseManifest.parse({ ...makeManifest(), target_units: ["u01", "u01"] })).toThrow();
   });
 });

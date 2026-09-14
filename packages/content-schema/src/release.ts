@@ -113,6 +113,12 @@ export const ReleaseManifest = z.strictObject({
   created_at: z.iso.datetime({ offset: true }),
   book: z.strictObject({ book_key: LogicalKey, edition: z.string().min(1) }),
   source_pdf_sha256: Sha256Hex,
+  /**
+   * Declared target unit scope (spec 5.6): exactly the units this release
+   * ships. A release MAY cover a subset of fully-passed units, but the
+   * manifest must state that scope and every declared unit must be PASSED.
+   */
+  target_units: z.array(LogicalKey).min(1),
   /** Previous compatible release kept for rollback, when one exists. */
   previous_release_id: z.string().min(1).optional(),
   config_versions: z.strictObject({
@@ -162,4 +168,25 @@ export const ReleaseManifest = z.strictObject({
   expectTotal("units_blocked", blocked);
   expectTotal("words", sumOf("words"));
   expectTotal("cards", sumOf("cards"));
+  // The declared target scope is binding (spec 5.6): a duplicate-free list
+  // covering exactly the declared units — never a phantom or partial scope.
+  if (new Set(manifest.target_units).size !== manifest.target_units.length) {
+    ctx.addIssue({
+      code: "custom",
+      message: "target_units must not contain duplicates",
+      path: ["target_units"],
+    });
+  }
+  const declaredKeys = manifest.units.map((unit) => unit.unit_key).sort();
+  const declaredScope = [...manifest.target_units].sort();
+  if (
+    declaredKeys.length !== declaredScope.length ||
+    declaredKeys.some((unitKey, index) => unitKey !== declaredScope[index])
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message: "target_units must cover exactly the declared units (spec 5.6: no partial units)",
+      path: ["target_units"],
+    });
+  }
 });

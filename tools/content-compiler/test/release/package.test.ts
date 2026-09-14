@@ -112,6 +112,15 @@ const UNIT = Unit.parse({
   ...provenance(12, "Unit 1 第一单元 ||RAW-OCR-UNIT||"),
 });
 
+const UNIT2 = Unit.parse({
+  unit_key: "u02",
+  book_key: "bk-llcy",
+  level: 1,
+  unit_order: 2,
+  title: "Unit 2",
+  ...provenance(20, "Unit 2 第二单元 ||RAW-OCR-UNIT2||"),
+});
+
 const WORDS = [
   Word.parse({
     word_key: "u01-abandon",
@@ -132,6 +141,17 @@ const WORDS = [
   }),
 ];
 
+const WORDS2 = [
+  Word.parse({
+    word_key: "u02-zone",
+    unit_key: "u02",
+    headword: "zone",
+    tier: "core",
+    source_order: 1,
+    ...provenance(20, "zone n. 地区 ||RAW-OCR-ZONE||"),
+  }),
+];
+
 const SENSES = [
   Sense.parse({
     sense_key: "u01-abandon-s1",
@@ -140,6 +160,17 @@ const SENSES = [
     gloss: "放弃；抛弃",
     sense_order: 1,
     ...provenance(12, "放弃；抛弃 ||RAW-OCR-SENSE||"),
+  }),
+];
+
+const SENSES2 = [
+  Sense.parse({
+    sense_key: "u02-zone-s1",
+    word_key: "u02-zone",
+    pos: "n",
+    gloss: "地区；区域",
+    sense_order: 1,
+    ...provenance(20, "地区；区域 ||RAW-OCR-SENSE2||"),
   }),
 ];
 
@@ -186,10 +217,19 @@ const CARDS = [
     template_version: "v1",
     status: "ACTIVE",
   }),
+  CardDefinition.parse({
+    content_card_key: "card.u02-zone.wm",
+    card_type: "WORD_MEANING",
+    target_entity_key: "u02-zone-s1",
+    word_key: "u02-zone",
+    unit_key: "u02",
+    template_version: "v1",
+    status: "ACTIVE",
+  }),
 ];
 
 // Every headword and every example sentence needs audio (spec 5.8).
-const AUDIO_TEXTS = ["abandon", "ability", "He abandoned the plan without a second thought."];
+const AUDIO_TEXTS = ["abandon", "ability", "zone", "He abandoned the plan without a second thought."];
 
 /** Deterministic pseudo-WAV bytes (packaging only hashes, never decodes). */
 function wavBytes(seed: string): Buffer {
@@ -280,9 +320,10 @@ async function writeAudioFixture(workDir: string): Promise<AudioFixtureRow[]> {
 async function writeValidationReport(
   workDir: string,
   report: { status: "PASSED" | "BLOCKED"; findings?: Array<{ check: string; severity: "ERROR" | "WARNING"; message: string }> },
+  unitKey: string = UNIT.unit_key,
 ): Promise<void> {
   const parsed = UnitValidationReport.parse({
-    unit_key: UNIT.unit_key,
+    unit_key: unitKey,
     compile_run_id: "prime",
     status: report.status,
     repair_rounds: 0,
@@ -290,22 +331,30 @@ async function writeValidationReport(
   });
   await mkdir(path.join(workDir, "validation"), { recursive: true });
   await writeFile(
-    path.join(workDir, "validation", `${UNIT.unit_key}.json`),
+    path.join(workDir, "validation", `${unitKey}.json`),
     `${JSON.stringify(parsed, null, 2)}\n`,
     "utf8",
   );
 }
 
+/** Fixture constants per unit: recovered word counts for CARD_GENERATE output. */
+const WORDS_PER_UNIT: Record<string, number> = { u01: WORDS.length, u02: WORDS2.length };
+
+interface StageOutputOptions {
+  /** CARD_GENERATE target scope; default covers every fixture unit. */
+  cardUnits?: readonly string[];
+}
+
 /** Synthetic but self-consistent output object for one upstream stage. */
-async function stageOutputFor(name: string, workDir: string): Promise<Record<string, unknown>> {
-  const output = await syntheticStageOutput(name, workDir);
+async function stageOutputFor(name: string, workDir: string, options: StageOutputOptions = {}): Promise<Record<string, unknown>> {
+  const output = await syntheticStageOutput(name, workDir, options);
   // The primed fixture must satisfy the real stage's output contract, so the
   // release packaging test cannot drift away from the production schemas.
   if (name === "SOURCE_FINGERPRINT") SourceFingerprintOutputSchema.parse(output);
   return output;
 }
 
-async function syntheticStageOutput(name: string, workDir: string): Promise<Record<string, unknown>> {
+async function syntheticStageOutput(name: string, workDir: string, options: StageOutputOptions = {}): Promise<Record<string, unknown>> {
   switch (name) {
     case "SOURCE_FINGERPRINT":
       // Same shape the real stage emits (SourceFingerprintOutputSchema):
@@ -331,36 +380,69 @@ async function syntheticStageOutput(name: string, workDir: string): Promise<Reco
         source_sha256: SOURCE_HASH,
         normalized_jsonl: "normalized.jsonl",
         normalized_jsonl_sha256: await sha256File(path.join(workDir, "normalized.jsonl")),
-        counts: { units: 1, words: 2, senses: 1, phrases: 1, examples: 1 },
-        unit_boundaries: [{ unit_key: "u01", unit_order: 1, title: "Unit 1", first_page: 12, last_page: 13 }],
+        counts: { units: 2, words: 3, senses: 2, phrases: 1, examples: 1 },
+        unit_boundaries: [
+          { unit_key: "u01", unit_order: 1, title: "Unit 1", first_page: 12, last_page: 13 },
+          { unit_key: "u02", unit_order: 2, title: "Unit 2", first_page: 20, last_page: 20 },
+        ],
         resolved_packets: 0,
       };
     case "AGENT_ENRICH":
     case "AGENT_REVIEW":
     case "DETERMINISTIC_VALIDATE":
     case "REPAIR_LOOP":
-      return { source_sha256: SOURCE_HASH, units: [{ unit_key: "u01", phase: "passed" }] };
-    case "CARD_GENERATE":
+      return {
+        source_sha256: SOURCE_HASH,
+        units: [
+          { unit_key: "u01", phase: "passed" },
+          { unit_key: "u02", phase: "passed" },
+        ],
+      };
+    case "CARD_GENERATE": {
+      // Mirrors the real CARD_GENERATE output: derived from the cards.jsonl
+      // bytes on disk under the same declared target scope.
+      const raw = await readFile(path.join(workDir, "cards.jsonl"), "utf8");
+      const cardRows = raw
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map((line) => CardDefinition.parse(JSON.parse(line)));
+      const byType: Record<string, number> = {
+        WORD_MEANING: 0,
+        CONTEXT_MEANING: 0,
+        PHRASE: 0,
+        SENSE_DISCRIMINATION: 0,
+      };
+      const cardsByUnit = new Map<string, number>();
+      for (const card of cardRows) {
+        byType[card.card_type] = (byType[card.card_type] ?? 0) + 1;
+        cardsByUnit.set(card.unit_key, (cardsByUnit.get(card.unit_key) ?? 0) + 1);
+      }
+      const scopeUnits = options.cardUnits ?? ["u01", "u02"];
       return {
         source_sha256: SOURCE_HASH,
         cards_jsonl: "cards.jsonl",
         cards_jsonl_sha256: await sha256File(path.join(workDir, "cards.jsonl")),
         card_rules_version: "cards-v1",
         counts: {
-          units: 1,
-          words: 2,
-          cards: 2,
-          by_type: { WORD_MEANING: 1, CONTEXT_MEANING: 1, PHRASE: 0, SENSE_DISCRIMINATION: 0 },
+          units: scopeUnits.length,
+          words: scopeUnits.reduce((acc, unitKey) => acc + (WORDS_PER_UNIT[unitKey] ?? 0), 0),
+          cards: cardRows.length,
+          by_type: byType,
         },
-        units: [{ unit_key: "u01", words: 2, cards: 2 }],
+        units: scopeUnits.map((unitKey) => ({
+          unit_key: unitKey,
+          words: WORDS_PER_UNIT[unitKey] ?? 0,
+          cards: cardsByUnit.get(unitKey) ?? 0,
+        })),
       };
+    }
     case "TTS_SYNTHESIZE":
       return {
         source_sha256: SOURCE_HASH,
         audio_manifest: "audio/manifest.jsonl",
         audio_manifest_sha256: await sha256File(path.join(workDir, "audio", "manifest.jsonl")),
         synthesis_config_version: "mimo-v2.5-tts-1",
-        counts: { items: 2, unique_texts: 2, cache_hits: 0, synthesized: 2 },
+        counts: { items: 3, unique_texts: 3, cache_hits: 0, synthesized: 3 },
         characters: AUDIO_TEXTS.reduce((acc, text) => acc + text.length, 0),
         assets: [],
       };
@@ -391,9 +473,9 @@ const PRIMED_ATTEMPTS: Record<string, unknown> = {
   error_code: null,
 };
 
-async function primeLedger(ledger: LedgerStore, workDir: string): Promise<void> {
+async function primeLedger(ledger: LedgerStore, workDir: string, options: StageOutputOptions = {}): Promise<void> {
   for (const name of PRODUCTION_STAGE_NAMES.slice(0, 12)) {
-    const output = await stageOutputFor(name, workDir);
+    const output = await stageOutputFor(name, workDir, options);
     await ledger.save({
       ...PRIMED_ATTEMPTS,
       stage: name,
@@ -428,16 +510,22 @@ interface ReleaseFixture {
   ctx: StageRunContext;
 }
 
-/** Fully-compiled work directory + primed 12-stage ledger + the real stage. */
-async function makeReleaseFixture(): Promise<ReleaseFixture> {
+/**
+ * Fully-compiled work directory + primed 12-stage ledger + the real stage.
+ * `cardScope` narrows the card artifact and the primed CARD_GENERATE output to
+ * the given units (what a scoped `cards generate --units` run produces) while
+ * normalized.jsonl and audio keep covering the whole book.
+ */
+async function makeReleaseFixture(options: StageOutputOptions = {}): Promise<ReleaseFixture> {
   const privateRoot = await makeTempDir("release-private-");
   const workDir = path.join(privateRoot, "work", SOURCE_HASH);
   await mkdir(workDir, { recursive: true });
   const normalizedRows = [
     { entity_type: "book" as const, book_key: UNIT.book_key, title: "低压高频词汇 2024", edition: "2024 第一版", ...provenance(1, "book cover ||RAW-OCR-BOOK||") },
     { entity_type: "unit" as const, ...UNIT },
-    ...WORDS.map((word) => ({ entity_type: "word" as const, ...word })),
-    ...SENSES.map((sense) => ({ entity_type: "sense" as const, ...sense })),
+    { entity_type: "unit" as const, ...UNIT2 },
+    ...[...WORDS, ...WORDS2].map((word) => ({ entity_type: "word" as const, ...word })),
+    ...[...SENSES, ...SENSES2].map((sense) => ({ entity_type: "sense" as const, ...sense })),
     ...PHRASES.map((phrase) => ({ entity_type: "phrase" as const, ...phrase })),
     ...EXAMPLES.map((example) => ({ entity_type: "example" as const, ...example })),
   ];
@@ -446,18 +534,22 @@ async function makeReleaseFixture(): Promise<ReleaseFixture> {
     normalizedRows.map((row) => JSON.stringify(row)).join("\n") + "\n",
     "utf8",
   );
+  const bundleCards = options.cardUnits
+    ? CARDS.filter((card) => options.cardUnits!.includes(card.unit_key))
+    : CARDS;
   await writeFile(
     path.join(workDir, "cards.jsonl"),
-    CARDS.map((card) => JSON.stringify(card)).join("\n") + "\n",
+    bundleCards.map((card) => JSON.stringify(card)).join("\n") + "\n",
     "utf8",
   );
   const audioRows = await writeAudioFixture(workDir);
   await writeValidationReport(workDir, { status: "PASSED" });
+  await writeValidationReport(workDir, { status: "PASSED" }, UNIT2.unit_key);
 
   const ledgerDir = await makeTempDir("release-ledger-");
   const ledger = createFileLedger({ directory: ledgerDir });
-  await primeLedger(ledger, workDir);
-  const audioValidateOutput = await stageOutputFor("AUDIO_VALIDATE", workDir);
+  await primeLedger(ledger, workDir, options);
+  const audioValidateOutput = await stageOutputFor("AUDIO_VALIDATE", workDir, options);
   const stage = createReleasePackageStage({ privateRoot });
   const ctx: StageRunContext = {
     runId: "release-test",
@@ -526,15 +618,26 @@ describe("RELEASE_PACKAGE bundle (spec 5.9)", () => {
     }
     expect(manifest.status).toBe("DRAFT");
     expect(manifest.source_pdf_sha256).toBe(SOURCE_HASH);
+    // Default (no scope): every recovered unit ships, and the manifest
+    // declares that scope explicitly (spec 5.6).
+    expect(manifest.target_units).toEqual(["u01", "u02"]);
     expect(manifest.units).toEqual([
       {
         unit_key: "u01",
         status: "PASSED",
         counts: { words: 2, senses: 1, phrases: 1, examples: 1, explanations: 0, cards: 2 },
       },
+      {
+        unit_key: "u02",
+        status: "PASSED",
+        counts: { words: 1, senses: 1, phrases: 0, examples: 0, explanations: 0, cards: 1 },
+      },
     ]);
-    expect(manifest.totals).toMatchObject({ units: 1, units_passed: 1, units_blocked: 0, words: 2, cards: 2, audio_assets: 3 });
+    expect(manifest.totals).toMatchObject({ units: 2, units_passed: 2, units_blocked: 0, words: 3, cards: 3, audio_assets: 4 });
     expect(manifest.totals.audio_assets).toBe(fixture.audioRows.length);
+    // The default bundle contains BOTH units' content rows.
+    const contentSql = await readFile(path.join(bundleDir, "d1", "001-content.sql"), "utf8");
+    expect(contentSql).toContain("u02-zone");
     // The verified manifest hash is the stage output's manifest hash.
     const verified = await verifyBundle(bundleDir);
     expect(verified.ok).toBe(true);
@@ -665,6 +768,89 @@ describe("RELEASE_PACKAGE bundle (spec 5.9)", () => {
     await expect(fixture.stage.run(undefined, staleCtx)).rejects.toMatchObject({
       code: "RELEASE_PROVENANCE_INVALID",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Declared release target scope (spec 5.6): the release covers exactly the
+// card-generation target units — a BLOCKED unit's content never ships.
+// ---------------------------------------------------------------------------
+
+describe("RELEASE_PACKAGE target scope (spec 5.6)", () => {
+  it("declares the card-generation target scope and packages exactly those units", async () => {
+    // cards.jsonl + primed CARD_GENERATE cover u01 only (scoped cards generate).
+    const fixture = await makeReleaseFixture({ cardUnits: ["u01"] });
+    const stage = createReleasePackageStage({ privateRoot: fixture.privateRoot, units: ["u01"] });
+    const output = ReleasePackageOutputSchema.parse(await stage.run(undefined, fixture.ctx));
+    expect(output.units).toBe(1);
+
+    const bundleDir = path.join(fixture.privateRoot, "releases", output.release_id);
+    const manifest = ReleaseManifest.parse(JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")));
+    // The manifest records the declared target scope and statuses/import
+    // cover exactly the scoped units.
+    expect(manifest.target_units).toEqual(["u01"]);
+    expect(manifest.units.map((unit) => unit.unit_key)).toEqual(["u01"]);
+    expect(manifest.units[0]?.counts).toMatchObject({ words: 2, cards: 2 });
+    expect(manifest.totals).toMatchObject({ units: 1, units_passed: 1, units_blocked: 0, cards: 2 });
+
+    // u02's content never enters the bundle's D1 import.
+    const contentSql = await readFile(path.join(bundleDir, "d1", "001-content.sql"), "utf8");
+    expect(contentSql).toContain("'u01'");
+    expect(contentSql).toContain("u01-abandon");
+    expect(contentSql).not.toContain("u02");
+    const cardsSql = await readFile(path.join(bundleDir, "d1", "002-cards.sql"), "utf8");
+    expect(cardsSql).toContain("card.u01-abandon.wm");
+    expect(cardsSql).not.toContain("u02-zone");
+    const unitStatus = JSON.parse(await readFile(path.join(bundleDir, "qa", "unit-status.json"), "utf8")) as Array<{ unit_key: string }>;
+    expect(unitStatus.map((unit) => unit.unit_key)).toEqual(["u01"]);
+
+    const verified = await verifyBundle(bundleDir);
+    expect(verified.ok).toBe(true);
+    expect(verified.manifest!.target_units).toEqual(["u01"]);
+  });
+
+  it("imports only the scoped units when the bundle is staged into D1", async () => {
+    const env = createDb();
+    const fixture = await makeReleaseFixture({ cardUnits: ["u01"] });
+    const stage = createReleasePackageStage({ privateRoot: fixture.privateRoot, units: ["u01"] });
+    const output = ReleasePackageOutputSchema.parse(await stage.run(undefined, fixture.ctx));
+    const bundleDir = path.join(fixture.privateRoot, "releases", output.release_id);
+
+    const result = await stageBundle({ db: env.db, r2: new FakeR2(), bundleDir, audioRoot: fixture.workDir, now: NOW_MS });
+
+    const content = new ContentRepository(env.db);
+    expect((await content.getUnit(result.releaseId, "u01"))?.title).toBe("Unit 1");
+    expect(await content.getUnit(result.releaseId, "u02")).toBeUndefined();
+    expect(await content.getWord(result.releaseId, "u02-zone")).toBeUndefined();
+    expect(
+      env.sqlite.prepare("SELECT unit_key FROM release_unit WHERE release_id = ? ORDER BY unit_key").all(result.releaseId),
+    ).toEqual([{ unit_key: "u01" }]);
+    expect(env.sqlite.prepare("SELECT COUNT(*) AS n FROM card_definition WHERE release_id = ?").get(result.releaseId))
+      .toMatchObject({ n: 2 });
+    // Only the scoped plan's audio is imported (u01 headwords + example = 3);
+    // the out-of-scope unit's headword audio stays a private artifact.
+    expect(env.sqlite.prepare("SELECT COUNT(*) AS n FROM audio_asset WHERE release_id = ?").get(result.releaseId))
+      .toMatchObject({ n: 3 });
+    env.cleanup();
+  });
+
+  it("refuses to widen a scoped release beyond the card-generation target", async () => {
+    const fixture = await makeReleaseFixture({ cardUnits: ["u01"] });
+    // Default packaging (every unit) disagrees with the scoped card artifacts:
+    // the freshness gate refuses rather than shipping undeclared units.
+    await expect(fixture.stage.run(undefined, fixture.ctx)).rejects.toMatchObject({
+      code: "RELEASE_INPUT_STALE",
+    });
+    await expect(readdir(path.join(fixture.privateRoot, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a target scope that names an unknown unit", async () => {
+    const fixture = await makeReleaseFixture();
+    const stage = createReleasePackageStage({ privateRoot: fixture.privateRoot, units: ["u01", "u-unknown"] });
+    await expect(stage.run(undefined, fixture.ctx)).rejects.toMatchObject({
+      code: "RELEASE_SCOPE_INVALID",
+    });
+    await expect(readdir(path.join(fixture.privateRoot, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -1530,6 +1716,35 @@ describe("cli: release", () => {
     expect(harness.out.join("\n")).toContain("RELEASE_INPUT_STALE");
     // No second bundle was written for the tampered content.
     expect(await readdir(path.join(fixture.privateRoot, "releases"))).toHaveLength(1);
+  });
+
+  it("release package --units records the declared target scope in the manifest", async () => {
+    // cards.jsonl + primed CARD_GENERATE cover u01 only (scoped cards generate).
+    const fixture = await makeReleaseFixture({ cardUnits: ["u01"] });
+    const harness = makeHarness({ ledger: fixture.ledger });
+
+    await harness.cli.parseAsync(
+      [
+        "release",
+        "package",
+        "--source-hash",
+        SOURCE_HASH,
+        "--private-root",
+        fixture.privateRoot,
+        "--units",
+        "u01",
+      ],
+      { from: "user" },
+    );
+    expect(harness.out.join("\n")).toContain("release package OK (1 unit(s)");
+    expect(await fixture.ledger.load("RELEASE_PACKAGE")).toMatchObject({ status: "PASSED" });
+
+    const releaseId = (await readdir(path.join(fixture.privateRoot, "releases")))[0]!;
+    const manifest = JSON.parse(
+      await readFile(path.join(fixture.privateRoot, "releases", releaseId, "manifest.json"), "utf8"),
+    ) as { target_units: string[]; units: Array<{ unit_key: string }> };
+    expect(manifest.target_units).toEqual(["u01"]);
+    expect(manifest.units.map((unit) => unit.unit_key)).toEqual(["u01"]);
   });
 
   it("fails closed when the D1/R2 dependencies are not configured", async () => {

@@ -34,9 +34,18 @@ ACTIVE.
 
 ```bash
 pnpm compiler release package --source-hash <source-hash> \
-  [--previous-release <release-id>] [--metadata release-meta.json]
+  [--units <comma,separated,unit,keys>] [--previous-release <release-id>] [--metadata release-meta.json]
 pnpm compiler release verify --bundle .lexiloop-private/releases/<release-id>
 ```
+
+`--units` declares the release's target unit scope (spec 5.6): the manifest
+records it as `target_units`, and unit statuses plus the D1 import cover
+EXACTLY those units — use it when a compile is terminally blocked on one
+unit (e.g. WORD_HAS_NO_CARDS) so the remaining fully-passed units can ship
+without it. The scope must be the same one `cards generate --units` ran
+with; anything else trips the freshness gate below and refuses packaging.
+Units outside the scope simply never enter the release — there is no flag
+that includes a BLOCKED unit.
 
 `release package` runs the same `RELEASE_PACKAGE` stage as the pipeline and
 therefore refuses to run unless all 13 stage ledger entries are PASSED with

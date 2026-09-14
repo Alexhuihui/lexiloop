@@ -53,7 +53,7 @@ import {
   createRepairLoopStage,
   getProductionStages,
 } from "../src/stage-registry";
-import { hashJson, type AnyStage } from "../src/stage";
+import { hashJson, type AnyStage, type StageRunContext } from "../src/stage";
 
 // ---------------------------------------------------------------------------
 // Fixtures: one Unit of strict source evidence (mirrors review-loop.test.ts
@@ -79,9 +79,8 @@ function provenance(page: number, text: string) {
   };
 }
 
-/** Unit u01 with abandon (sense/phrase/exam example) and ability (sense). */
-function makeWorkload(options: { abilitySense?: boolean } = {}): UnitWorkload {
-  const unitKey = "u01";
+/** Unit `unitKey` with abandon (sense/phrase/exam example) and ability (sense). */
+function makeWorkloadFor(unitKey: string, options: { abilitySense?: boolean } = {}): UnitWorkload {
   const unit = Unit.parse({
     unit_key: unitKey,
     book_key: "llcy",
@@ -254,19 +253,28 @@ function envelopeFor(packet: EnvelopeSeeds, agentRunId: string, output: unknown)
 
 /**
  * Resolve every pending packet the way an external Codex supervisor would:
- * one fresh agent_run_id per packet, PASS verdicts everywhere.
+ * one fresh agent_run_id per packet (distinct across the whole queue), PASS
+ * verdicts everywhere. Results are built from the packet's own unit workload.
  */
-async function ingestPending(queueDir: string, workload: UnitWorkload): Promise<void> {
+async function ingestPending(
+  queueDir: string,
+  workloads: UnitWorkload | readonly UnitWorkload[],
+): Promise<void> {
+  const byUnit = new Map(
+    (Array.isArray(workloads) ? workloads : [workloads]).map((workload) => [workload.unitKey, workload]),
+  );
   for (;;) {
     const entries = await loadSemanticQueue(queueDir);
     const pending = entries.filter((entry) => entry.status === "pending");
     if (pending.length === 0) break;
     for (const entry of pending) {
+      const workload = byUnit.get(entry.order.unit_key)!;
       if (entry.order.role === "generation") {
+        const runId = `run-gen-${entry.order.unit_key}`;
         await ingestSemanticResult(
           queueDir,
           SOURCE_HASH,
-          envelopeFor(entry, "run-gen", generationOutputFor(workload, entry.order.packet_id, entry.packetHash, "run-gen")),
+          envelopeFor(entry, runId, generationOutputFor(workload, entry.order.packet_id, entry.packetHash, runId)),
         );
       } else {
         const packet = entry.packet as Extract<AgentWorkPacketT, { role: "review" }>;
@@ -282,15 +290,20 @@ async function ingestPending(queueDir: string, workload: UnitWorkload): Promise<
 }
 
 /** Write the normalized.jsonl artifact STRUCTURE_NORMALIZE would produce. */
-async function writeNormalizedArtifact(workDir: string, workload: UnitWorkload): Promise<void> {
-  const { unit, words, senses, phrases, examples } = workload.source;
-  const rows = [
-    { entity_type: "unit" as const, ...unit },
-    ...words.map((word) => ({ entity_type: "word" as const, ...word })),
-    ...senses.map((sense) => ({ entity_type: "sense" as const, ...sense })),
-    ...phrases.map((phrase) => ({ entity_type: "phrase" as const, ...phrase })),
-    ...examples.map((example) => ({ entity_type: "example" as const, ...example })),
-  ];
+async function writeNormalizedArtifact(
+  workDir: string,
+  workloads: UnitWorkload | readonly UnitWorkload[],
+): Promise<void> {
+  const list: readonly UnitWorkload[] = Array.isArray(workloads) ? workloads : [workloads];
+  const rows = list.flatMap(
+    ({ source: { unit, words, senses, phrases, examples } }) => [
+      { entity_type: "unit" as const, ...unit },
+      ...words.map((word) => ({ entity_type: "word" as const, ...word })),
+      ...senses.map((sense) => ({ entity_type: "sense" as const, ...sense })),
+      ...phrases.map((phrase) => ({ entity_type: "phrase" as const, ...phrase })),
+      ...examples.map((example) => ({ entity_type: "example" as const, ...example })),
+    ],
+  );
   await writeFile(
     path.join(workDir, "normalized.jsonl"),
     rows.map((row) => JSON.stringify(row)).join("\n") + "\n",
@@ -335,18 +348,25 @@ interface CardsFixture {
   ledger: LedgerStore;
   stages: AnyStage[];
   workload: UnitWorkload;
+  workloads: UnitWorkload[];
+}
+
+/** Spec of one fixture unit (ability without a sense has zero card evidence). */
+interface UnitSpec {
+  unitKey: string;
+  abilitySense?: boolean;
 }
 
 /** Compile fixture: normalized artifact + the four agent gates + CARD_GENERATE. */
 async function makeCardsFixture(
-  workloadOptions: { abilitySense?: boolean } = {},
+  unitSpecs: UnitSpec[] = [{ unitKey: "u01", abilitySense: true }],
 ): Promise<CardsFixture> {
   const privateRoot = await makeTempDir("cards-private-");
   const workDir = path.join(privateRoot, "work", SOURCE_HASH);
   const queueDir = path.join(workDir, SEMANTIC_QUEUE_DIR);
   await mkdir(workDir, { recursive: true });
-  const workload = makeWorkload(workloadOptions);
-  await writeNormalizedArtifact(workDir, workload);
+  const workloads = unitSpecs.map((spec) => makeWorkloadFor(spec.unitKey, spec));
+  await writeNormalizedArtifact(workDir, workloads);
   // A private copy of the versioned rules so tests can revise it.
   const cardsConfigPath = path.join(privateRoot, "cards-v1.json");
   const repoConfig = await readFile(
@@ -363,7 +383,7 @@ async function makeCardsFixture(
     createRepairLoopStage(options),
     createCardGenerateStage(options),
   ];
-  return { privateRoot, workDir, queueDir, cardsConfigPath, ledger, stages, workload };
+  return { privateRoot, workDir, queueDir, cardsConfigPath, ledger, stages, workload: workloads[0]!, workloads };
 }
 
 /** Drive the fixture to completion (two pending-packet rounds, then done). */
@@ -372,9 +392,9 @@ async function runToCards(fixture: CardsFixture, downstream: AnyStage[]): Promis
   const run = (runId: string) =>
     runPipeline(allStages, fixture.ledger, { sourceHash: SOURCE_HASH, runId });
   await run("run-0");
-  await ingestPending(fixture.queueDir, fixture.workload);
+  await ingestPending(fixture.queueDir, fixture.workloads);
   await run("run-1");
-  await ingestPending(fixture.queueDir, fixture.workload);
+  await ingestPending(fixture.queueDir, fixture.workloads);
   return run("run-2");
 }
 
@@ -384,6 +404,19 @@ async function readCards(workDir: string): Promise<z.output<typeof CardDefinitio
     .split("\n")
     .filter((line) => line.trim().length > 0)
     .map((line) => CardDefinition.parse(JSON.parse(line)));
+}
+
+/** Run context mirroring the pipeline's upstream provenance for direct runs. */
+async function fixtureLedgerContext(fixture: CardsFixture, runId: string): Promise<StageRunContext> {
+  const repair = await fixture.ledger.load("REPAIR_LOOP");
+  return {
+    runId,
+    sourceHash: SOURCE_HASH,
+    config: {},
+    ledger: fixture.ledger,
+    logger: silentLogger,
+    upstream: repair?.output_hash ? { stage: "REPAIR_LOOP", outputHash: repair.output_hash } : null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +454,7 @@ describe("CARD_GENERATE stage (production registry)", () => {
 
   it("blocks a word with zero cards terminally: TTS/RELEASE never run", async () => {
     // ability has no sense, phrase, example, or candidate: zero cards.
-    const fixture = await makeCardsFixture({ abilitySense: false });
+    const fixture = await makeCardsFixture([{ unitKey: "u01", abilitySense: false }]);
     const ttsCalls: string[] = [];
     const releaseCalls: string[] = [];
     const report = await runToCards(fixture, [
@@ -530,6 +563,76 @@ describe("CARD_GENERATE stage (production registry)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Unit scope (spec 5.6): a release may declare a target scope of fully-passed
+// units, so CARD_GENERATE can be scoped to exactly the units that will ship.
+// ---------------------------------------------------------------------------
+
+describe("CARD_GENERATE unit scope (spec 5.6)", () => {
+  /** u01 is fully card-generatable; u02's ability word has zero card evidence. */
+  const twoUnitSpecs: UnitSpec[] = [
+    { unitKey: "u01", abilitySense: true },
+    { unitKey: "u02", abilitySense: false },
+  ];
+
+  it("generates cards only for in-scope units and never assesses out-of-scope units", async () => {
+    const fixture = await makeCardsFixture(twoUnitSpecs);
+    // The unscoped pipeline still blocks terminally on u02's no-card word
+    // (default behavior unchanged), but all four gates are PASSED by then.
+    const report = await runToCards(fixture, []);
+    expect(report.status).toBe("BLOCKED");
+    expect(report.results.find((outcome) => outcome.name === "CARD_GENERATE")).toMatchObject({
+      status: "BLOCKED",
+      error_code: "WORD_HAS_NO_CARDS",
+    });
+    expect(await fixture.ledger.load("REPAIR_LOOP")).toMatchObject({ status: "PASSED" });
+
+    // Scoped generation covers exactly the declared target units: u02 is out
+    // of scope, produces no cards, and is never card-checked.
+    const stage = createCardGenerateStage({
+      privateRoot: fixture.privateRoot,
+      cardsConfigPath: fixture.cardsConfigPath,
+      units: ["u01"],
+    });
+    const output = stage.outputSchema.parse(
+      await stage.run(undefined, await fixtureLedgerContext(fixture, "scoped-1")),
+    ) as { units: Array<{ unit_key: string; words: number; cards: number }> };
+    expect(output.units).toEqual([{ unit_key: "u01", words: 2, cards: 5 }]);
+    const cards = await readCards(fixture.workDir);
+    expect(cards).toHaveLength(5);
+    expect(cards.every((card) => card.unit_key === "u01")).toBe(true);
+  });
+
+  it("still blocks terminally on an in-scope word with zero cards", async () => {
+    const fixture = await makeCardsFixture(twoUnitSpecs);
+    await runToCards(fixture, []);
+    const stage = createCardGenerateStage({
+      privateRoot: fixture.privateRoot,
+      cardsConfigPath: fixture.cardsConfigPath,
+      units: ["u02"],
+    });
+    await expect(stage.run(undefined, await fixtureLedgerContext(fixture, "scoped-2"))).rejects.toMatchObject({
+      code: "WORD_HAS_NO_CARDS",
+      blocked: true,
+    });
+    // The blocked run wrote nothing: no out-of-scope cards either.
+    await expect(readCards(fixture.workDir)).rejects.toThrow();
+  });
+
+  it("fails closed when the declared scope names an unknown unit", async () => {
+    const fixture = await makeCardsFixture();
+    await runToCards(fixture, []);
+    const stage = createCardGenerateStage({
+      privateRoot: fixture.privateRoot,
+      cardsConfigPath: fixture.cardsConfigPath,
+      units: ["u01", "u-unknown"],
+    });
+    await expect(stage.run(undefined, await fixtureLedgerContext(fixture, "scoped-3"))).rejects.toMatchObject({
+      code: "UNIT_SCOPE_UNKNOWN",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CLI wiring: cards generate
 // ---------------------------------------------------------------------------
 
@@ -563,9 +666,9 @@ describe("cli: cards generate", () => {
     const runPrime = (runId: string) =>
       runPipeline(fixture.stages, fixture.ledger, { sourceHash: SOURCE_HASH, runId });
     await runPrime("prime-0");
-    await ingestPending(fixture.queueDir, fixture.workload);
+    await ingestPending(fixture.queueDir, fixture.workloads);
     await runPrime("prime-1");
-    await ingestPending(fixture.queueDir, fixture.workload);
+    await ingestPending(fixture.queueDir, fixture.workloads);
     const report = await runPrime("prime-2");
     expect(report.status).toBe("COMPLETED");
     const seeded = await fixture.ledger.load("CARD_GENERATE");
@@ -603,5 +706,76 @@ describe("cli: cards generate", () => {
     expect(deps.exitCode).toBe(1);
     const entry = await deps.createLedger(SOURCE_HASH).load("CARD_GENERATE");
     expect(entry?.status ?? "PENDING").not.toBe("PASSED");
+  });
+
+  it("--units scopes generation, still blocks in scope, and the default checks every unit", async () => {
+    // u01 is fully card-generatable; u02's ability word has zero card evidence
+    // — the Task 19 shape: 21 passed units, one word with no card evidence.
+    const fixture = await makeCardsFixture([
+      { unitKey: "u01", abilitySense: true },
+      { unitKey: "u02", abilitySense: false },
+    ]);
+    const workRoot = await makeTempDir("cards-cli-scope-");
+    const out: string[] = [];
+    const deps = makeDeps(workRoot, out);
+    const cli = buildCli(deps);
+
+    // Prime all four agent gates for BOTH units; the unscoped CARD_GENERATE
+    // then blocks terminally on u02 (the default still checks every unit).
+    const runPrime = (runId: string) =>
+      runPipeline(fixture.stages, fixture.ledger, { sourceHash: SOURCE_HASH, runId });
+    await runPrime("prime-0");
+    await ingestPending(fixture.queueDir, fixture.workloads);
+    await runPrime("prime-1");
+    await ingestPending(fixture.queueDir, fixture.workloads);
+    const report = await runPrime("prime-2");
+    expect(report.status).toBe("BLOCKED");
+    expect(report.results.find((outcome) => outcome.name === "CARD_GENERATE")).toMatchObject({
+      error_code: "WORD_HAS_NO_CARDS",
+    });
+
+    // Scoped CLI run: cards for the declared target units only.
+    out.length = 0;
+    await cli.parseAsync(
+      ["cards", "generate", "--source-hash", SOURCE_HASH, "--private-root", fixture.privateRoot, "--units", "u01"],
+      { from: "user" },
+    );
+    expect(out.join("\n")).toContain("unit u01 words=2 cards=5");
+    expect(out.join("\n")).toContain("cards generate OK (5 card(s) across 1 unit(s))");
+    expect(deps.exitCode).toBeUndefined();
+    const entry = await deps.createLedger(SOURCE_HASH).load("CARD_GENERATE");
+    expect(entry).toMatchObject({ status: "PASSED" });
+    const cardsAfterScoped = await readFile(path.join(fixture.workDir, "cards.jsonl"), "utf8");
+    expect(cardsAfterScoped).toContain("u01-abandon");
+    expect(cardsAfterScoped).not.toContain("u02-");
+
+    // An IN-SCOPE no-card word still blocks: nothing written, ledger intact.
+    out.length = 0;
+    await cli.parseAsync(
+      ["cards", "generate", "--source-hash", SOURCE_HASH, "--private-root", fixture.privateRoot, "--units", "u02"],
+      { from: "user" },
+    );
+    expect(out.join("\n")).toContain("cards generate failed [WORD_HAS_NO_CARDS]");
+    expect(deps.exitCode).toBe(1);
+    expect(await readFile(path.join(fixture.workDir, "cards.jsonl"), "utf8")).toBe(cardsAfterScoped);
+    expect(await deps.createLedger(SOURCE_HASH).load("CARD_GENERATE")).toMatchObject({ status: "PASSED" });
+
+    // The default (no --units) still checks EVERY unit: u02 blocks it again.
+    out.length = 0;
+    await cli.parseAsync(
+      ["cards", "generate", "--source-hash", SOURCE_HASH, "--private-root", fixture.privateRoot],
+      { from: "user" },
+    );
+    expect(out.join("\n")).toContain("cards generate failed [WORD_HAS_NO_CARDS]");
+    expect(deps.exitCode).toBe(1);
+
+    // Unknown scope keys fail closed with a machine-readable code.
+    out.length = 0;
+    await cli.parseAsync(
+      ["cards", "generate", "--source-hash", SOURCE_HASH, "--private-root", fixture.privateRoot, "--units", "u-unknown"],
+      { from: "user" },
+    );
+    expect(out.join("\n")).toContain("cards generate failed [UNIT_SCOPE_UNKNOWN]");
+    expect(deps.exitCode).toBe(1);
   });
 });
