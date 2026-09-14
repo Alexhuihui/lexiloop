@@ -641,6 +641,93 @@ describe("visual corrections", () => {
 });
 
 // ---------------------------------------------------------------------------
+// CJK gloss continuation blocks
+//
+// The real raster splits entries across OCR blocks: a headword line can end
+// at its POS marker ("word [,phon]v.") with the gloss on the NEXT block, and
+// a multi-line gloss continues onto a CJK-leading block. Such blocks matched
+// no walk branch before (the phrase branch requires a non-CJK first char) and
+// were silently dropped, leaving words with zero senses. Synthetic
+// lookalikes only.
+// ---------------------------------------------------------------------------
+
+describe("CJK gloss continuation blocks", () => {
+  const chapterOpener = (page: number): NormalizeInputBlock =>
+    makeBlock(`p${page}.chapter`, page, [0.2, 0.065, 0.44, 0.1], "Chapter 1");
+  const unitTab = (page: number, digits: string): NormalizeInputBlock =>
+    makeBlock(`p${page}.tab`, page, [0.9359, 0.8278, 0.9709, 0.8478], digits);
+
+  it("creates the sense from a CJK gloss block when the headword line ends at its POS marker", () => {
+    const blocks = [
+      chapterOpener(1),
+      unitTab(1, "01"),
+      // Headword line: phonetic then POS marker, NO gloss on this line.
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "orble [,ɔːrbəl]v."),
+      // The gloss lives on its own OCR block starting with a CJK char.
+      makeBlock("p1.gloss", 1, [0.1, 0.2, 0.48, 0.26], "环绕；轨道运行"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.words.map((w) => w.headword)).toEqual(["orble"]);
+    const senses = output.senses.filter((s) => s.word_key === output.words[0]!.word_key);
+    expect(senses).toHaveLength(1);
+    // POS comes from the headword line's trailing marker.
+    expect(senses[0]!.pos).toBe("v");
+    expect(senses[0]!.gloss).toBe("环绕；轨道运行");
+    // Provenance matches the word's head block, like every other sense.
+    expect(senses[0]!.bbox).toEqual([0.1, 0.14, 0.48, 0.2]);
+  });
+
+  it("appends a CJK continuation block to the current sense's gloss", () => {
+    const blocks = [
+      chapterOpener(1),
+      unitTab(1, "01"),
+      makeBlock("p1.head", 1, [0.1, 0.14, 0.48, 0.2], "orbflow /ˈɔːrbfləʊ/ n. 循环流"),
+      // Multi-line gloss continuation on the next OCR block.
+      makeBlock("p1.gloss2", 1, [0.1, 0.2, 0.48, 0.26], "量；人员的流动率"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    const senses = output.senses.filter((s) => s.word_key === output.words[0]!.word_key);
+    expect(senses).toHaveLength(1);
+    expect(senses[0]!.gloss).toBe("循环流量；人员的流动率");
+  });
+
+  it("appends a continuation to the LAST sense of a multi-sense entry", () => {
+    const blocks = [
+      chapterOpener(1),
+      unitTab(1, "01"),
+      makeBlock(
+        "p1.head",
+        1,
+        [0.1, 0.14, 0.48, 0.2],
+        "orbflow /ˈɔːrbfləʊ/ ① n. 循环流 ② n. 环流圈",
+      ),
+      makeBlock("p1.gloss2", 1, [0.1, 0.2, 0.48, 0.26], "带"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    const senses = output.senses.filter((s) => s.word_key === output.words[0]!.word_key);
+    expect(senses.map((s) => [s.sense_order, s.gloss])).toEqual([
+      [1, "循环流"],
+      [2, "环流圈带"],
+    ]);
+  });
+
+  it("still ignores a CJK-leading block when no word is open", () => {
+    const blocks = [
+      chapterOpener(1),
+      unitTab(1, "01"),
+      // A CJK-leading block before any headword: nothing to attach to.
+      makeBlock("p1.orphan", 1, [0.1, 0.11, 0.48, 0.14], "孤立的中文块"),
+      makeBlock("p1.head", 1, [0.1, 0.18, 0.48, 0.24], "alpha /ˈælfə/ n. 阿尔法"),
+    ];
+    const output = segmentStructure(assignReadingOrder(blocks), normalizeConfig());
+    expect(output.words.map((w) => w.headword)).toEqual(["alpha"]);
+    expect(output.senses.map((s) => [s.word_key, s.gloss])).toEqual([
+      [output.words[0]!.word_key, "阿尔法"],
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Stage handlers: ledger hash chaining, resume-skip, packet gating
 // ---------------------------------------------------------------------------
 

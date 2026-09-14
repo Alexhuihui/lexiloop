@@ -732,8 +732,11 @@ export function createStructureNormalizeStage(options: MediaStageOptions): AnySt
   // first opener) and back matter (from the index opener) are signal-inert;
   // unit keys are chapter-qualified (c<chapter>.u<number>) with unit_order as
   // the global encounter ordinal; the monotonic guard is chapter-scoped.
+  // v4: CJK-leading gloss blocks attach to the open entry (multi-line gloss
+  // continuations, and glosses of headword lines ending at their POS marker)
+  // instead of being silently dropped.
   // Bumped so cached ledgers invalidate and re-segment.
-  const configVersion = "3";
+  const configVersion = "4";
   return {
     name: "STRUCTURE_NORMALIZE",
     configVersion,

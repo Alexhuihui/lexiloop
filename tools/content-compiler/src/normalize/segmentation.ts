@@ -119,10 +119,14 @@ interface SenseDraft {
 interface WordDraft {
   word: WordT;
   unitKey: string;
-  head: NormalizeInputBlock;
+  /** The entry's headword block (always carries its normalizedText). */
+  head: PreprocessedBlock;
   headword: string;
   phonetic: string | null;
   senseDrafts: SenseDraft[];
+  /** POS from the headword line's trailing marker, for entries whose gloss
+   * lives on a following OCR block (null when the line carries no marker). */
+  posFromHead: PartOfSpeechT | null;
   exampleCount: number;
 }
 
@@ -146,6 +150,26 @@ function findPosMarker(text: string, markers: readonly string[]): { marker: stri
     if (
       best === null ||
       index < best.index ||
+      (index === best.index && marker.length > best.marker.length)
+    ) {
+      best = { marker, index };
+    }
+  }
+  return best;
+}
+
+/** Find the configured POS marker occurring last (longest match wins ties). */
+function findLastPosMarker(
+  text: string,
+  markers: readonly string[],
+): { marker: string; index: number } | null {
+  let best: { marker: string; index: number } | null = null;
+  for (const marker of markers) {
+    const index = text.indexOf(marker);
+    if (index < 0) continue;
+    if (
+      best === null ||
+      index > best.index ||
       (index === best.index && marker.length > best.marker.length)
     ) {
       best = { marker, index };
@@ -331,6 +355,7 @@ function startWord(state: WalkState, block: PreprocessedBlock, match: RegExpMatc
 
   const senseDrafts = parseSenses(senseText, state.config);
   const phonetic = phoneticWithDelims.trim();
+  const posFromHeadMatch = findLastPosMarker(senseText, state.config.pos_markers);
   const word: WordT = {
     word_key: wordKey,
     unit_key: unitKey,
@@ -347,6 +372,7 @@ function startWord(state: WalkState, block: PreprocessedBlock, match: RegExpMatc
     headword: headwordText,
     phonetic: phonetic.length > 0 ? phonetic : null,
     senseDrafts,
+    posFromHead: posFromHeadMatch ? posValue(posFromHeadMatch.marker) : null,
     exampleCount: 0,
   };
   state.words.push(word);
@@ -416,6 +442,44 @@ function addPhrase(state: WalkState, block: PreprocessedBlock): void {
     ...provenance(block),
   };
   state.phrases.push(phrase);
+  touchBoundary(state, draft.unitKey, block.page);
+}
+
+/**
+ * Attach a CJK-leading block that matched no earlier branch to the entry
+ * being read. The real raster splits entries across OCR blocks in two ways:
+ * a headword line can end at its POS marker (no gloss on that line) with the
+ * gloss on the next block, and a parsed gloss can continue onto further
+ * CJK-leading lines. Direct concatenation reconstructs the printed gloss
+ * (e.g. "货物周转" + "率；..." -> "货物周转率；...").
+ */
+function attachCjkGloss(state: WalkState, block: PreprocessedBlock): void {
+  const draft = state.currentWord;
+  if (!draft) return; // Guarded by the caller; kept total.
+  const gloss = block.normalizedText;
+  if (gloss.length === 0) return;
+  if (draft.senseDrafts.length > 0) {
+    // Continuation of the entry's last sense, draft + pushed record alike.
+    const last = draft.senseDrafts[draft.senseDrafts.length - 1]!;
+    last.gloss += gloss;
+    const senseKey = `s.${draft.word.word_key}.${draft.senseDrafts.length}`;
+    const sense = state.senses.find((s) => s.sense_key === senseKey);
+    if (sense) sense.gloss = last.gloss;
+  } else {
+    // The headword line ended at its POS marker: this block IS the sense
+    // gloss. POS from that line's trailing marker — a started word always had
+    // one, so the "other" fallback is unreachable in practice (kept total).
+    const pos = draft.posFromHead ?? "other";
+    draft.senseDrafts.push({ pos, gloss });
+    state.senses.push({
+      sense_key: `s.${draft.word.word_key}.${draft.senseDrafts.length}`,
+      word_key: draft.word.word_key,
+      pos,
+      gloss,
+      sense_order: draft.senseDrafts.length,
+      ...provenance(draft.head),
+    });
+  }
   touchBoundary(state, draft.unitKey, block.page);
 }
 
@@ -990,6 +1054,14 @@ export function segmentStructure(
       }
       if (text.startsWith(config.exam_marker)) {
         addExample(state, block, config.exam_marker);
+        continue;
+      }
+      if (state.currentWord && CJK_RANGE.test(text.slice(0, 1))) {
+        // A CJK-leading tail of the open entry: a multi-line gloss
+        // continuation, or the gloss block of a headword line that ended at
+        // its POS marker. Without this branch such blocks matched nothing and
+        // were silently dropped (words could end up with zero senses).
+        attachCjkGloss(state, block);
         continue;
       }
       if (
