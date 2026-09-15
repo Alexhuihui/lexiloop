@@ -144,8 +144,10 @@ export class ReleaseRepository {
   /**
    * Legal status transitions (spec 11.3). There is no manual override: only
    * these edges exist, and activation/rollback go through `activateBatch`.
+   * Exported so remote publish tooling judges its status moves against the
+   * SAME table (never a divergent copy).
    */
-  private static readonly LEGAL_TRANSITIONS: Readonly<Record<string, readonly string[]>> = {
+  static readonly LEGAL_TRANSITIONS: Readonly<Record<string, readonly string[]>> = {
     DRAFT: ["IMPORTING", "FAILED"],
     IMPORTING: ["VALIDATING", "FAILED"],
     VALIDATING: ["READY", "FAILED"],
@@ -163,11 +165,8 @@ export class ReleaseRepository {
     if (!current) {
       throw new Error(`updateStatus: release ${releaseId} does not exist`);
     }
-    const allowed = ReleaseRepository.LEGAL_TRANSITIONS[current.status] ?? [];
-    if (!allowed.includes(status)) {
-      throw new Error(`updateStatus: release ${releaseId} cannot move ${current.status} -> ${status}`);
-    }
-    await this.db.update(contentRelease).set({ status }).where(eq(contentRelease.releaseId, releaseId));
+    assertStatusTransition(current.status, status, releaseId);
+    await this.db.run(sqlUpdateReleaseStatus(releaseId, status));
     return (await this.getById(releaseId)) ?? current;
   }
 
@@ -202,19 +201,71 @@ export class ReleaseRepository {
       throw new Error(`activateBatch: release ${input.releaseId} is ${target.status}, expected READY or RETIRED`);
     }
     const meta = await this.getMeta();
-    const statements: SQL[] = input.aliasRows.map((row) => sqlUpsertAliasEdge(row));
-    if (meta?.activeReleaseId && meta.activeReleaseId !== input.releaseId) {
-      statements.push(sqlDemoteRelease(meta.activeReleaseId));
-    }
-    statements.push(sqlActivateRelease(input.releaseId, input.activatedAt), sqlSwitchPointer(input.releaseId));
-    await createAtomicBatchRunner(this.db).run(statements);
+    await createAtomicBatchRunner(this.db).run(
+      buildActivationBatchStatements({
+        releaseId: input.releaseId,
+        activatedAt: input.activatedAt,
+        previousActiveId: meta?.activeReleaseId ?? null,
+        aliasRows: input.aliasRows,
+      }),
+    );
     return (await this.getById(input.releaseId)) ?? target;
   }
+}
+
+export type ActivationAliasRow = {
+  releaseId: string;
+  fromKey: string;
+  toKey: string;
+  canonicalKey: string;
+  createdAt: number;
+};
+
+export interface ActivationBatchStatementsInput {
+  releaseId: string;
+  activatedAt: number;
+  /** app_meta.active_release_id read BEFORE the batch (null when unset). */
+  previousActiveId: string | null;
+  aliasRows: readonly ActivationAliasRow[];
+}
+
+/**
+ * The exact statement list of one activation (spec 6.4/11.3): alias upserts,
+ * demotion of the previous ACTIVE release, promotion of the target, and the
+ * app_meta pointer switch — in that order, pointer LAST. `activateBatch` runs
+ * it atomically (batch() on D1, one transaction on better-sqlite3); the
+ * remote publish tooling renders the SAME statements to literal SQL and
+ * applies them sequentially, stopping at the first failure so a broken
+ * activation never reaches the pointer switch.
+ */
+export function buildActivationBatchStatements(input: ActivationBatchStatementsInput): SQL[] {
+  const statements: SQL[] = input.aliasRows.map((row) => sqlUpsertAliasEdge(row));
+  if (input.previousActiveId !== null && input.previousActiveId !== input.releaseId) {
+    statements.push(sqlDemoteRelease(input.previousActiveId));
+  }
+  statements.push(sqlActivateRelease(input.releaseId, input.activatedAt), sqlSwitchPointer(input.releaseId));
+  return statements;
 }
 
 /** Single-statement demotion of a release to RETIRED (pre-batch read guard). */
 function sqlDemoteRelease(releaseId: string): SQL {
   return sql`UPDATE content_release SET status = 'RETIRED' WHERE release_id = ${releaseId}`;
+}
+
+/**
+ * Single-statement status move, judged against the SAME legal transition
+ * table `updateStatus` enforces (spec 11.3). Shared by the repository and the
+ * remote publish tooling so both emit the identical statement.
+ */
+export function assertStatusTransition(current: string, status: string, releaseId = "(unknown)"): void {
+  const allowed = ReleaseRepository.LEGAL_TRANSITIONS[current] ?? [];
+  if (!allowed.includes(status)) {
+    throw new Error(`updateStatus: release ${releaseId} cannot move ${current} -> ${status}`);
+  }
+}
+
+export function sqlUpdateReleaseStatus(releaseId: string, status: string): SQL {
+  return sql`UPDATE content_release SET status = ${status} WHERE release_id = ${releaseId}`;
 }
 
 /** Single-statement promotion of the target release to ACTIVE. */

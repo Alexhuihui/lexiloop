@@ -8,13 +8,27 @@
  * content-addressed objects), which makes the whole lifecycle rehearsable on
  * a workstation before a remote deployment (spec 17: rollback rehearsal).
  *
+ * Remote wiring (--remote, Task 19): the SAME lifecycle runs against the real
+ * Cloudflare bindings through the Wrangler CLI — `wrangler d1 execute
+ * --remote` for D1 and `wrangler r2 object` for the private bucket. The
+ * target comes from infra/wrangler/wrangler.toml (untracked production
+ * config), overridable with --d1-database/--r2-bucket. The checks, evaluators,
+ * and statements are the SAME functions the local flow uses
+ * (tools/content-compiler/src/release/*): uploads are unconditional
+ * (content-addressed keys make re-uploads byte-identical), smoke failures
+ * record FAILED and never move the pointer, and activation applies the exact
+ * batch statement list sequentially with the pointer switch last — a failure
+ * stops before it. There is no --force and no manual status override: a
+ * failed verification, smoke check, or activation leaves the previous
+ * release ACTIVE.
+ *
  * Examples:
  *   tsx scripts/publish-release.ts --bundle .lexiloop-private/releases/<id> \
  *     --db .lexiloop-private/d1/rehearsal.sqlite --r2-dir .lexiloop-private/r2
  *   tsx scripts/publish-release.ts --rollback <previous-release-id> --db ... --r2-dir ...
- *
- * There is no --force and no manual status override: a failed verification,
- * smoke check, or activation leaves the previous release ACTIVE.
+ *   tsx scripts/publish-release.ts --bundle .lexiloop-private/releases/<id> --remote \
+ *     [--aliases <edges.json>] [--no-activate]
+ *   tsx scripts/publish-release.ts --rollback <release-id> --remote
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -23,7 +37,6 @@ import process from "node:process";
 import Database from "better-sqlite3";
 import { createSqliteDatabase } from "../packages/db/src/index";
 import { ReleaseRepository } from "../packages/db/src/index";
-import { verifyBundle } from "../tools/content-compiler/src/release/validate";
 import {
   AliasFileSchema,
   activateRelease,
@@ -32,6 +45,13 @@ import {
   stageBundle,
   type R2AudioStore,
 } from "../tools/content-compiler/src/release/publish";
+import { verifyBundle } from "../tools/content-compiler/src/release/validate";
+import {
+  createWranglerCli,
+  readWranglerTarget,
+  remoteRollbackRelease,
+  runRemotePublish,
+} from "../tools/content-compiler/src/release/remote";
 
 interface Args {
   bundle?: string;
@@ -41,19 +61,28 @@ interface Args {
   aliases?: string;
   rollback?: string;
   noActivate: boolean;
+  remote: boolean;
+  d1Database?: string;
+  r2Bucket?: string;
 }
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const WRANGLER_TOML = join(REPO_ROOT, "infra", "wrangler", "wrangler.toml");
 
 function usage(): never {
   process.stderr.write(
     "usage: tsx scripts/publish-release.ts --bundle <dir> --db <sqlite-file> --r2-dir <dir> " +
       "[--private-root <dir>] [--aliases <edges.json>] [--no-activate]\n" +
-      "       tsx scripts/publish-release.ts --rollback <release-id> --db <sqlite-file> --r2-dir <dir>\n",
+      "       tsx scripts/publish-release.ts --rollback <release-id> --db <sqlite-file> --r2-dir <dir>\n" +
+      "       tsx scripts/publish-release.ts --bundle <dir> --remote [--d1-database <name>] " +
+      "[--r2-bucket <name>] [--aliases <edges.json>] [--no-activate]\n" +
+      "       tsx scripts/publish-release.ts --rollback <release-id> --remote\n",
   );
   process.exit(2);
 }
 
 function parseArgs(argv: readonly string[]): Args {
-  const args: Args = { noActivate: false };
+  const args: Args = { noActivate: false, remote: false };
   for (let i = 0; i < argv.length; i += 1) {
     const value = argv[i + 1];
     switch (argv[i]) {
@@ -64,10 +93,20 @@ function parseArgs(argv: readonly string[]): Args {
       case "--aliases": args.aliases = value; i += 1; break;
       case "--rollback": args.rollback = value; i += 1; break;
       case "--no-activate": args.noActivate = true; break;
+      case "--remote": args.remote = true; break;
+      case "--d1-database": args.d1Database = value; i += 1; break;
+      case "--r2-bucket": args.r2Bucket = value; i += 1; break;
       default: usage();
     }
   }
-  if (!args.db || !args.r2Dir) usage();
+  if (args.remote && (args.db !== undefined || args.r2Dir !== undefined)) {
+    process.stderr.write(
+      "--remote is mutually exclusive with --db/--r2-dir: the remote target comes from " +
+        "infra/wrangler/wrangler.toml (or --d1-database/--r2-bucket overrides)\n",
+    );
+    process.exit(2);
+  }
+  if (!args.remote && (!args.db || !args.r2Dir)) usage();
   if (!args.bundle && !args.rollback) usage();
   return args;
 }
@@ -110,12 +149,46 @@ function ensureMigrated(dbFile: string): Database.Database {
   return sqlite;
 }
 
+/** The --remote lifecycle against the real Cloudflare bindings. */
+async function runRemote(args: Args): Promise<number> {
+  const target = readWranglerTarget(WRANGLER_TOML, { d1Database: args.d1Database, r2Bucket: args.r2Bucket });
+  console.log(
+    `remote target: d1=${target.d1Database} r2=${target.r2Bucket} (config ${target.configPath}); ` +
+      "no --force and no bypass exists",
+  );
+  const cli = createWranglerCli();
+  if (args.rollback) {
+    const result = await remoteRollbackRelease({ cli, target, releaseId: args.rollback, now: Date.now() });
+    console.log(`rollback OK: release ${result.releaseId} ACTIVE again (undone ${result.previousReleaseId ?? "none"})`);
+    return 0;
+  }
+  let aliases: readonly unknown[] | undefined;
+  if (args.aliases) {
+    aliases = AliasFileSchema.parse(JSON.parse(readFileSync(toAbs(args.aliases), "utf8"))).edges;
+  }
+  await runRemotePublish({
+    cli,
+    target,
+    bundleDir: toAbs(args.bundle!),
+    privateRoot: toAbs(args.privateRoot ?? ".lexiloop-private"),
+    ...(aliases !== undefined ? { aliases } : {}),
+    activate: !args.noActivate,
+    now: Date.now(),
+    log: (line) => console.log(line),
+  });
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
+  if (args.remote) {
+    return await runRemote(args);
+  }
+
+  const privateRoot = toAbs(args.privateRoot ?? ".lexiloop-private");
   const sqlite = ensureMigrated(toAbs(args.db!));
   const db = createSqliteDatabase(sqlite);
   const r2 = createDirectoryR2(toAbs(args.r2Dir!));
-  const privateRoot = toAbs(args.privateRoot ?? ".lexiloop-private");
 
   if (args.rollback) {
     const result = await rollbackRelease({ db, releaseId: args.rollback, now: Date.now() });

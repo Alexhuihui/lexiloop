@@ -70,6 +70,8 @@ import { RELEASE_V1, RELEASE_V2, V2_ALIAS_EDGES } from "../apps/worker/e2e-harne
 import { sha256HexOf } from "../apps/worker/e2e-harness/wav";
 import { DirectoryObjectStore } from "../apps/worker/e2e-harness/object-store";
 import { seedHarnessDatabase } from "../apps/worker/e2e-harness/seed";
+// The ONE wrangler-output parser, shared with the remote publish path.
+import { parseWranglerRows } from "../tools/content-compiler/src/release/remote";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const EXIT_FAILED = 1;
@@ -755,40 +757,6 @@ function loadWranglerConfig(): WranglerConfig | null {
   const content = readFileSync(configPath, "utf8");
   const bucket = /bucket_name\s*=\s*"([^"]+)"/.exec(content)?.[1] ?? null;
   return { configPath, bucket };
-}
-
-/** First JSON array found in wrangler's mixed output, parsed as rows. */
-function parseWranglerRows(stdout: string): Row[] {
-  const start = stdout.indexOf("[");
-  if (start === -1) {
-    throw new Error("no JSON payload in wrangler output");
-  }
-  const parsed: unknown = JSON.parse(stdout.slice(start, stdout.lastIndexOf("]") + 1));
-  if (!Array.isArray(parsed)) {
-    throw new Error("unexpected wrangler JSON shape");
-  }
-  const rows: Row[] = [];
-  for (const element of parsed) {
-    const results = (element as { results?: unknown }).results;
-    if (Array.isArray(results)) {
-      for (const row of results) {
-        if (typeof row === "object" && row !== null) {
-          rows.push(row as Row);
-        }
-      }
-    } else if (results !== undefined && typeof results === "object" && results !== null) {
-      const shaped = results as { columns?: string[]; rows?: unknown[][] };
-      const columns = shaped.columns ?? [];
-      for (const tuple of shaped.rows ?? []) {
-        const row: Row = {};
-        columns.forEach((column, index) => {
-          row[column] = tuple[index];
-        });
-        rows.push(row);
-      }
-    }
-  }
-  return rows;
 }
 
 /** Production runner: the real wrangler CLI against real bindings. */

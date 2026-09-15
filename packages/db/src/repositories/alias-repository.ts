@@ -140,32 +140,49 @@ export class AliasRepository {
    * A component whose key already carries word_progress/card_state rows under
    * any other key would collapse two distinct progress roots into one the
    * moment the edge is imported — such batches are rejected before activation.
+   * The judgment is `stateConflictsFromRows` (shared with the remote publish
+   * tooling, which fetches the same rows over wrangler); this method only
+   * fetches them.
    */
   async findStateConflicts(graph: AliasGraph): Promise<AliasStateConflict[]> {
-    const conflicts: AliasStateConflict[] = [];
     const keys = [...graph.canonicalByKey.keys()];
-    if (keys.length === 0) return conflicts;
-
+    if (keys.length === 0) return [];
     const progressRows = await this.db
       .select()
       .from(wordProgress)
       .where(inArray(wordProgress.wordKey, keys));
-    for (const row of progressRows) {
-      const canonicalKey = graph.canonicalByKey.get(row.wordKey);
-      if (canonicalKey !== undefined && canonicalKey !== row.wordKey) {
-        conflicts.push({ userId: row.userId, table: "word_progress", key: row.wordKey, canonicalKey });
-      }
-    }
     const cardRows = await this.db
       .select()
       .from(cardState)
       .where(inArray(cardState.contentCardKey, keys));
-    for (const row of cardRows) {
-      const canonicalKey = graph.canonicalByKey.get(row.contentCardKey);
-      if (canonicalKey !== undefined && canonicalKey !== row.contentCardKey) {
-        conflicts.push({ userId: row.userId, table: "card_state", key: row.contentCardKey, canonicalKey });
-      }
-    }
-    return conflicts;
+    return stateConflictsFromRows(graph.canonicalByKey, progressRows, cardRows);
   }
+}
+
+/**
+ * The user-state collapse judgment over already-fetched rows (spec 6.4): a
+ * component key that carries word_progress/card_state rows under any key
+ * other than its canonical root would collapse two distinct progress roots
+ * into one when the edge set is imported. Pure over data so the local
+ * repository and the remote publish tooling apply the SAME rule.
+ */
+export function stateConflictsFromRows(
+  canonicalByKey: ReadonlyMap<string, string>,
+  progressRows: ReadonlyArray<{ userId: string; wordKey: string }>,
+  cardRows: ReadonlyArray<{ userId: string; contentCardKey: string }>,
+): AliasStateConflict[] {
+  const conflicts: AliasStateConflict[] = [];
+  for (const row of progressRows) {
+    const canonicalKey = canonicalByKey.get(row.wordKey);
+    if (canonicalKey !== undefined && canonicalKey !== row.wordKey) {
+      conflicts.push({ userId: row.userId, table: "word_progress", key: row.wordKey, canonicalKey });
+    }
+  }
+  for (const row of cardRows) {
+    const canonicalKey = canonicalByKey.get(row.contentCardKey);
+    if (canonicalKey !== undefined && canonicalKey !== row.contentCardKey) {
+      conflicts.push({ userId: row.userId, table: "card_state", key: row.contentCardKey, canonicalKey });
+    }
+  }
+  return conflicts;
 }

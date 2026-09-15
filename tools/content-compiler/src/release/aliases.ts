@@ -7,9 +7,23 @@
  * activation fan-out against already-stored edges, endpoint existence in the
  * declared releases, and the user-state collapse check must ALL pass before
  * anything touches content_key_alias or app_meta.
+ *
+ * The gates themselves are pure over data (stored rows, an endpoint lookup,
+ * fetched user-state rows) so the local path (drizzle over SQLite) and the
+ * remote publish path (the same rows fetched over wrangler) run the SAME
+ * rules — `prepareAliasBatch` and `prepareAliasBatchFromData` are two data
+ * sources behind one implementation.
  */
 import { AliasEdgeSchema, validateAliasEdges, type AliasGraph } from "@lexiloop/domain";
-import { AliasRepository, ContentRepository, contentKeyAlias, type LexiloopDatabase } from "@lexiloop/db";
+import {
+  ContentRepository,
+  cardState,
+  contentKeyAlias,
+  wordProgress,
+  stateConflictsFromRows,
+  type LexiloopDatabase,
+} from "@lexiloop/db";
+import { inArray } from "drizzle-orm";
 import { z } from "zod";
 import { PublishError } from "./publish";
 
@@ -19,15 +33,46 @@ export const AliasFileSchema = z.strictObject({
   edges: z.array(AliasEdgeSchema),
 });
 
+/** One stored `content_key_alias` row, as the union gate consumes it. */
+export interface StoredAliasEdge {
+  releaseId: string;
+  fromKey: string;
+  toKey: string;
+  canonicalKey: string;
+}
+
+/** Existence probe for one edge endpoint in its declared release. */
+export type AliasEndpointLookup = (
+  entityType: "word" | "card",
+  releaseId: string,
+  key: string,
+) => Promise<boolean>;
+
 /**
- * Validate a full edge set against the database and map it to the
+ * The data the alias gates need, fetched lazily behind narrow ports: drizzle
+ * over a local database, or remote SQL over the wrangler CLI.
+ */
+export interface AliasValidationSource {
+  storedEdges(): Promise<readonly StoredAliasEdge[]>;
+  endpointExists: AliasEndpointLookup;
+  /** word_progress/card_state rows under the component keys. */
+  stateRows(keys: readonly string[]): Promise<{
+    progress: ReadonlyArray<{ userId: string; wordKey: string }>;
+    cards: ReadonlyArray<{ userId: string; contentCardKey: string }>;
+  }>;
+}
+
+/**
+ * Validate a full edge set against the data source and map it to the
  * release-scoped rows the activation batch imports. Every edge is stored
  * under the release that DECLARES it (`from_release_id`), so the presenting
- * release's own rows resolve its renamed keys (spec 6.4).
+ * release's own rows resolve its renamed keys (spec 6.4). This is the ONE
+ * implementation of the activation gates; `prepareAliasBatch` feeds it from
+ * a local database.
  */
-export async function prepareAliasBatch(
-  db: LexiloopDatabase,
+export async function prepareAliasBatchFromData(
   edges: readonly unknown[],
+  source: AliasValidationSource,
   now: number,
 ): Promise<Array<{ releaseId: string; fromKey: string; toKey: string; canonicalKey: string; createdAt: number }>> {
   let graph: AliasGraph;
@@ -37,9 +82,10 @@ export async function prepareAliasBatch(
     const code = (err as { code?: string }).code ?? "ALIAS_INVALID";
     throw new PublishError(code, err instanceof Error ? err.message : String(err));
   }
-  await assertNoCrossActivationConflicts(db, graph);
-  await assertAliasEndsExist(db, graph);
-  const conflicts = await new AliasRepository(db).findStateConflicts(graph);
+  assertNoCrossActivationConflicts(await source.storedEdges(), graph);
+  await assertAliasEndsExist(source.endpointExists, graph);
+  const { progress, cards } = await source.stateRows([...graph.canonicalByKey.keys()]);
+  const conflicts = stateConflictsFromRows(graph.canonicalByKey, progress, cards);
   if (conflicts.length > 0) {
     const detail = conflicts
       .map((conflict) => `${conflict.userId}/${conflict.table}/${conflict.key} (canonical ${conflict.canonicalKey})`)
@@ -58,19 +104,50 @@ export async function prepareAliasBatch(
   }));
 }
 
-/** Both ends of every alias edge must exist in their declared releases. */
-async function assertAliasEndsExist(db: LexiloopDatabase, graph: AliasGraph): Promise<void> {
+/** The drizzle-backed data source (local rehearsal/tests). */
+export function drizzleAliasSource(db: LexiloopDatabase): AliasValidationSource {
   const content = new ContentRepository(db);
+  return {
+    async storedEdges() {
+      return (await db.select().from(contentKeyAlias)) as StoredAliasEdge[];
+    },
+    async endpointExists(entityType, releaseId, key) {
+      const found =
+        entityType === "word" ? await content.getWord(releaseId, key) : await content.getCard(releaseId, key);
+      return found !== undefined;
+    },
+    async stateRows(keys) {
+      if (keys.length === 0) return { progress: [], cards: [] };
+      const progress = (await db
+        .select()
+        .from(wordProgress)
+        .where(inArray(wordProgress.wordKey, keys))) as Array<{ userId: string; wordKey: string }>;
+      const cards = (await db
+        .select()
+        .from(cardState)
+        .where(inArray(cardState.contentCardKey, keys))) as Array<{ userId: string; contentCardKey: string }>;
+      return { progress, cards };
+    },
+  };
+}
+
+/** Local-database entry point (same gates as `prepareAliasBatchFromData`). */
+export async function prepareAliasBatch(
+  db: LexiloopDatabase,
+  edges: readonly unknown[],
+  now: number,
+): Promise<Array<{ releaseId: string; fromKey: string; toKey: string; canonicalKey: string; createdAt: number }>> {
+  return prepareAliasBatchFromData(edges, drizzleAliasSource(db), now);
+}
+
+/** Both ends of every alias edge must exist in their declared releases. */
+async function assertAliasEndsExist(lookup: AliasEndpointLookup, graph: AliasGraph): Promise<void> {
   for (const edge of graph.edges) {
     for (const [releaseId, key] of [
       [edge.from_release_id, edge.from_key],
       [edge.to_release_id, edge.to_key],
     ] as const) {
-      const found =
-        edge.entity_type === "word"
-          ? await content.getWord(releaseId, key)
-          : await content.getCard(releaseId, key);
-      if (!found) {
+      if (!(await lookup(edge.entity_type, releaseId, key))) {
         throw new PublishError(
           "ALIAS_END_MISSING",
           `alias ${edge.entity_type} endpoint (${releaseId}, ${key}) does not exist in its declared release`,
@@ -82,7 +159,8 @@ async function assertAliasEndsExist(db: LexiloopDatabase, graph: AliasGraph): Pr
 
 /**
  * Cross-activation fan-out gate (spec 6.4: one-to-many/many-to-one are
- * rejected at activation, never discovered afterwards).
+ * rejected at activation, never discovered afterwards) — pure over the
+ * stored rows so local and remote paths apply the same rule.
  *
  * The schema's uniqueness is per release (`UNIQUE (release_id, from_key)` /
  * `UNIQUE (release_id, to_key)`), so the stored rows cannot see a conflict
@@ -102,13 +180,10 @@ async function assertAliasEndsExist(db: LexiloopDatabase, graph: AliasGraph): Pr
  * release does not supersede: both rows would coexist and leave `resolve`
  * ambiguous, so the stale stored canonical stays in the union and rejects.
  */
-async function assertNoCrossActivationConflicts(db: LexiloopDatabase, graph: AliasGraph): Promise<void> {
-  const stored = (await db.select().from(contentKeyAlias)) as Array<{
-    releaseId: string;
-    fromKey: string;
-    toKey: string;
-    canonicalKey: string;
-  }>;
+export function assertNoCrossActivationConflicts(
+  stored: readonly StoredAliasEdge[],
+  graph: AliasGraph,
+): void {
   if (stored.length === 0) return;
 
   // Transitively collect every stored edge reachable from the batch's keys,

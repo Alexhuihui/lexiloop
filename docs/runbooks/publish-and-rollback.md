@@ -93,10 +93,6 @@ fail-closed pass. What is faithful about the rehearsal: the exact D1 schema
 and migrations, the activation semantics (activation composes ONE atomic
 statement batch on BOTH drivers — `batch()` on real D1, a single transaction
 on the local SQLite driver), and the content-addressed R2 object semantics.
-What is NOT faithful: nothing here touches the remote Cloudflare bindings —
-there is no `--remote` path yet. Wiring these commands to the real D1/R2
-resources is future work (Task 19's Cloudflare step); until then the
-rehearsal runs entirely against local files.
 `--no-activate` stops after READY (the old release remains ACTIVE);
 `--rollback <release-id>` re-activates a RETIRED release instead.
 
@@ -110,6 +106,67 @@ pnpm compiler release smoke --release <release-id>    # VALIDATING -> READY | FA
 pnpm compiler release activate --release <release-id> [--aliases aliases.json]
 pnpm compiler release rollback --release <retired-release-id>
 ```
+
+## Remote publishing (--remote)
+
+The same lifecycle runs against the real Cloudflare bindings through the
+Wrangler CLI (Task 19):
+
+```bash
+tsx scripts/publish-release.ts \
+  --bundle .lexiloop-private/releases/<release-id> \
+  --remote \
+  [--d1-database <name>] [--r2-bucket <name>] \
+  [--aliases aliases.json] [--no-activate]
+tsx scripts/publish-release.ts --rollback <retired-release-id> --remote
+```
+
+The target comes from the untracked `infra/wrangler/wrangler.toml`
+(`database_name` + `bucket_name`); `--d1-database`/`--r2-bucket` override it.
+`--remote` is mutually exclusive with `--db`/`--r2-dir`. What runs:
+
+- **verify** — unchanged and local: the bundle manifest is re-hashed on disk
+  before any remote call. The manifest is the root of trust.
+- **stage** — every manifest audio asset is uploaded to the private bucket
+  (`wrangler r2 object put <bucket>/<key> --pipe --remote`, bytes verified
+  against the manifest SHA-256 first). wrangler has no `r2 object head`, so
+  uploads are UNCONDITIONAL: keys are content-addressed, re-uploading writes
+  identical bytes and the step stays idempotent. Then the release row
+  (IMPORTING) + unit reports are created with the same statements the local
+  repositories issue and `d1/001-content.sql`, `002-cards.sql`,
+  `003-search.sql` are applied in order via `wrangler d1 execute --remote
+  --file`. `app_meta` is NEVER touched. A release that is already staged
+  fails the run (RELEASE_ALREADY_STAGED).
+- **smoke** — the SAME pre-activation checks as local mode (unit totals vs
+  content rows, orphan FKs, FTS parity, audio rows gate-passed) run as remote
+  SQL and are judged by the SAME shared evaluator; every audio asset's
+  presence in the bucket is probed for real. IMPORTING -> VALIDATING ->
+  READY, or FAILED on any failure with the pointer untouched.
+- **activate** — the EXACT statement list of the runtime activation batch
+  (`buildActivationBatchStatements`: alias upserts, demotion of the previous
+  ACTIVE release, promotion, `app_meta` pointer switch LAST) rendered to
+  literal SQL and applied as a SEQUENCE of `wrangler d1 execute --command`
+  calls, because wrangler has no batch mode. This is the one place the remote
+  path is weaker than the Worker's runtime path: the Worker's `batch()` is
+  atomic on D1, the publish-time sequence is not. Two properties keep it
+  safe: every failure STOPS BEFORE the pointer switch (the previous release
+  keeps serving), and the pointer switch is verified afterwards together with
+  the target's ACTIVE status. If a run fails after the promotion but before
+  the pointer switch (target ACTIVE, pointer still naming the old release),
+  re-run the same activate command: it recognizes that state, re-applies the
+  idempotent statements, and completes the switch.
+- **rollback** — same demote/promote/pointer statements for a RETIRED
+  release; no aliases are imported.
+
+Declared alias edges (`--aliases`) are validated against the REMOTE data
+through the same rules as local mode (stored-edge union fan-out/cycle gate,
+endpoint existence, user-state collapse) before any statement is applied.
+
+There is no `--force`, no status override, and no check bypass in remote
+mode either: every wrangler invocation's output is parsed, and a command that
+fails or returns unparseable output is a named failure (WRANGLER_FAILED /
+WRANGLER_OUTPUT_INVALID), never a pass. A failed run always leaves the
+previous release ACTIVE.
 
 Guarantees:
 

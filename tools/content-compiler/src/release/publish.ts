@@ -24,10 +24,9 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { eq, sql, type SQL } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import {
   ReleaseRepository,
-  audioAsset,
   type LexiloopDatabase,
 } from "@lexiloop/db";
 import { AudioManifestRowSchema, type AudioManifestRow } from "../tts/cache";
@@ -189,6 +188,126 @@ export interface SmokeCheck {
   detail?: string;
 }
 
+// -- Shared smoke criteria -------------------------------------------------
+//
+// The pre-activation checks are ONE set of SQL builders and ONE evaluator,
+// used by the local driver (drizzle over SQLite) and the remote driver (the
+// same statements rendered to literal SQL and run over wrangler) — no
+// divergent copies (spec 17).
+
+/** release_unit reports exist for the release. */
+export function smokeUnitCountQuery(releaseId: string): SQL {
+  return sql`SELECT COUNT(*) AS n FROM release_unit WHERE release_id = ${releaseId}`;
+}
+
+/** Per-metric totals the unit reports claim. */
+export function smokeExpectedSumsQuery(releaseId: string): SQL {
+  return sql`SELECT COALESCE(SUM(words),0) AS words, COALESCE(SUM(senses),0) AS senses,
+      COALESCE(SUM(phrases),0) AS phrases, COALESCE(SUM(examples),0) AS examples,
+      COALESCE(SUM(explanations),0) AS explanations, COALESCE(SUM(cards),0) AS cards
+      FROM release_unit WHERE release_id = ${releaseId}`;
+}
+
+/** Per-metric content rows actually imported for the release. */
+export function smokeActualCountsQuery(releaseId: string): SQL {
+  return sql`SELECT
+        (SELECT COUNT(*) FROM word WHERE release_id = ${releaseId}) AS words,
+        (SELECT COUNT(*) FROM sense WHERE release_id = ${releaseId}) AS senses,
+        (SELECT COUNT(*) FROM phrase WHERE release_id = ${releaseId}) AS phrases,
+        (SELECT COUNT(*) FROM example WHERE release_id = ${releaseId}) AS examples,
+        (SELECT COUNT(*) FROM explanation WHERE release_id = ${releaseId}) AS explanations,
+        (SELECT COUNT(*) FROM card_definition WHERE release_id = ${releaseId}) AS cards`;
+}
+
+/** Orphan foreign keys (spec 17: zero dangling references). */
+export function smokeOrphansQuery(releaseId: string): SQL {
+  return sql`SELECT
+        (SELECT COUNT(*) FROM unit c LEFT JOIN book p ON p.release_id = c.release_id AND p.book_key = c.book_key
+           WHERE c.release_id = ${releaseId} AND p.book_key IS NULL) AS unit_book,
+        (SELECT COUNT(*) FROM word c LEFT JOIN unit p ON p.release_id = c.release_id AND p.unit_key = c.unit_key
+           WHERE c.release_id = ${releaseId} AND p.unit_key IS NULL) AS word_unit,
+        (SELECT COUNT(*) FROM sense c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
+           WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS sense_word,
+        (SELECT COUNT(*) FROM phrase c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
+           WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS phrase_word,
+        (SELECT COUNT(*) FROM example c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
+           WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS example_word,
+        (SELECT COUNT(*) FROM explanation c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
+           WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS explanation_word,
+        (SELECT COUNT(*) FROM card_definition c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
+           WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS card_word,
+        (SELECT COUNT(*) FROM content_audio_link c LEFT JOIN audio_asset p ON p.release_id = c.release_id AND p.asset_key = c.asset_key
+           WHERE c.release_id = ${releaseId} AND p.asset_key IS NULL) AS link_asset`;
+}
+
+/** FTS index rows for the release (parity is judged against content rows). */
+export function smokeFtsCountQuery(releaseId: string): SQL {
+  return sql`SELECT COUNT(*) AS n FROM content_search_fts WHERE release_id = ${releaseId}`;
+}
+
+/** The release's audio asset rows (presence + gate judged per row). */
+export function smokeAudioRowsQuery(releaseId: string): SQL {
+  return sql`SELECT asset_key, validation FROM audio_asset WHERE release_id = ${releaseId}`;
+}
+
+export interface SmokeChecksInput {
+  unitReportCount: number;
+  expected: Record<string, unknown>;
+  actual: Record<string, unknown>;
+  orphans: Record<string, unknown>;
+  ftsCount: number;
+  audio: { missing: number; unvalidated: number };
+}
+
+/**
+ * The pre-activation verdicts (spec 17) over raw query results: unit report
+ * presence, report/content row parity, orphan FKs, FTS parity, and audio
+ * object presence + gate. Both drivers feed this the same way.
+ */
+export function evaluateSmokeChecks(data: SmokeChecksInput): SmokeCheck[] {
+  const { expected, actual } = data;
+  const checks: SmokeCheck[] = [];
+  const check = (name: string, passed: boolean, detail?: string): void => {
+    checks.push({ name, passed, ...(detail !== undefined ? { detail } : {}) });
+  };
+
+  // release_unit totals vs content rows (spec 17: zero partial units).
+  check("unit_reports_present", data.unitReportCount > 0);
+  for (const metric of ["words", "senses", "phrases", "examples", "explanations", "cards"] as const) {
+    check(
+      `row_counts_${metric}`,
+      Number(expected[metric] ?? 0) === Number(actual[metric] ?? 0),
+      `release_unit sums ${Number(expected[metric] ?? 0)} vs content rows ${Number(actual[metric] ?? 0)}`,
+    );
+  }
+
+  // Orphan foreign keys (spec 17: zero dangling references).
+  let orphanTotal = 0;
+  for (const value of Object.values(data.orphans)) {
+    orphanTotal += Number(value ?? 0);
+  }
+  check(
+    "foreign_keys",
+    orphanTotal === 0,
+    orphanTotal === 0 ? undefined : `dangling references: ${JSON.stringify(data.orphans)}`,
+  );
+
+  // FTS parity (spec 6.3: index must cover headwords, glosses, phrases, examples).
+  const searchable =
+    Number(actual["words"] ?? 0) + Number(actual["senses"] ?? 0) + Number(actual["phrases"] ?? 0) + Number(actual["examples"] ?? 0);
+  check("fts_sync", data.ftsCount === searchable, `index rows ${data.ftsCount} vs searchable content ${searchable}`);
+
+  // Audio: every asset present in private R2 and gate-passed (spec 5.8/17).
+  check(
+    "audio_objects",
+    data.audio.missing === 0 && data.audio.unvalidated === 0,
+    data.audio.missing === 0 && data.audio.unvalidated === 0
+      ? undefined
+      : `${data.audio.missing} object(s) missing from R2, ${data.audio.unvalidated} not gate-passed`,
+  );
+  return checks;
+}
+
 /**
  * Pre-activation validation (spec 17): row totals, foreign keys, FTS parity,
  * and audio object presence. IMPORTING -> VALIDATING -> READY on success,
@@ -210,99 +329,36 @@ export async function smokeRelease(input: {
   }
   await releases.updateStatus(releaseId, "VALIDATING");
 
-  const checks: SmokeCheck[] = [];
-  const check = (name: string, passed: boolean, detail?: string): void => {
-    checks.push({ name, passed, ...(detail !== undefined ? { detail } : {}) });
-  };
-
-  // release_unit totals vs content rows (spec 17: zero partial units).
-  check(
-    "unit_reports_present",
-    await scalar(db, sql`SELECT COUNT(*) AS n FROM release_unit WHERE release_id = ${releaseId}`) > 0,
-  );
+  const unitReportCount = await scalar(db, smokeUnitCountQuery(releaseId));
   const expected = (
-    (await db.all(
-      sql`SELECT COALESCE(SUM(words),0) AS words, COALESCE(SUM(senses),0) AS senses,
-          COALESCE(SUM(phrases),0) AS phrases, COALESCE(SUM(examples),0) AS examples,
-          COALESCE(SUM(explanations),0) AS explanations, COALESCE(SUM(cards),0) AS cards
-          FROM release_unit WHERE release_id = ${releaseId}`,
-    )) as Array<Record<string, number | string | null>>
+    (await db.all(smokeExpectedSumsQuery(releaseId))) as Array<Record<string, number | string | null>>
   )[0] ?? {};
   const actual = (
-    (await db.all(
-      sql`SELECT
-            (SELECT COUNT(*) FROM word WHERE release_id = ${releaseId}) AS words,
-            (SELECT COUNT(*) FROM sense WHERE release_id = ${releaseId}) AS senses,
-            (SELECT COUNT(*) FROM phrase WHERE release_id = ${releaseId}) AS phrases,
-            (SELECT COUNT(*) FROM example WHERE release_id = ${releaseId}) AS examples,
-            (SELECT COUNT(*) FROM explanation WHERE release_id = ${releaseId}) AS explanations,
-            (SELECT COUNT(*) FROM card_definition WHERE release_id = ${releaseId}) AS cards`,
-    )) as Array<Record<string, number | string | null>>
+    (await db.all(smokeActualCountsQuery(releaseId))) as Array<Record<string, number | string | null>>
   )[0] ?? {};
-  for (const metric of ["words", "senses", "phrases", "examples", "explanations", "cards"] as const) {
-    check(
-      `row_counts_${metric}`,
-      Number(expected[metric] ?? 0) === Number(actual[metric] ?? 0),
-      `release_unit sums ${Number(expected[metric] ?? 0)} vs content rows ${Number(actual[metric] ?? 0)}`,
-    );
-  }
-
-  // Orphan foreign keys (spec 17: zero dangling references).
-  const orphans = (
-    (await db.all(
-      sql`SELECT
-            (SELECT COUNT(*) FROM unit c LEFT JOIN book p ON p.release_id = c.release_id AND p.book_key = c.book_key
-               WHERE c.release_id = ${releaseId} AND p.book_key IS NULL) AS unit_book,
-            (SELECT COUNT(*) FROM word c LEFT JOIN unit p ON p.release_id = c.release_id AND p.unit_key = c.unit_key
-               WHERE c.release_id = ${releaseId} AND p.unit_key IS NULL) AS word_unit,
-            (SELECT COUNT(*) FROM sense c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
-               WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS sense_word,
-            (SELECT COUNT(*) FROM phrase c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
-               WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS phrase_word,
-            (SELECT COUNT(*) FROM example c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
-               WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS example_word,
-            (SELECT COUNT(*) FROM explanation c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
-               WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS explanation_word,
-            (SELECT COUNT(*) FROM card_definition c LEFT JOIN word p ON p.release_id = c.release_id AND p.word_key = c.word_key
-               WHERE c.release_id = ${releaseId} AND p.word_key IS NULL) AS card_word,
-            (SELECT COUNT(*) FROM content_audio_link c LEFT JOIN audio_asset p ON p.release_id = c.release_id AND p.asset_key = c.asset_key
-               WHERE c.release_id = ${releaseId} AND p.asset_key IS NULL) AS link_asset`,
-    )) as Array<Record<string, number | string | null>>
-  )[0] ?? {};
-  let orphanTotal = 0;
-  for (const value of Object.values(orphans)) {
-    orphanTotal += Number(value ?? 0);
-  }
-  check(
-    "foreign_keys",
-    orphanTotal === 0,
-    orphanTotal === 0 ? undefined : `dangling references: ${JSON.stringify(orphans)}`,
-  );
-
-  // FTS parity (spec 6.3: index must cover headwords, glosses, phrases, examples).
-  const ftsCount = await scalar(
-    db,
-    sql`SELECT COUNT(*) AS n FROM content_search_fts WHERE release_id = ${releaseId}`,
-  );
-  const searchable = Number(actual["words"] ?? 0) + Number(actual["senses"] ?? 0) + Number(actual["phrases"] ?? 0) + Number(actual["examples"] ?? 0);
-  check("fts_sync", ftsCount === searchable, `index rows ${ftsCount} vs searchable content ${searchable}`);
+  const orphans = ((await db.all(smokeOrphansQuery(releaseId))) as Array<Record<string, number | string | null>>)[0] ?? {};
+  const ftsCount = await scalar(db, smokeFtsCountQuery(releaseId));
 
   // Audio: every asset present in private R2 and gate-passed (spec 5.8/17).
-  const assets = await db.select().from(audioAsset).where(eq(audioAsset.releaseId, releaseId));
+  const assets = (await db.all(smokeAudioRowsQuery(releaseId))) as Array<{
+    asset_key: string;
+    validation: string;
+  }>;
   let missingAudio = 0;
   let unvalidatedAudio = 0;
   for (const asset of assets) {
-    if (!(await r2.head(asset.assetKey))) missingAudio += 1;
-    if (asset.validation !== "PASSED") unvalidatedAudio += 1;
+    if (!(await r2.head(asset["asset_key"]))) missingAudio += 1;
+    if (asset["validation"] !== "PASSED") unvalidatedAudio += 1;
   }
-  check(
-    "audio_objects",
-    missingAudio === 0 && unvalidatedAudio === 0,
-    missingAudio === 0 && unvalidatedAudio === 0
-      ? undefined
-      : `${missingAudio} object(s) missing from R2, ${unvalidatedAudio} not gate-passed`,
-  );
 
+  const checks = evaluateSmokeChecks({
+    unitReportCount,
+    expected,
+    actual,
+    orphans,
+    ftsCount,
+    audio: { missing: missingAudio, unvalidated: unvalidatedAudio },
+  });
   const failed = checks.filter((candidate) => !candidate.passed);
   if (failed.length > 0) {
     await releases.updateStatus(releaseId, "FAILED");
