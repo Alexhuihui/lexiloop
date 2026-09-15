@@ -12,6 +12,7 @@ export default tseslint.config(
       "**/.venv/**",
       "**/.wrangler/**",
       "**/node_modules/**",
+      ".lexiloop-private/**",
     ],
   },
   js.configs.recommended,
