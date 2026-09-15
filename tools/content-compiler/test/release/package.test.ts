@@ -50,7 +50,12 @@ import {
 import { buildCli, type CliDeps } from "../../src/cli";
 import { createFileLedger, type LedgerStore } from "../../src/ledger";
 import { silentLogger } from "../../src/logging";
+import { readJsonl } from "../../src/media";
 import { runPipeline } from "../../src/pipeline";
+import { LLCY_2024_NORMALIZE_CONFIG } from "../../src/normalize/config";
+import { segmentStructure } from "../../src/normalize/segmentation";
+import { assignReadingOrder } from "../../src/normalize/reading-order";
+import { OcrBlockRecordSchema, toNormalizeInputBlocks } from "../../src/ocr-adapter";
 import { loadAudioManifest, ttsCacheKey } from "../../src/tts/cache";
 import {
   PRODUCTION_STAGE_DEPENDENCIES,
@@ -251,9 +256,9 @@ interface AudioFixtureRow {
   bytes: number;
 }
 
-async function writeAudioFixture(workDir: string): Promise<AudioFixtureRow[]> {
+async function writeAudioFixture(workDir: string, texts: readonly string[] = AUDIO_TEXTS): Promise<AudioFixtureRow[]> {
   const rows: AudioFixtureRow[] = [];
-  for (const text of AUDIO_TEXTS) {
+  for (const text of texts) {
     // Cache keys must match the TTS planner exactly: sha256(provider, model,
     // voice, normalized text, synthesis config version) with the repo config.
     const cacheKey = ttsCacheKey({
@@ -849,6 +854,300 @@ describe("RELEASE_PACKAGE target scope (spec 5.6)", () => {
     const stage = createReleasePackageStage({ privateRoot: fixture.privateRoot, units: ["u01", "u-unknown"] });
     await expect(stage.run(undefined, fixture.ctx)).rejects.toMatchObject({
       code: "RELEASE_SCOPE_INVALID",
+    });
+    await expect(readdir(path.join(fixture.privateRoot, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Freshness gate vs whole-book stage outputs (real-raster regression): the
+// recorded STRUCTURE_NORMALIZE/CARD_GENERATE/AUDIO_VALIDATE outputs are
+// deterministic functions of the WHOLE book, so the gate must reconstruct
+// them exactly as the stages computed them — the --units scope narrows what
+// gets imported, never the freshness comparison.
+// ---------------------------------------------------------------------------
+
+/** One synthetic OCR block row (OcrBlockRecordSchema) for the mini raster. */
+function ocrBlock(page: number, bbox: [number, number, number, number], text: string): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    pipeline: "pp-struct",
+    pipeline_version: "1",
+    model_version: "1",
+    config_version: 1,
+    source_sha256: PDF_HASH,
+    page,
+    page_image_sha256: sha(`page-${page}`),
+    bbox,
+    layout_label: "other",
+    text,
+    confidence: 0.98,
+    source_raw_ref_hash: sha(`raw-ocr-${page}-${text}`),
+  };
+}
+
+/**
+ * The STRUCTURE_NORMALIZE output exactly as the stage computed it from the
+ * raw OCR artifact (same pure composition as createStructureNormalizeStage):
+ * segmentation over ocr.jsonl with no resolved visual corrections.
+ */
+async function trueStructureNormalizeOutput(workDir: string): Promise<Record<string, unknown>> {
+  const records = await readJsonl(path.join(workDir, "ocr.jsonl"), OcrBlockRecordSchema);
+  const normalized = segmentStructure(
+    assignReadingOrder(toNormalizeInputBlocks(records)),
+    LLCY_2024_NORMALIZE_CONFIG,
+    [],
+  );
+  return {
+    source_sha256: SOURCE_HASH,
+    normalized_jsonl: "normalized.jsonl",
+    normalized_jsonl_sha256: await sha256File(path.join(workDir, "normalized.jsonl")),
+    counts: {
+      units: normalized.units.length,
+      words: normalized.words.length,
+      senses: normalized.senses.length,
+      phrases: normalized.phrases.length,
+      examples: normalized.examples.length,
+    },
+    unit_boundaries: normalized.unitBoundaries,
+    resolved_packets: 0,
+  };
+}
+
+/**
+ * Work directory in the real raster's shape: page 1 is a signal-less
+ * chapter-opener page that STRUCTURE_NORMALIZE attributes to unit c1.u1 via
+ * the FOLLOWING page's right-rail tab — so the recorded unit boundary starts
+ * on a page carrying none of the unit's rows (the real book: c1.u1 opens on
+ * page 15 while every c1.u1 row points at page 17+). The normalize ledger
+ * covers the whole book (2 units) while cards.jsonl + CARD_GENERATE are
+ * scoped to c1.u1 (what `cards generate --units c1.u1` recorded) and the
+ * whole-book TTS artifact covers all three headwords.
+ */
+async function makeTabAttributedFixture(): Promise<ReleaseFixture> {
+  const privateRoot = await makeTempDir("release-private-tab-");
+  const workDir = path.join(privateRoot, "work", SOURCE_HASH);
+  await mkdir(workDir, { recursive: true });
+
+  const ocrRows = [
+    ocrBlock(1, [0.2, 0.065, 0.44, 0.1], "Chapter 1"),
+    ocrBlock(1, [0.1, 0.14, 0.48, 0.2], "alpha /\u02c8\u00e6lf\u0259/ n. \u963f\u5c14\u6cd5"),
+    ocrBlock(2, [0.9359, 0.8278, 0.9709, 0.8478], "01"),
+    ocrBlock(2, [0.1, 0.14, 0.48, 0.2], "beta /\u02c8bi\u02d0t\u0259/ vt. \u8d1d\u5854"),
+    ocrBlock(3, [0.9359, 0.8278, 0.9709, 0.8478], "02"),
+    ocrBlock(3, [0.1, 0.14, 0.48, 0.2], "gamma /\u02c8\u0261\u00e6m\u0259/ n. \u4f3d\u9a6c"),
+  ];
+  await writeFile(
+    path.join(workDir, "ocr.jsonl"),
+    ocrRows.map((row) => JSON.stringify(row)).join("\n") + "\n",
+    "utf8",
+  );
+
+  // The unit row's provenance page is the tab anchor's page (2), NOT the
+  // boundary's first page (1): reconstructing recorded spans from the
+  // normalized rows alone can never reproduce the stage output.
+  const tabUnits = [
+    Unit.parse({ unit_key: "c1.u1", book_key: "llcy-2024", level: 1, unit_order: 1, title: "Unit 1", ...provenance(2, "01 ||RAW-OCR-TAB-U1||") }),
+    Unit.parse({ unit_key: "c1.u2", book_key: "llcy-2024", level: 1, unit_order: 2, title: "Unit 2", ...provenance(3, "02 ||RAW-OCR-TAB-U2||") }),
+  ];
+  const tabWords = [
+    Word.parse({ word_key: "w.c1.u1.0001.alpha", unit_key: "c1.u1", headword: "alpha", tier: "core", source_order: 1, ...provenance(1, "alpha n. \u963f\u5c14\u6cd5 ||RAW-OCR-ALPHA||") }),
+    Word.parse({ word_key: "w.c1.u1.0002.beta", unit_key: "c1.u1", headword: "beta", tier: "core", source_order: 2, ...provenance(2, "beta vt. \u8d1d\u5854 ||RAW-OCR-BETA||") }),
+    Word.parse({ word_key: "w.c1.u2.0001.gamma", unit_key: "c1.u2", headword: "gamma", tier: "core", source_order: 1, ...provenance(3, "gamma n. \u4f3d\u9a6c ||RAW-OCR-GAMMA||") }),
+  ];
+  const tabSenses = tabWords.map((word, index) =>
+    Sense.parse({
+      sense_key: `${word.word_key}-s1`,
+      word_key: word.word_key,
+      pos: index === 1 ? "vt" : "n",
+      gloss: "\u91ca\u4e49",
+      sense_order: 1,
+      ...provenance(word.page_number, `gloss-${index} ||RAW-OCR-SENSE-${index}||`),
+    }),
+  );
+  const normalizedRows = [
+    { entity_type: "book" as const, book_key: "llcy-2024", title: "LLRC 6500", edition: "2024", ...provenance(1, "book cover ||RAW-OCR-TAB-BOOK||") },
+    ...tabUnits.map((unit) => ({ entity_type: "unit" as const, ...unit })),
+    ...tabWords.map((word) => ({ entity_type: "word" as const, ...word })),
+    ...tabSenses.map((sense) => ({ entity_type: "sense" as const, ...sense })),
+  ];
+  await writeFile(
+    path.join(workDir, "normalized.jsonl"),
+    normalizedRows.map((row) => JSON.stringify(row)).join("\n") + "\n",
+    "utf8",
+  );
+
+  // Scoped card artifact: c1.u1 only (c1.u2 ships in no scoped release).
+  const tabCards = [
+    CardDefinition.parse({
+      content_card_key: "card.w.c1.u1.0001.alpha.wm",
+      card_type: "WORD_MEANING",
+      target_entity_key: "w.c1.u1.0001.alpha-s1",
+      word_key: "w.c1.u1.0001.alpha",
+      unit_key: "c1.u1",
+      template_version: "v1",
+      status: "ACTIVE",
+    }),
+    CardDefinition.parse({
+      content_card_key: "card.w.c1.u1.0002.beta.wm",
+      card_type: "WORD_MEANING",
+      target_entity_key: "w.c1.u1.0002.beta-s1",
+      word_key: "w.c1.u1.0002.beta",
+      unit_key: "c1.u1",
+      template_version: "v1",
+      status: "ACTIVE",
+    }),
+  ];
+  await writeFile(
+    path.join(workDir, "cards.jsonl"),
+    tabCards.map((card) => JSON.stringify(card)).join("\n") + "\n",
+    "utf8",
+  );
+
+  // Whole-book TTS artifact: every headword of both units (alpha/beta/gamma).
+  await writeAudioFixture(workDir, ["alpha", "beta", "gamma"]);
+  await writeValidationReport(workDir, { status: "PASSED" }, "c1.u1");
+  await writeValidationReport(workDir, { status: "PASSED" }, "c1.u2");
+
+  const ledgerDir = await makeTempDir("release-ledger-tab-");
+  const ledger = createFileLedger({ directory: ledgerDir });
+  // The normalize ledger records the WHOLE-book stage output (both units),
+  // with boundary spans that are not derivable from the normalized rows.
+  const trueNormalize = await trueStructureNormalizeOutput(workDir);
+  expect(trueNormalize.unit_boundaries).toEqual([
+    { unit_key: "c1.u1", unit_order: 1, title: "Unit 1", first_page: 1, last_page: 2 },
+    { unit_key: "c1.u2", unit_order: 2, title: "Unit 2", first_page: 3, last_page: 3 },
+  ]);
+  for (const name of PRODUCTION_STAGE_NAMES.slice(0, 12)) {
+    let output: Record<string, unknown>;
+    switch (name) {
+      case "STRUCTURE_NORMALIZE":
+        output = trueNormalize;
+        break;
+      case "CARD_GENERATE":
+        output = {
+          source_sha256: SOURCE_HASH,
+          cards_jsonl: "cards.jsonl",
+          cards_jsonl_sha256: await sha256File(path.join(workDir, "cards.jsonl")),
+          card_rules_version: "cards-v1",
+          counts: {
+            units: 1,
+            words: 2,
+            cards: tabCards.length,
+            by_type: { WORD_MEANING: tabCards.length, CONTEXT_MEANING: 0, PHRASE: 0, SENSE_DISCRIMINATION: 0 },
+          },
+          units: [{ unit_key: "c1.u1", words: 2, cards: tabCards.length }],
+        };
+        break;
+      case "AGENT_ENRICH":
+      case "AGENT_REVIEW":
+      case "DETERMINISTIC_VALIDATE":
+      case "REPAIR_LOOP":
+        output = {
+          source_sha256: SOURCE_HASH,
+          units: [
+            { unit_key: "c1.u1", phase: "passed" },
+            { unit_key: "c1.u2", phase: "passed" },
+          ],
+        };
+        break;
+      case "TTS_SYNTHESIZE":
+        output = {
+          source_sha256: SOURCE_HASH,
+          audio_manifest: "audio/manifest.jsonl",
+          audio_manifest_sha256: await sha256File(path.join(workDir, "audio", "manifest.jsonl")),
+          synthesis_config_version: "mimo-v2.5-tts-1",
+          counts: { items: 3, unique_texts: 3, cache_hits: 0, synthesized: 3 },
+          characters: ["alpha", "beta", "gamma"].join("").length,
+          assets: [],
+        };
+        break;
+      case "AUDIO_VALIDATE":
+        output = {
+          source_sha256: SOURCE_HASH,
+          audio_inspection: "audio/inspection.jsonl",
+          audio_inspection_sha256: await sha256File(path.join(workDir, "audio", "inspection.jsonl")),
+          synthesis_config_version: "mimo-v2.5-tts-1",
+          counts: { checked: 3, failed: 0 },
+        };
+        break;
+      default:
+        output = await stageOutputFor(name, workDir);
+        break;
+    }
+    await ledger.save({
+      ...PRIMED_ATTEMPTS,
+      stage: name,
+      input_hash: hashString(`${name}:input`),
+      config_version_hash: hashString(`${name}:config`),
+      output_hash: hashJson(output),
+    } as Parameters<LedgerStore["save"]>[0]);
+  }
+  const audioValidateOutput = {
+    source_sha256: SOURCE_HASH,
+    audio_inspection: "audio/inspection.jsonl",
+    audio_inspection_sha256: await sha256File(path.join(workDir, "audio", "inspection.jsonl")),
+    synthesis_config_version: "mimo-v2.5-tts-1",
+    counts: { checked: 3, failed: 0 },
+  };
+  const ctx: StageRunContext = {
+    runId: "release-tab-test",
+    sourceHash: SOURCE_HASH,
+    config: {},
+    ledger,
+    logger: silentLogger,
+    upstream: { stage: "AUDIO_VALIDATE", outputHash: hashJson(audioValidateOutput) },
+  };
+  const stage = createReleasePackageStage({ privateRoot });
+  return { privateRoot, workDir, ledgerDir, ledger, audioRows: [], audioValidateOutput, stage, ctx };
+}
+
+describe("RELEASE_PACKAGE freshness gate vs whole-book stage outputs", () => {
+  it("packages a scoped release against a whole-book normalize ledger with tab-attributed unit spans", async () => {
+    // The exact real-world failure: `release package --units` over a compile
+    // whose STRUCTURE_NORMALIZE ledger was recorded over the whole book, with
+    // unit spans the normalized rows alone cannot reproduce (c1.u1's recorded
+    // first page 1 carries none of its rows; its rows point at page 2+).
+    const fixture = await makeTabAttributedFixture();
+    const stage = createReleasePackageStage({ privateRoot: fixture.privateRoot, units: ["c1.u1"] });
+    const output = ReleasePackageOutputSchema.parse(await stage.run(undefined, fixture.ctx));
+    expect(output.units).toBe(1);
+
+    const bundleDir = path.join(fixture.privateRoot, "releases", output.release_id);
+    const manifest = ReleaseManifest.parse(JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")));
+    expect(manifest.target_units).toEqual(["c1.u1"]);
+    // The out-of-scope unit never enters the D1 import.
+    const contentSql = await readFile(path.join(bundleDir, "d1", "001-content.sql"), "utf8");
+    expect(contentSql).toContain("c1.u1");
+    expect(contentSql).not.toContain("c1.u2");
+    const cardsSql = await readFile(path.join(bundleDir, "d1", "002-cards.sql"), "utf8");
+    expect(cardsSql).toContain("card.w.c1.u1.0001.alpha.wm");
+  });
+
+  it("still refuses to widen past the recorded card-generation scope", async () => {
+    const fixture = await makeTabAttributedFixture();
+    // Unscoped packaging disagrees with the scoped CARD_GENERATE ledger.
+    await expect(fixture.stage.run(undefined, fixture.ctx)).rejects.toMatchObject({
+      code: "RELEASE_INPUT_STALE",
+    });
+    await expect(readdir(path.join(fixture.privateRoot, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses when the raw OCR artifact drifted after the stage passed", async () => {
+    const fixture = await makeTabAttributedFixture();
+    // Dropping a block changes what STRUCTURE_NORMALIZE would record (word
+    // count), even though normalized.jsonl and the queue are untouched. The
+    // release scope matches the card ledger, so the normalize mirror is the
+    // only stale signal.
+    const stage = createReleasePackageStage({ privateRoot: fixture.privateRoot, units: ["c1.u1"] });
+    const ocrFile = path.join(fixture.workDir, "ocr.jsonl");
+    const drifted = (await readFile(ocrFile, "utf8"))
+      .split("\n")
+      .filter((line) => line.trim().length > 0 && !line.includes("gamma"))
+      .join("\n") + "\n";
+    await writeFile(ocrFile, drifted, "utf8");
+    await expect(stage.run(undefined, fixture.ctx)).rejects.toMatchObject({
+      code: "RELEASE_INPUT_STALE",
     });
     await expect(readdir(path.join(fixture.privateRoot, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
   });

@@ -57,6 +57,10 @@ import {
   WorkPacketError,
 } from "../agents/work-packets";
 import { loadQueue, VISUAL_OCR_QUEUE_DIR } from "../agents/visual-ocr";
+import { LLCY_2024_NORMALIZE_CONFIG } from "../normalize/config";
+import { segmentStructure } from "../normalize/segmentation";
+import { assignReadingOrder } from "../normalize/reading-order";
+import { OCR_JSONL, OcrBlockRecordSchema, toNormalizeInputBlocks } from "../ocr-adapter";
 import { COMPILER_ROOT, DEFAULT_RULE_PATH, fileExists, MediaOutputInvalidError, readJsonl, sha256File } from "../media";
 import { DEFAULT_OCR_CONFIG_PATH } from "../ocr-adapter";
 import { hashJson, StageError, type AnyStage, type StageRunContext } from "../stage";
@@ -478,10 +482,13 @@ async function artifactSha(filePath: string): Promise<string> {
  * Freshness gate: the recorded ledger outputs of STRUCTURE_NORMALIZE,
  * CARD_GENERATE, and AUDIO_VALIDATE are deterministic functions of the
  * packaged artifacts, so recomputing them from the current disk state must
- * reproduce the stored hashes exactly. Any post-pass edit — normalized
- * content, cards, audio manifest, or the inspection artifact — fails the
- * release closed with RELEASE_INPUT_STALE instead of shipping unvalidated
- * content under PASSED gates (spec 5.2: changed inputs must re-run).
+ * reproduce the stored hashes exactly. Every comparison mirrors the WHOLE-BOOK
+ * stage output exactly as the stage computed it — the declared --units scope
+ * narrows what gets imported (manifest, D1 rows, audio assets), never the
+ * freshness comparison. Any post-pass edit — normalized content, cards, audio
+ * manifest, or the inspection artifact — fails the release closed with
+ * RELEASE_INPUT_STALE instead of shipping unvalidated content under PASSED
+ * gates (spec 5.2: changed inputs must re-run).
  */
 async function assertFreshArtifacts(input: {
   ctx: StageRunContext;
@@ -511,40 +518,108 @@ async function assertFreshArtifacts(input: {
   };
 
   // STRUCTURE_NORMALIZE: bytes + counts + per-unit page spans + corrections.
-  const firstPage = new Map<string, number>();
-  const lastPage = new Map<string, number>();
-  const unitByWord = new Map(content.words.map((word) => [word.word_key, word.unit_key]));
-  const touch = (unitKey: string | undefined, page: number): void => {
-    if (!unitKey) return;
-    const current = lastPage.get(unitKey);
-    if (current === undefined || page > current) lastPage.set(unitKey, page);
-  };
-  for (const unit of content.units) {
-    firstPage.set(unit.unit_key, unit.page_number);
-    lastPage.set(unit.unit_key, unit.page_number);
-  }
-  for (const word of content.words) touch(word.unit_key, word.page_number);
-  for (const sense of content.senses) touch(unitByWord.get(sense.word_key), sense.page_number);
-  for (const phrase of content.phrases) touch(unitByWord.get(phrase.word_key), phrase.page_number);
-  for (const example of content.examples) touch(unitByWord.get(example.word_key), example.page_number);
-  const unitBoundaries = [...content.units]
-    .sort((a, b) => a.unit_order - b.unit_order || (a.unit_key < b.unit_key ? -1 : 1))
-    .map((unit) => ({
-      unit_key: unit.unit_key,
-      unit_order: unit.unit_order,
-      title: unit.title,
-      first_page: firstPage.get(unit.unit_key)!,
-      last_page: lastPage.get(unit.unit_key)!,
-    }));
+  // The recorded output covers the WHOLE book, so the reconstruction must
+  // reproduce it book-wide. When the stage's raw OCR input artifact survives,
+  // recompute the output exactly as the stage computed it (segmentation over
+  // the raw blocks + the resolved visual corrections): page attribution can
+  // open a unit on a page that carries none of its rows (the real raster: the
+  // chapter-1 tab misread opens c1.u1 on page 15 while every c1.u1 row points
+  // at page 17+), so the normalized rows alone cannot always reproduce the
+  // recorded spans. Only when the raw artifact is absent entirely (minimal
+  // work directories) does the gate mirror the output from the normalized
+  // artifact the stage wrote — a missing raw artifact can never turn a
+  // mismatch into a match, and a corrupt one fails closed below.
+  let counts: Record<string, number>;
+  let unitBoundaries: Array<{
+    unit_key: string;
+    unit_order: number;
+    title: string;
+    first_page: number;
+    last_page: number;
+  }>;
   let resolvedPackets: number;
-  try {
-    const visualEntries = await loadQueue(path.join(workDir, VISUAL_OCR_QUEUE_DIR));
-    resolvedPackets = visualEntries.filter((entry) => entry.status === "resolved" && entry.result !== undefined).length;
-  } catch {
-    // A missing/corrupt queue after the pass counts as drift: 0 recorded
-    // corrections can never disagree with an intact no-review compile, and
-    // any recorded corrections make the reconstruction mismatch below.
-    resolvedPackets = 0;
+  const ocrJsonlPath = path.join(workDir, OCR_JSONL);
+  if (await fileExists(ocrJsonlPath)) {
+    // Same pure composition as createStructureNormalizeStage's run body.
+    try {
+      const records = await readJsonl(ocrJsonlPath, OcrBlockRecordSchema);
+      const visualEntries = await loadQueue(path.join(workDir, VISUAL_OCR_QUEUE_DIR));
+      const corrections = visualEntries
+        .filter((entry) => entry.status === "resolved" && entry.result !== undefined)
+        .map((entry) => ({
+          packet_id: entry.result!.packet_id,
+          verdict: entry.result!.verdict,
+          ...(entry.result!.corrected_text !== undefined
+            ? { corrected_text: entry.result!.corrected_text }
+            : {}),
+          agent_run_id: entry.result!.agent_run_id,
+          round: entry.packet.round,
+        }));
+      const normalized = segmentStructure(
+        assignReadingOrder(toNormalizeInputBlocks(records)),
+        LLCY_2024_NORMALIZE_CONFIG,
+        corrections,
+      );
+      counts = {
+        units: normalized.units.length,
+        words: normalized.words.length,
+        senses: normalized.senses.length,
+        phrases: normalized.phrases.length,
+        examples: normalized.examples.length,
+      };
+      unitBoundaries = normalized.unitBoundaries;
+      resolvedPackets = corrections.length;
+    } catch (err) {
+      // A raw artifact that no longer recomputes (corrupt, or edited after
+      // the pass) is drift: refuse instead of degrading to a weaker check.
+      throw new StageError(
+        "RELEASE_INPUT_STALE",
+        `STRUCTURE_NORMALIZE output cannot be recomputed from ${OCR_JSONL} ` +
+          `(${err instanceof Error ? err.message : String(err)}); re-run the pipeline before packaging`,
+      );
+    }
+  } else {
+    counts = {
+      units: content.units.length,
+      words: content.words.length,
+      senses: content.senses.length,
+      phrases: content.phrases.length,
+      examples: content.examples.length,
+    };
+    const firstPage = new Map<string, number>();
+    const lastPage = new Map<string, number>();
+    const unitByWord = new Map(content.words.map((word) => [word.word_key, word.unit_key]));
+    const touch = (unitKey: string | undefined, page: number): void => {
+      if (!unitKey) return;
+      const current = lastPage.get(unitKey);
+      if (current === undefined || page > current) lastPage.set(unitKey, page);
+    };
+    for (const unit of content.units) {
+      firstPage.set(unit.unit_key, unit.page_number);
+      lastPage.set(unit.unit_key, unit.page_number);
+    }
+    for (const word of content.words) touch(word.unit_key, word.page_number);
+    for (const sense of content.senses) touch(unitByWord.get(sense.word_key), sense.page_number);
+    for (const phrase of content.phrases) touch(unitByWord.get(phrase.word_key), phrase.page_number);
+    for (const example of content.examples) touch(unitByWord.get(example.word_key), example.page_number);
+    unitBoundaries = [...content.units]
+      .sort((a, b) => a.unit_order - b.unit_order || (a.unit_key < b.unit_key ? -1 : 1))
+      .map((unit) => ({
+        unit_key: unit.unit_key,
+        unit_order: unit.unit_order,
+        title: unit.title,
+        first_page: firstPage.get(unit.unit_key)!,
+        last_page: lastPage.get(unit.unit_key)!,
+      }));
+    try {
+      const visualEntries = await loadQueue(path.join(workDir, VISUAL_OCR_QUEUE_DIR));
+      resolvedPackets = visualEntries.filter((entry) => entry.status === "resolved" && entry.result !== undefined).length;
+    } catch {
+      // A missing/corrupt queue after the pass counts as drift: 0 recorded
+      // corrections can never disagree with an intact no-review compile, and
+      // any recorded corrections make the reconstruction mismatch below.
+      resolvedPackets = 0;
+    }
   }
   assertLedgerOutput(
     "STRUCTURE_NORMALIZE",
@@ -552,19 +627,17 @@ async function assertFreshArtifacts(input: {
       source_sha256: ctx.sourceHash,
       normalized_jsonl: "normalized.jsonl",
       normalized_jsonl_sha256: await artifactSha(path.join(workDir, "normalized.jsonl")),
-      counts: {
-        units: content.units.length,
-        words: content.words.length,
-        senses: content.senses.length,
-        phrases: content.phrases.length,
-        examples: content.examples.length,
-      },
+      counts,
       unit_boundaries: unitBoundaries,
       resolved_packets: resolvedPackets,
     },
   );
 
   // CARD_GENERATE: cards bytes + per-unit/type counts under the same rules.
+  // The cards stage records the output under ITS declared target scope (what
+  // `cards generate --units` computed), so the reconstruction assesses the
+  // same declared release scope: a scope that disagrees with the recorded
+  // card artifact can never pass this gate (no widening a scoped compile).
   const cardsByType: Record<string, number> = {
     WORD_MEANING: 0,
     CONTEXT_MEANING: 0,
