@@ -15,7 +15,10 @@
  *   `insertUnitReport`; app_meta is NEVER touched.
  * - `smoke` runs the pre-activation checks as remote SQL through the SAME
  *   statement builders and the SAME evaluator as local mode
- *   (evaluateSmokeChecks), plus real object presence in the private bucket.
+ *   (evaluateSmokeChecks). Audio needs no object traffic: stage JUST
+ *   uploaded every manifest asset with verified success (exit status,
+ *   retried), so the check verifies every imported audio_asset row is
+ *   gate-passed and backed by a manifest asset of this verified bundle.
  *   Any failure records FAILED and never moves the pointer.
  * - `activate`/`rollback` render the EXACT statement list of the activation
  *   batch (buildActivationBatchStatements) and apply it sequentially, pointer
@@ -35,7 +38,10 @@
  * therefore UNCONDITIONAL — keys are content-addressed (sha-256 of the WAV,
  * verified against the manifest before upload), so a re-upload writes
  * identical bytes and the operation stays idempotent end to end. `reused` is
- * always 0 in remote mode.
+ * always 0 in remote mode. Each put retries up to 3 attempts with a short
+ * backoff (5s/15s); three consecutive failures abort the run fail-closed
+ * (nothing has been staged yet at upload time, and no pointer can move).
+ * Upload progress prints one line per 50 assets (`uploaded K/total`).
  *
  * The wrangler spawn boundary is injected (`WranglerCli`: argument arrays in,
  * structured results out); production wires spawnSync over the repo-local
@@ -266,45 +272,49 @@ async function remoteD1File(cli: WranglerCli, target: RemoteTarget, filePath: st
   }
 }
 
-/** Unconditional content-addressed upload (`r2 object put --pipe`). */
-async function remoteR2Put(cli: WranglerCli, target: RemoteTarget, objectKey: string, body: Uint8Array): Promise<void> {
-  await requireOk(
-    cli,
-    ["r2", "object", "put", `${target.r2Bucket}/${objectKey}`, "--remote", "--config", target.configPath, "--pipe"],
-    body,
-  );
-}
+/** Unconditional content-addressed upload (`r2 object put --pipe`), retried. */
+const PUT_MAX_ATTEMPTS = 3;
+const PUT_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000];
 
-/**
- * Object presence probe (`r2 object get --pipe`, exit status only): false
- * when the object is absent OR the fetch fails — smoke counts either as a
- * missing object and fails closed.
- */
-async function remoteR2ObjectPresent(cli: WranglerCli, target: RemoteTarget, objectKey: string): Promise<boolean> {
-  const result = await cli.run([
-    "r2",
-    "object",
-    "get",
-    `${target.r2Bucket}/${objectKey}`,
-    "--remote",
-    "--config",
-    target.configPath,
-    "--pipe",
-  ]);
-  return result.status === 0;
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+
+async function remoteR2Put(
+  cli: WranglerCli,
+  target: RemoteTarget,
+  objectKey: string,
+  body: Uint8Array,
+  sleep: (ms: number) => Promise<void>,
+): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    const result = await cli.run(
+      ["r2", "object", "put", `${target.r2Bucket}/${objectKey}`, "--remote", "--config", target.configPath, "--pipe"],
+      body,
+    );
+    if (result.status === 0) {
+      return;
+    }
+    if (attempt >= PUT_MAX_ATTEMPTS) {
+      const detail = (result.stderr || result.stdout || "wrangler failed").trim().split("\n")[0];
+      throw new PublishError(
+        "WRANGLER_FAILED",
+        `r2 object put ${objectKey} failed after ${attempt} attempts: ${detail}`,
+      );
+    }
+    await sleep(PUT_RETRY_DELAYS_MS[attempt - 1] ?? 0);
+  }
 }
 
 /** The R2AudioStore port wired to wrangler, so `uploadAudioAssets` is reused verbatim. */
-function remoteAudioStore(cli: WranglerCli, target: RemoteTarget): R2AudioStore {
+function remoteAudioStore(cli: WranglerCli, target: RemoteTarget, sleep: (ms: number) => Promise<void>): R2AudioStore {
   return {
-    // No cheap existence/etag probe exists in wrangler: uploads are
-    // unconditional (see module doc). head() answering "absent" is exactly
-    // that policy expressed through the shared uploader's port.
+    // Uploads are unconditional (see module doc): no existence probe exists
+    // worth its cost, and stage's verified puts (exit status, retried) are
+    // the presence proof this run relies on.
     async head() {
       return null;
     },
     async put(objectKey, body) {
-      await remoteR2Put(cli, target, objectKey, body);
+      await remoteR2Put(cli, target, objectKey, body, sleep);
     },
   };
 }
@@ -351,6 +361,9 @@ async function remoteTransitionStatus(
 /** Bundle files applied to remote D1, in order (deterministic bundle layout). */
 const IMPORT_FILES = ["d1/001-content.sql", "d1/002-cards.sql", "d1/003-search.sql"] as const;
 
+/** One upload-progress line per N assets (`uploaded K/total`). */
+const UPLOAD_PROGRESS_EVERY = 50;
+
 export interface RemoteStageResult {
   releaseId: string;
   manifestSha256: string;
@@ -360,9 +373,10 @@ export interface RemoteStageResult {
 
 /**
  * Verify + stage the bundle against the remote bindings: uploads every
- * manifest audio asset, then creates the release row (IMPORTING) and unit
- * reports with the SAME statements the local repositories issue, then
- * applies the three bundle import files in order. app_meta is NEVER touched.
+ * manifest audio asset (unconditional, retried — see `remoteR2Put`), then
+ * creates the release row (IMPORTING) and unit reports with the SAME
+ * statements the local repositories issue, then applies the three bundle
+ * import files in order. app_meta is NEVER touched.
  */
 export async function remoteStageBundle(input: {
   cli: WranglerCli;
@@ -370,8 +384,12 @@ export async function remoteStageBundle(input: {
   bundleDir: string;
   privateRoot: string;
   now: number;
+  log?: (line: string) => void;
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<RemoteStageResult> {
   const { cli, target, bundleDir, privateRoot, now } = input;
+  const log = input.log ?? (() => {});
+  const sleep = input.sleep ?? defaultSleep;
   const verified = await verifyBundle(bundleDir);
   if (!verified.ok || !verified.manifest || !verified.manifestSha256) {
     const details = verified.errors.map((error) => `${error.path}: ${error.reason}`).join("; ");
@@ -391,7 +409,11 @@ export async function remoteStageBundle(input: {
 
   const audioRows = await readJsonl(join(bundleDir, "r2", "audio-manifest.jsonl"), AudioManifestRowSchema);
   const audioRoot = join(privateRoot, "work", manifest.source_pdf_sha256);
-  const upload = await uploadAudioAssets(remoteAudioStore(cli, target), audioRows, audioRoot);
+  const upload = await uploadAudioAssets(remoteAudioStore(cli, target, sleep), audioRows, audioRoot, (done, total) => {
+    if (done % UPLOAD_PROGRESS_EVERY === 0 || done === total) {
+      log(`uploaded ${done}/${total}`);
+    }
+  });
 
   // Release-status preamble: the release row in IMPORTING + its unit reports,
   // the same column list and values ReleaseRepository.create/insertUnitReport
@@ -417,16 +439,20 @@ export async function remoteStageBundle(input: {
 
 /**
  * Pre-activation validation against the remote bindings (spec 17): the SAME
- * statements and the SAME evaluator as local smoke, with object presence
- * checked against the private bucket. Any failure records FAILED and never
- * moves the pointer.
+ * statements and the SAME evaluator as local smoke. The audio check needs no
+ * object traffic: stage JUST uploaded every manifest asset with verified
+ * success (exit status, retried), so presence is a fact of this run — the
+ * check instead verifies every imported audio_asset row is gate-passed and
+ * backed by an asset of the verified manifest (a row outside the manifest
+ * could not have been uploaded and counts as missing).
  */
 export async function remoteSmokeRelease(input: {
   cli: WranglerCli;
   target: RemoteTarget;
   releaseId: string;
+  bundleDir: string;
 }): Promise<{ releaseId: string; checks: SmokeCheck[] }> {
-  const { cli, target, releaseId } = input;
+  const { cli, target, releaseId, bundleDir } = input;
   const status = await remoteReleaseStatus(cli, target, releaseId);
   if (status !== "IMPORTING") {
     throw new PublishError("RELEASE_BAD_STATUS", `release ${releaseId} is ${status}, expected IMPORTING`);
@@ -447,10 +473,15 @@ export async function remoteSmokeRelease(input: {
     asset_key: unknown;
     validation: unknown;
   }>;
+  const verifiedKeys = new Set(
+    (await readJsonl(join(bundleDir, "r2", "audio-manifest.jsonl"), AudioManifestRowSchema)).map(
+      (row) => row.object_key,
+    ),
+  );
   let missingAudio = 0;
   let unvalidatedAudio = 0;
   for (const row of audioRows) {
-    if (!(await remoteR2ObjectPresent(cli, target, String(row["asset_key"])))) missingAudio += 1;
+    if (!verifiedKeys.has(String(row["asset_key"]))) missingAudio += 1;
     if (row["validation"] !== "PASSED") unvalidatedAudio += 1;
   }
 
@@ -652,6 +683,8 @@ export async function runRemotePublish(input: {
   activate: boolean;
   now: number;
   log?: (line: string) => void;
+  /** Retry backoff override (tests); default sleeps 5s/15s between put attempts. */
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<RemotePublishOutcome> {
   const { cli, target, bundleDir, privateRoot, now } = input;
   const log = input.log ?? (() => {});
@@ -672,12 +705,12 @@ export async function runRemotePublish(input: {
       `manifest ${verified.manifestSha256.slice(0, 12)})`,
   );
 
-  const staged = await remoteStageBundle({ cli, target, bundleDir, privateRoot, now });
+  const staged = await remoteStageBundle({ cli, target, bundleDir, privateRoot, now, log, ...(input.sleep !== undefined ? { sleep: input.sleep } : {}) });
   log(
     `stage OK: release ${staged.releaseId} IMPORTING (audio uploaded=${staged.uploaded} reused=${staged.reused}; app_meta untouched)`,
   );
 
-  const smoke = await remoteSmokeRelease({ cli, target, releaseId: staged.releaseId });
+  const smoke = await remoteSmokeRelease({ cli, target, releaseId: staged.releaseId, bundleDir });
   for (const check of smoke.checks) {
     log(`smoke ${check.passed ? "PASS" : "FAIL"} ${check.name}${check.detail ? ` (${check.detail})` : ""}`);
   }

@@ -131,16 +131,22 @@ The target comes from the untracked `infra/wrangler/wrangler.toml`
   (`wrangler r2 object put <bucket>/<key> --pipe --remote`, bytes verified
   against the manifest SHA-256 first). wrangler has no `r2 object head`, so
   uploads are UNCONDITIONAL: keys are content-addressed, re-uploading writes
-  identical bytes and the step stays idempotent. Then the release row
-  (IMPORTING) + unit reports are created with the same statements the local
-  repositories issue and `d1/001-content.sql`, `002-cards.sql`,
-  `003-search.sql` are applied in order via `wrangler d1 execute --remote
-  --file`. `app_meta` is NEVER touched. A release that is already staged
-  fails the run (RELEASE_ALREADY_STAGED).
+  identical bytes and the step stays idempotent. Each put retries up to
+  3 attempts (5s/15s backoff); three consecutive failures abort the run
+  fail-closed — at that point nothing is staged and no pointer can move.
+  Progress prints one line per 50 uploads (`uploaded K/<total>`). Then the
+  release row (IMPORTING) + unit reports are created with the same
+  statements the local repositories issue and `d1/001-content.sql`,
+  `002-cards.sql`, `003-search.sql` are applied in order via
+  `wrangler d1 execute --remote --file`. `app_meta` is NEVER touched. A
+  release that is already staged fails the run (RELEASE_ALREADY_STAGED).
 - **smoke** — the SAME pre-activation checks as local mode (unit totals vs
-  content rows, orphan FKs, FTS parity, audio rows gate-passed) run as remote
-  SQL and are judged by the SAME shared evaluator; every audio asset's
-  presence in the bucket is probed for real. IMPORTING -> VALIDATING ->
+  content rows, orphan FKs, FTS parity) run as remote SQL and are judged by
+  the SAME shared evaluator. The audio check makes no object traffic:
+  stage just uploaded every manifest asset with verified success, so smoke
+  verifies every imported audio_asset row is gate-passed and backed by an
+  asset of the verified manifest (a row outside the manifest could not have
+  been uploaded and counts as missing). IMPORTING -> VALIDATING ->
   READY, or FAILED on any failure with the pointer untouched.
 - **activate** — the EXACT statement list of the runtime activation batch
   (`buildActivationBatchStatements`: alias upserts, demotion of the previous

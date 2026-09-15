@@ -358,12 +358,13 @@ describe("remote publish lifecycle (injected wrangler boundary)", () => {
     }
   });
 
-  it("happy path: uploads every manifest asset, imports the D1 files in order, then activates with the pointer switch last", async () => {
+  it("happy path: uploads every manifest asset (no presence probes, with progress lines), imports the D1 files in order, then activates with the pointer switch last", async () => {
     const bundle = await buildRemoteBundle();
     cleanup = bundle.root;
     const fake = fakeWrangler(bundle);
+    const lines: string[] = [];
 
-    const outcome = await runPublish(bundle, fake);
+    const outcome = await runPublish(bundle, fake, { log: (line) => lines.push(line) });
 
     expect(outcome.releaseId).toBe(bundle.releaseId);
     expect(outcome.uploaded).toBe(2);
@@ -374,6 +375,12 @@ describe("remote publish lifecycle (injected wrangler boundary)", () => {
       `${TEST_TARGET.r2Bucket}/${bundle.audioObjectKeys[0]}`,
       `${TEST_TARGET.r2Bucket}/${bundle.audioObjectKeys[1]}`,
     ]);
+    // Uploads are unconditional: smoke re-probes NOTHING (no r2 object get),
+    // presence was established by stage's verified puts.
+    expect(fake.r2Gets).toEqual([]);
+    // Progress is observable in a background run: a line per 50 uploads plus
+    // a final count.
+    expect(lines.filter((line) => /^uploaded \d+\/\d+$/.test(line))).toEqual(["uploaded 2/2"]);
     // The three bundle import files are applied in order, after the uploads.
     expect(fake.files).toEqual([
       join(bundle.bundleDir, "d1", "001-content.sql"),
@@ -436,6 +443,77 @@ describe("remote publish lifecycle (injected wrangler boundary)", () => {
     expect(writes.some((statement) => statement.includes("UPDATE app_meta SET active_release_id"))).toBe(false);
     expect(writes.some((statement) => statement.includes("SET status = 'ACTIVE'"))).toBe(false);
     expect(fake.state.pointer).toBeNull();
+  });
+
+  it("smoke audio check stays honest without probes: an imported row not backed by the verified manifest uploads fails smoke", async () => {
+    const bundle = await buildRemoteBundle();
+    cleanup = bundle.root;
+    const fake = fakeWrangler(bundle, {
+      audioRows: [
+        { asset_key: bundle.audioObjectKeys[0], validation: "PASSED" },
+        { asset_key: "audio/rt/not-in-this-bundle.wav", validation: "PASSED" },
+      ],
+    });
+
+    await expect(runPublish(bundle, fake)).rejects.toMatchObject({ code: "SMOKE_FAILED" });
+    expect(fake.r2Gets).toEqual([]); // still no probe traffic
+    const writes = writeCommands(fake);
+    expect(writes.some((statement) => statement.includes("UPDATE app_meta SET active_release_id"))).toBe(false);
+    expect(fake.state.status).toBe("FAILED");
+  });
+
+  it("retries a failing r2 put up to 3 attempts with 5s/15s backoff, then continues", async () => {
+    const bundle = await buildRemoteBundle();
+    cleanup = bundle.root;
+    const fake = fakeWrangler(bundle);
+    const innerRun = fake.cli.run;
+    const firstKey = `${TEST_TARGET.r2Bucket}/${bundle.audioObjectKeys[0]}`;
+    let firstObjectAttempts = 0;
+    fake.cli = {
+      run: async (argv, input) => {
+        if (argv[0] === "r2" && argv[2] === "put" && argv[3] === firstKey) {
+          firstObjectAttempts += 1;
+          if (firstObjectAttempts <= 2) {
+            return { status: 1, stdout: "", stderr: "[ERROR] 500 Internal Server Error" };
+          }
+        }
+        return await innerRun(argv, input);
+      },
+    };
+    const sleeps: number[] = [];
+
+    const outcome = await runPublish(bundle, fake, { sleep: async (ms) => void sleeps.push(ms) });
+
+    // Two failed attempts for the first object, then the third succeeded;
+    // the run completed with every manifest asset uploaded exactly once.
+    expect(firstObjectAttempts).toBe(3);
+    expect(sleeps).toEqual([5_000, 15_000]);
+    expect(outcome.uploaded).toBe(2);
+    expect(outcome.activeReleaseId).toBe(bundle.releaseId);
+  });
+
+  it("aborts fail-closed after 3 consecutive put failures: no pointer switch", async () => {
+    const bundle = await buildRemoteBundle();
+    cleanup = bundle.root;
+    const fake = fakeWrangler(bundle);
+    const innerRun = fake.cli.run;
+    const sleeps: number[] = [];
+    fake.cli = {
+      run: async (argv, input) => {
+        if (argv[0] === "r2" && argv[2] === "put") {
+          return { status: 1, stdout: "", stderr: "[ERROR] 503 Service Unavailable" };
+        }
+        return await innerRun(argv, input);
+      },
+    };
+
+    await expect(runPublish(bundle, fake, { sleep: async (ms) => void sleeps.push(ms) })).rejects.toMatchObject({
+      code: "WRANGLER_FAILED",
+    });
+    expect(sleeps).toEqual([5_000, 15_000]);
+    const writes = writeCommands(fake);
+    expect(writes.some((statement) => statement.includes("UPDATE app_meta SET active_release_id"))).toBe(false);
+    expect(fake.commands.some((statement) => statement.startsWith("INSERT INTO content_release"))).toBe(false);
   });
 
   it("unparseable wrangler output is a NAMED failure, never a pass", async () => {

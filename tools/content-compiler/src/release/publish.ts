@@ -64,18 +64,28 @@ export interface UploadResult {
  * Upload content-addressed audio to private R2, idempotent by hash: an
  * object whose key already exists is reused, never re-put (identical text +
  * config share one object across releases). Local bytes are verified against
- * the manifest's SHA-256 before any upload.
+ * the manifest's SHA-256 before any upload. `onProgress` (optional) reports
+ * `done/total` after every asset — the remote driver uses it for operator
+ * visibility on long uploads.
  */
 export async function uploadAudioAssets(
   r2: R2AudioStore,
   rows: readonly AudioManifestRow[],
   audioRoot: string,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<UploadResult> {
+  const total = rows.length;
+  let done = 0;
   let uploaded = 0;
   let reused = 0;
+  const report = (): void => {
+    done += 1;
+    onProgress?.(done, total);
+  };
   for (const row of rows) {
     if (await r2.head(row.object_key)) {
       reused += 1;
+      report();
       continue;
     }
     const filePath = path.join(audioRoot, row.object_key);
@@ -94,6 +104,7 @@ export async function uploadAudioAssets(
     }
     await r2.put(row.object_key, bytes);
     uploaded += 1;
+    report();
   }
   return { uploaded, reused };
 }
