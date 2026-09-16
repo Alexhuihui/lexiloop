@@ -22,6 +22,7 @@ import {
   CONTENT_CACHE_PREFIX,
   PRECACHE_URLS,
   SHELL_CACHE,
+  SHELL_CACHE_PREFIX,
   SHELL_DOCUMENT,
   audioCacheKey,
   audioPassthroughRequest,
@@ -31,6 +32,7 @@ import {
   isContentCacheName,
   offlineFallback,
   pruneContentCacheNames,
+  staleShellCacheNames,
 } from "./sw";
 
 const ORIGIN = "https://lexiloop.test";
@@ -54,6 +56,17 @@ describe("static shell precache", () => {
     for (const url of PRECACHE_URLS) {
       expect(url.startsWith("/api/")).toBe(false);
     }
+  });
+
+  it("prunes shell caches left by older frontend builds", () => {
+    const names = [
+      "lexiloop-shell-previous-build",
+      SHELL_CACHE,
+      AUDIO_CACHE,
+      contentCacheName("rel-1"),
+      "unrelated-cache",
+    ];
+    expect(staleShellCacheNames(names)).toEqual(["lexiloop-shell-previous-build"]);
   });
 });
 
@@ -162,8 +175,9 @@ describe("logout cache deletion", () => {
     ]);
   });
 
-  it("uses stable cache names so logout clears across upgrades", () => {
-    expect(SHELL_CACHE).toBe("lexiloop-shell-v1");
+  it("uses a build-scoped shell cache and stable personal cache names", () => {
+    expect(SHELL_CACHE).toMatch(/^lexiloop-shell-[a-z0-9-]+$/);
+    expect(SHELL_CACHE.startsWith(SHELL_CACHE_PREFIX)).toBe(true);
     expect(AUDIO_CACHE).toBe("lexiloop-audio-v1");
     expect(CONTENT_CACHE_PREFIX).toBe("lexiloop-content-");
   });

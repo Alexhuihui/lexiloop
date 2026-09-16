@@ -50,56 +50,47 @@ export function TodayPage({ api }: TodayPageProps): React.JSX.Element {
     .reduce((total, session) => total + session.cards.length, 0);
 
   return (
-    <section>
-      <h1>今日</h1>
+    <section className="page page--today">
+      <header className="page-heading">
+        <div><p className="eyebrow">TODAY</p><h1>今日</h1><p className="page-heading__lead">今天学什么？保持一点节奏，进步会慢慢累积。</p></div>
+        <div className="streak-pill" aria-label={`连续学习 ${stats.data?.streak_days ?? 0} 天`}><span>✦</span><strong>{stats.data?.streak_days ?? 0}</strong><small>天连续</small></div>
+      </header>
       {stats.isPending || me.isPending ? <p role="status">正在加载…</p> : null}
       {stats.isError ? <p role="alert">统计数据加载失败，部分内容不可用。</p> : null}
 
-      <section aria-labelledby="today-due-heading">
-        <h2 id="today-due-heading">到期复习</h2>
-        <p>
-          <strong>{dueToday}</strong> 张卡到期
-        </p>
-        <p>建议先处理到期复习，但不强制；也可以直接开始学习新词。</p>
-        <Link className="btn" to="/review">
-          去复习
-        </Link>
-      </section>
+      <div className="today-actions">
+        <section className="action-card action-card--review" aria-labelledby="today-due-heading">
+          <div className="action-card__top"><span className="action-card__icon">↻</span><span className="status-dot">推荐先完成</span></div>
+          <div><p className="eyebrow">SPACED REVIEW</p><h2 id="today-due-heading">到期复习</h2></div>
+          <p className="action-card__number"><strong>{dueToday}</strong><span>张卡待复习</span></p>
+          <p className="action-card__copy">建议趁记忆还清晰时巩固一下，几分钟就能完成。</p>
+          <Link aria-label="去复习" className="btn btn--secondary btn--block" to="/review">开始复习 <span aria-hidden="true">→</span></Link>
+        </section>
 
-      <section aria-labelledby="today-new-heading">
-        <h2 id="today-new-heading">教材新词</h2>
-        <p>
-          今日新词目标 <strong>{dailyGoal}</strong> 个
-        </p>
-        <p>
-          已学单词 <strong>{stats.data?.learned_words ?? 0}</strong> 个
-        </p>
-        <Link className="btn btn--primary" to="/learn">
-          去学习
-        </Link>
-      </section>
+        <section className="action-card action-card--learn" aria-labelledby="today-new-heading">
+          <div className="action-card__top"><span className="action-card__icon">Aa</span><span className="status-dot status-dot--warm">每日目标 {dailyGoal}</span></div>
+          <div><p className="eyebrow">NEW WORDS</p><h2 id="today-new-heading">教材新词</h2></div>
+          <p className="action-card__number"><strong>{dailyGoal}</strong><span>个今日目标</span></p>
+          <p className="action-card__copy">已学单词 <strong>{stats.data?.learned_words ?? 0}</strong> 个 · 跟随教材顺序继续积累。</p>
+          <Link aria-label="去学习" className="btn btn--primary btn--block" to="/learn">进入学习 <span aria-hidden="true">→</span></Link>
+        </section>
+      </div>
 
-      <p>
-        连续学习 <strong>{stats.data?.streak_days ?? 0}</strong> 天
-      </p>
       {currentUnit ? (
-        <p>
-          当前进度 {currentUnit.title}：已学 {currentUnit.studied_cards} /{" "}
-          {currentUnit.total_cards} 张卡
-        </p>
+        <section className="surface progress-card" aria-label="当前进度">
+          <div className="section-heading"><div><p className="eyebrow">YOUR PROGRESS</p><h2>学习进度</h2></div><strong>{currentUnit.title}</strong></div>
+          <div className="progress-track"><span style={{ width: `${Math.min(100, currentUnit.total_cards === 0 ? 0 : currentUnit.studied_cards / currentUnit.total_cards * 100)}%` }} /></div>
+          <div className="progress-meta"><span>已学 {currentUnit.studied_cards} / {currentUnit.total_cards} 张卡</span><span>累计 {stats.data?.learned_words ?? 0} 个词</span></div>
+        </section>
       ) : null}
 
       {learnSession || supplementalCards > 0 ? (
-        <section aria-labelledby="today-resume-heading">
-          <h2 id="today-resume-heading">继续学习</h2>
+        <section className="surface resume-card" aria-labelledby="today-resume-heading">
+          <div><p className="eyebrow">PICK UP WHERE YOU LEFT</p><h2 id="today-resume-heading">继续学习</h2></div>
           {learnSession ? (
-            <p>
-              <Link className="btn" to="/learn">
-                继续新词学习（第 {learnSession.position + 1} / {learnSession.cards.length} 张）
-              </Link>
-            </p>
+              <Link className="btn btn--secondary" to="/learn">继续新词学习 · 第 {learnSession.position + 1} / {learnSession.cards.length} 张</Link>
           ) : null}
-          {supplementalCards > 0 ? <p>快测待引入卡 {supplementalCards} 张</p> : null}
+          {supplementalCards > 0 ? <span className="tag">快测待引入卡 {supplementalCards} 张</span> : null}
         </section>
       ) : null}
     </section>

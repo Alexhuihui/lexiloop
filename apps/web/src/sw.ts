@@ -38,7 +38,10 @@
 // Pure policy surface
 // ---------------------------------------------------------------------------
 
-export const SHELL_CACHE = "lexiloop-shell-v1";
+declare const __LEXILOOP_BUILD_ID__: string;
+
+export const SHELL_CACHE_PREFIX = "lexiloop-shell-";
+export const SHELL_CACHE = `${SHELL_CACHE_PREFIX}${__LEXILOOP_BUILD_ID__}`;
 export const AUDIO_CACHE = "lexiloop-audio-v1";
 export const CONTENT_CACHE_PREFIX = "lexiloop-content-";
 
@@ -119,6 +122,11 @@ export function isContentCacheName(name: string): boolean {
   return name.startsWith(CONTENT_CACHE_PREFIX);
 }
 
+/** Shell caches from older frontend builds, removed when this worker activates. */
+export function staleShellCacheNames(names: readonly string[]): string[] {
+  return names.filter((name) => name.startsWith(SHELL_CACHE_PREFIX) && name !== SHELL_CACHE);
+}
+
 /**
  * Old content namespaces to delete when `activeReleaseId` changes. V1
  * policy: prune immediately on the switch (or when no release is known
@@ -182,6 +190,10 @@ interface MessageEventLike extends Event {
   data: unknown;
 }
 
+interface ExtendableEventLike extends Event {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
 interface ServiceWorkerScopeLike {
   location: { origin: string };
   addEventListener(type: string, listener: (event: Event) => void): void;
@@ -217,17 +229,22 @@ function registerHandlers(): void {
     activeReleaseId = null;
   }
 
-  scope.addEventListener("install", () => {
+  scope.addEventListener("install", (event: Event) => {
     const install = async (): Promise<void> => {
       const cache = await caches.open(SHELL_CACHE);
       await cache.addAll([...PRECACHE_URLS]);
       await scope.skipWaiting();
     };
-    void install();
+    (event as ExtendableEventLike).waitUntil(install());
   });
 
-  scope.addEventListener("activate", () => {
-    void scope.clients.claim();
+  scope.addEventListener("activate", (event: Event) => {
+    const activate = async (): Promise<void> => {
+      const names = await caches.keys();
+      await Promise.all(staleShellCacheNames(names).map((name) => caches.delete(name)));
+      await scope.clients.claim();
+    };
+    (event as ExtendableEventLike).waitUntil(activate());
   });
 
   scope.addEventListener("message", (event: Event) => {
@@ -245,7 +262,7 @@ function registerHandlers(): void {
         cachesToDeleteOnLogout(names).map((name) => caches.delete(name)),
       );
     };
-    void clear();
+    (event as ExtendableEventLike).waitUntil(clear());
   });
 
   scope.addEventListener("fetch", (event: Event) => {

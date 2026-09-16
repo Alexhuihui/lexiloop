@@ -118,37 +118,40 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
   const progressRow = progress.data?.progress ?? null;
 
   return (
-    <article>
-      <h1>{data.word.headword}</h1>
-      {data.word.phonetic ? <p>{data.word.phonetic}</p> : null}
-      <p>
+    <article className="page word-detail">
+      <Link className="back-link" to="/dictionary">← 返回词典</Link>
+      <header className="word-detail__hero">
+      <div><p className="eyebrow">WORD ENTRY</p><h1>{data.word.headword}</h1>
+      {data.word.phonetic ? <p className="phonetic">{data.word.phonetic}</p> : null}</div>
+      <p className="word-detail__unit">
         {data.unit ? (
           <>
-            所属 Unit：<span>{data.unit.title}</span>
+            <span>所属单元</span><strong>{data.unit.title}</strong>
           </>
         ) : null}
       </p>
+      </header>
       {wordAudio ? (
-        <p>
+        <div className="audio-player">
           <audio controls src={api.audioUrl(wordAudio.asset_key)}></audio>
-        </p>
+        </div>
       ) : null}
 
-      <section aria-label="全部义项">
-        <h2>全部义项</h2>
-        <ul>
+      <section className="content-block content-block--meaning" aria-label="全部义项">
+        <h2 className="content-block__label">全部义项</h2>
+        <ul className="sense-list">
           {data.senses.map((sense) => (
             <li key={sense.sense_key}>
-              <span>{sense.pos}</span> <strong>{sense.gloss}</strong>
+              <span className="pos-tag">{sense.pos}</span> <strong>{sense.gloss}</strong>
             </li>
           ))}
         </ul>
       </section>
 
       {data.phrases.length > 0 ? (
-        <section aria-label="短语">
-          <h2>短语</h2>
-          <ul>
+        <section className="content-block" aria-label="短语">
+          <p className="content-block__label">常用短语</p>
+          <ul className="phrase-list">
             {data.phrases.map((phrase) => (
               <li key={phrase.phrase_key}>
                 {phrase.text}（{phrase.gloss}）
@@ -159,13 +162,13 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
       ) : null}
 
       {data.examples.length > 0 ? (
-        <section aria-label="例句">
-          <h2>例句</h2>
-          <ul>
+        <section className="content-block" aria-label="例句">
+          <p className="content-block__label">语境例句</p>
+          <ul className="example-list">
             {data.examples.map((example) => (
               <li key={example.example_key}>
                 <p>
-                  {example.origin === "exam" ? <span>真题 </span> : null}
+                  {example.origin === "exam" ? <span className="tag">真题</span> : null}
                   {example.text}
                 </p>
                 {example.source_ref ? <p>来源：{example.source_ref}</p> : null}
@@ -176,10 +179,10 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
       ) : null}
 
       {data.explanations.length > 0 ? (
-        <section aria-label="讲解">
-          <h2>讲解</h2>
+        <section className="content-block" aria-label="讲解">
+          <p className="content-block__label">记忆讲解</p>
           {data.explanations.map((explanation) => (
-            <div key={explanation.explanation_key}>
+            <div className="explanation-notes" key={explanation.explanation_key}>
               {explanation.syntax_notes.length > 0 ? (
                 <p>语法提示：{explanation.syntax_notes.join("；")}</p>
               ) : null}
@@ -199,9 +202,9 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
       ) : null}
 
       {data.related.length > 0 ? (
-        <section aria-label="相关词">
-          <h2>相关词</h2>
-          <ul>
+        <section className="content-block" aria-label="相关词">
+          <p className="content-block__label">相关词</p>
+          <ul className="related-list">
             {data.related.map((entry) => (
               <li key={`${entry.to_word_key}-${entry.relation_type}`}>
                 <Link to={`/dictionary/words/${entry.to_word_key}`}>
@@ -213,8 +216,8 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
         </section>
       ) : null}
 
-      <section aria-label="个人学习状态">
-        <h2>个人学习状态</h2>
+      <section className="content-block personal-state" aria-label="个人学习状态">
+        <p className="content-block__label">个人学习状态</p>
         {progressRow ? (
           <>
             <p>

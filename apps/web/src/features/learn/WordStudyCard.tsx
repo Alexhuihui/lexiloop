@@ -62,9 +62,7 @@ export function WordStudyCard({
 
   return (
     <article className="study-card">
-      <p>
-        第 {position + 1} 词 / 共 {total} 词
-      </p>
+      <div className="study-progress"><span>第 {position + 1} 词 / 共 {total} 词</span><div className="progress-track"><span style={{ width: `${(position + 1) / total * 100}%` }} /></div></div>
       {content === null ? (
         word.contentFailed ? (
           <>
@@ -78,35 +76,38 @@ export function WordStudyCard({
         )
       ) : (
         <>
-          <h2>{content.word.headword}</h2>
-          {content.word.phonetic ? <p>{content.word.phonetic}</p> : null}
+          <header className="word-hero">
+            <p className="eyebrow">NEW WORD</p>
+            <h2>{content.word.headword}</h2>
+            {content.word.phonetic ? <p className="phonetic">{content.word.phonetic}</p> : null}
+          </header>
           {wordAudio ? (
-            <p>
+            <div className="audio-player">
               {/* Audio failure is announced inline; reading never blocked. */}
               <audio
                 controls
                 src={audioUrl ?? undefined}
                 onError={() => setAudioFailed(true)}
               ></audio>
-            </p>
+            </div>
           ) : null}
           {audioFailed ? <p role="status">音频暂时无法播放，可先继续学习。</p> : null}
 
-          <section aria-label="核心词义">
-            <h3>核心词义</h3>
-            <ul>
+          <section className="content-block content-block--meaning" aria-label="核心词义">
+            <p className="content-block__label">核心词义</p>
+            <ul className="sense-list">
               {content.senses.map((sense) => (
                 <li key={sense.sense_key}>
-                  <span>{sense.pos}</span> <strong>{sense.gloss}</strong>
+                  <span className="pos-tag">{sense.pos}</span> <strong>{sense.gloss}</strong>
                 </li>
               ))}
             </ul>
           </section>
 
           {content.phrases.length > 0 ? (
-            <section aria-label="短语">
-              <h3>短语</h3>
-              <ul>
+            <section className="content-block" aria-label="短语">
+              <p className="content-block__label">常用短语</p>
+              <ul className="phrase-list">
                 {content.phrases.map((phrase) => (
                   <li key={phrase.phrase_key}>
                     {phrase.text}（{phrase.gloss}）
@@ -117,13 +118,13 @@ export function WordStudyCard({
           ) : null}
 
           {content.examples.length > 0 ? (
-            <section aria-label="例句">
-              <h3>例句</h3>
-              <ul>
+            <section className="content-block" aria-label="例句">
+              <p className="content-block__label">语境例句</p>
+              <ul className="example-list">
                 {content.examples.map((example) => (
                   <li key={example.example_key}>
                     <p>
-                      {example.origin === "exam" ? <span>真题 </span> : null}
+                      {example.origin === "exam" ? <span className="tag">真题</span> : null}
                       {example.text}
                     </p>
                     {example.source_ref ? <p>来源：{example.source_ref}</p> : null}
@@ -134,8 +135,8 @@ export function WordStudyCard({
           ) : null}
 
           {content.explanations.length > 0 ? (
-            <section aria-label="讲解">
-              <h3>讲解</h3>
+            <details className="explanation-block">
+              <summary>查看记忆讲解</summary>
               {content.explanations.map((explanation) => (
                 <div key={explanation.explanation_key}>
                   {explanation.syntax_notes.length > 0 ? (
@@ -147,20 +148,19 @@ export function WordStudyCard({
                   ) : null}
                 </div>
               ))}
-            </section>
+            </details>
           ) : null}
         </>
       )}
 
-      <section aria-label="首印象">
-        <h3>首印象</h3>
-        <p>首印象仅用于分类与统计，不是评分。</p>
-        <div role="group" aria-label="选择首印象">
+      <section className="familiarity-panel" aria-label="首印象">
+        <div><p className="content-block__label">这个词对你来说？</p><p>只记录第一感觉，不影响复习评分。</p></div>
+        <div className="choice-group" role="group" aria-label="选择首印象">
           {FAMILIARITY_CHOICES.map((choice) => (
             <button
               key={choice.value}
               type="button"
-              className="btn"
+              className="choice-chip"
               disabled={familiarityDisabled}
               aria-pressed={word.familiarity === choice.value}
               onClick={() => onFamiliarity(choice.value)}
@@ -185,9 +185,7 @@ export function WordStudyCard({
         ) : null}
       </section>
 
-      <button type="button" className="btn btn--primary" disabled={nextDisabled} onClick={onNext}>
-        {nextLabel}
-      </button>
+      <div className="study-card__footer"><button type="button" className="btn btn--primary btn--block" disabled={nextDisabled} onClick={onNext}>{nextLabel} <span aria-hidden="true">→</span></button></div>
     </article>
   );
 }

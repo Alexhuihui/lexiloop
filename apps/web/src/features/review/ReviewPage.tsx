@@ -85,18 +85,19 @@ export function ReviewPage({ api }: ReviewPageProps): React.JSX.Element {
   ]);
 
   return (
-    <section>
-      <h1>复习</h1>
+    <section className="page page--review">
+      <header className="page-heading page-heading--compact"><div><p className="eyebrow">REVIEW</p><h1>复习</h1><p className="page-heading__lead">在刚好要忘记之前，再想起一次。</p></div></header>
       {study.phase === "IDLE" ? (
-        <div>
-          <h2>开始复习</h2>
-          <p>复习按到期时间安排卡片，默认使用语境挖空，必要时回退到词义题。</p>
+        <div className="empty-state review-start">
+          <span aria-hidden="true">↻</span>
+          <h2>准备好开始了吗？</h2>
+          <p>复习会优先使用语境回忆，帮助你真正把词用起来。</p>
           {study.loadError ? <p role="alert">复习记录加载失败：{study.loadError}</p> : null}
           {study.startError ? <p role="alert">{study.startError}</p> : null}
           {study.queueEmpty ? <p role="status">当前没有到期的复习卡。</p> : null}
           <button
             type="button"
-            className="btn btn--primary"
+            className="btn btn--primary btn--wide"
             onClick={() => void study.start()}
           >
             开始复习
@@ -125,7 +126,8 @@ export function ReviewPage({ api }: ReviewPageProps): React.JSX.Element {
         />
       ) : null}
       {study.phase === "COMPLETE" ? (
-        <div>
+        <div className="empty-state complete-state">
+          <span aria-hidden="true">✓</span>
           <h2>本次复习已完成</h2>
           <p>共 {study.session?.cards.length ?? 0} 张卡已评分。</p>
           <Link className="btn btn--primary" to="/today">

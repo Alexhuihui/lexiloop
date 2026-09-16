@@ -144,18 +144,19 @@ function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element 
   const resumable = resumableSessions.find((session) => sameGroup(session.word_keys, groupKeys));
   const hasUnmatched = resumableSessions.length > 0 && !resumable;
   const expectedGroupWords = group.map(toGroupWord);
+  const visibleWords = words.filter((word) => tierFilter === ALL_TIERS || word.tier === tierFilter);
 
   return (
-    <section>
-      <h2>开始新词学习</h2>
+    <section className="learn-setup">
+      <div className="section-heading"><div><p className="eyebrow">SET UP YOUR SESSION</p><h2>开始新词学习</h2><p>选择范围，我们会按教材顺序安排这一组。</p></div></div>
       {bootstrap.isPending || sessions.isPending ? <p role="status">正在加载…</p> : null}
       {bootstrap.isError || sessions.isError ? (
         <p role="alert">学习内容加载失败，请稍后重试。</p>
       ) : null}
       {study.setupError ? <p role="alert">{study.setupError}</p> : null}
 
-      <div>
-        <label htmlFor="learn-unit">选择单元</label>
+      <div className="setup-controls">
+      <div className="field-card"><label htmlFor="learn-unit">选择单元</label>
         <select
           id="learn-unit"
           value={unitKey}
@@ -168,8 +169,7 @@ function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element 
           ))}
         </select>
       </div>
-      <div>
-        <label htmlFor="learn-tier">选择分层</label>
+      <div className="field-card"><label htmlFor="learn-tier">选择分层</label>
         <select
           id="learn-tier"
           value={tierFilter}
@@ -183,24 +183,27 @@ function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element 
           ))}
         </select>
       </div>
+      </div>
 
-      <p>预计本组 {group.length} 个新词（按教材顺序学习）。</p>
-      <ul aria-label="本单元单词顺序">
-        {words
-          .filter((word) => tierFilter === ALL_TIERS || word.tier === tierFilter)
-          .map((word) => (
+      <section className="word-preview" aria-labelledby="word-preview-heading">
+        <div className="word-preview__heading"><div><p className="eyebrow">UP NEXT</p><h3 id="word-preview-heading">本组预览</h3></div><strong>{group.length}<small> 个新词</small></strong></div>
+        <p className="word-preview__summary">预计本组 {group.length} 个新词（按教材顺序学习）。</p>
+        <ul aria-label="本单元单词顺序">
+        {visibleWords.map((word, index) => (
             <li key={word.word_key}>
-              {word.headword}
-              {word.phonetic ? ` /${word.phonetic}/` : ""} ·{" "}
-              {stageTag(word, progressMap, groupKeys.has(word.word_key))}
+              <span className="word-preview__index">{String(index + 1).padStart(2, "0")}</span>
+              <span><strong>{word.headword}</strong>{word.phonetic ? <small>/{word.phonetic}/</small> : null}</span>
+              <span className={`word-status word-status--${stageTag(word, progressMap, groupKeys.has(word.word_key)) === "在本组" ? "active" : "muted"}`}>{stageTag(word, progressMap, groupKeys.has(word.word_key))}</span>
             </li>
           ))}
-      </ul>
+        </ul>
+      </section>
 
+      <div className="setup-actions">
       {resumable ? (
         <button
           type="button"
-          className="btn"
+          className="btn btn--secondary"
           disabled={study.starting}
           onClick={() => void study.resumeSession(expectedGroupWords)}
         >
@@ -218,6 +221,7 @@ function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element 
       >
         开始学习
       </button>
+      </div>
       {study.starting ? <p role="status">正在准备学习…</p> : null}
     </section>
   );
@@ -245,10 +249,10 @@ function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls
   );
   const isLastWord = study.studyIndex === study.words.length - 1;
   return (
-    <div>
-      <p>
+    <div className="study-flow">
+      <div className="session-overview">
         本组共 {study.session.cards.length} 张卡（完成学习后逐卡快速回忆）。
-      </p>
+      </div>
       <WordStudyCard
         key={word.wordKey}
         position={study.studyIndex}
@@ -334,8 +338,8 @@ export function LearnSetupPage({ api }: LearnSetupPageProps): React.JSX.Element 
   const study = useStudySession({ api });
 
   return (
-    <section>
-      <h1>学习</h1>
+    <section className="page page--learn">
+      <header className="page-heading page-heading--compact"><div><p className="eyebrow">LEARN</p><h1>学习</h1><p>理解一个词，再让记忆接手。</p></div></header>
       {study.phase === "SETUP" ? (
         <SetupView api={api} settings={me.data?.settings ?? null} study={study} />
       ) : null}

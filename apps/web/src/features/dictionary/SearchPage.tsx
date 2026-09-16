@@ -67,8 +67,8 @@ function HitItem({ hit, query }: { hit: SearchHit; query: string }): React.JSX.E
   const headwordIsMatch =
     hit.matched_field === "headword_exact" || hit.matched_field === "headword_prefix";
   return (
-    <li>
-      <p>
+    <li className="search-result">
+      <div>
         <Link to={`/dictionary/words/${hit.word_key}`}>
           {headwordIsMatch ? (
             <HighlightedText text={hit.headword} query={query} />
@@ -77,9 +77,9 @@ function HitItem({ hit, query }: { hit: SearchHit; query: string }): React.JSX.E
           )}
           {hit.phonetic ? ` ${hit.phonetic}` : null}
         </Link>
-      </p>
-      <p>
-        <span>{FIELD_LABELS[hit.matched_field]}</span>
+      </div>
+      <p className="search-result__match">
+        <span className="tag">{FIELD_LABELS[hit.matched_field]}</span>
         {headwordIsMatch ? null : (
           <>
             {" "}
@@ -102,21 +102,24 @@ export function SearchPage({ api }: SearchPageProps): React.JSX.Element {
   });
 
   return (
-    <section>
-      <h1>词典</h1>
+    <section className="page page--dictionary">
+      <header className="page-heading"><div><p className="eyebrow">DICTIONARY</p><h1>词典</h1><p className="page-heading__lead">查一个词，词头、中文释义、短语和例句都可以搜索。</p></div></header>
       <form
         role="search"
+        className="search-box"
         onSubmit={(event) => {
           event.preventDefault();
           setQuery(input.trim());
         }}
       >
-        <label htmlFor="dict-search">搜索词或释义</label>
+        <label className="sr-only" htmlFor="dict-search">搜索词或释义</label>
+        <span className="search-box__icon" aria-hidden="true">⌕</span>
         <input
           id="dict-search"
           type="search"
           value={input}
           onChange={(event) => setInput(event.target.value)}
+          placeholder="例如：coworker、劳动、take away"
         />
         <button type="submit" className="btn btn--primary">
           搜索
@@ -124,7 +127,7 @@ export function SearchPage({ api }: SearchPageProps): React.JSX.Element {
       </form>
 
       {search.isPending && query === "" ? (
-        <p>输入词头、中文释义、短语或例句进行搜索。</p>
+        <div className="empty-state"><span aria-hidden="true">Aa</span><h2>从一个词开始</h2><p>输入英文或中文，快速找到教材里的词义、短语与真题例句。</p></div>
       ) : null}
       {search.isPending && query !== "" ? <p role="status">正在搜索…</p> : null}
       {search.isError ? <p role="alert">搜索失败，请稍后重试。</p> : null}
@@ -132,7 +135,7 @@ export function SearchPage({ api }: SearchPageProps): React.JSX.Element {
         <p role="status">没有找到相关词条。</p>
       ) : null}
       {search.data && search.data.hits.length > 0 ? (
-        <ul aria-label="搜索结果">
+        <ul className="search-results" aria-label="搜索结果">
           {search.data.hits.map((hit) => (
             <HitItem key={`${hit.word_key}-${hit.matched_field}`} hit={hit} query={query} />
           ))}

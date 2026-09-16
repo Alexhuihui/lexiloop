@@ -177,8 +177,18 @@ test("clears content and audio caches on logout while the shell precache survive
 
   await logoutViaUi(page);
 
+  // Service Worker message handling is asynchronous. Wait for the clear
+  // event to finish instead of racing the cache deletion after navigation.
+  await expect
+    .poll(async () =>
+      page.evaluate(async () => {
+        const names = await caches.keys();
+        return names.some(
+          (name) => name.startsWith("lexiloop-content-") || name === "lexiloop-audio-v1",
+        );
+      }),
+    )
+    .toBe(false);
   const cacheNames = await page.evaluate(async () => await caches.keys());
-  expect(cacheNames.filter((name) => name.startsWith("lexiloop-content-"))).toEqual([]);
-  expect(cacheNames).not.toContain("lexiloop-audio-v1");
-  expect(cacheNames).toContain("lexiloop-shell-v1");
+  expect(cacheNames.filter((name) => name.startsWith("lexiloop-shell-"))).toHaveLength(1);
 });

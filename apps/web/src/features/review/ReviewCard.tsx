@@ -198,30 +198,30 @@ function Prompt({ card }: { card: QuickRecallCard | null }): React.JSX.Element {
     case "context":
       return (
         <div>
-          <p className="text-(--ink-soft)">语境回忆</p>
-          <p>{card.sentence}</p>
+          <p className="eyebrow">CONTEXT RECALL</p>
+          <p className="recall-prompt">{card.sentence}</p>
         </div>
       );
     case "word":
       return (
         <div>
-          <p className="text-(--ink-soft)">词义回忆</p>
+          <p className="eyebrow">WORD MEANING</p>
           <h2>{card.headword}</h2>
-          {card.phonetic ? <p>{card.phonetic}</p> : null}
+          {card.phonetic ? <p className="phonetic">{card.phonetic}</p> : null}
         </div>
       );
     case "phrase":
       return (
         <div>
-          <p className="text-(--ink-soft)">短语回忆</p>
-          <p>{card.text}</p>
+          <p className="eyebrow">PHRASE RECALL</p>
+          <p className="recall-prompt">{card.text}</p>
         </div>
       );
     case "discrimination":
       return (
         <div>
-          <p className="text-(--ink-soft)">词义辨析</p>
-          <p>{card.prompt}</p>
+          <p className="eyebrow">WORD CHOICE</p>
+          <p className="recall-prompt">{card.prompt}</p>
         </div>
       );
     case "generic":
@@ -244,7 +244,7 @@ function Explanations({
     return null;
   }
   return (
-    <details>
+    <details className="explanation-block">
       <summary>查看讲解</summary>
       {explanation.syntax_notes.length > 0 ? (
         <p>语法提示：{explanation.syntax_notes.join("；")}</p>
@@ -270,7 +270,7 @@ function Answer({
   }
   const answer = card.answer;
   return (
-    <section aria-label="参考答案">
+    <section className="answer-panel" aria-label="参考答案">
       {answer.senses ? (
         <ul>
           {answer.senses.map((sense) => (
@@ -318,23 +318,21 @@ export function ReviewCard({
 }: ReviewCardProps): React.JSX.Element {
   const wordKey = card && card.form !== "generic" ? card.wordKey : null;
   return (
-    <article className="study-card">
-      <p>
-        第 {position + 1} 张 / 共 {total} 张
-      </p>
-      <Prompt card={card} />
+    <article className="study-card recall-card">
+      <div className="study-progress"><span>第 {position + 1} 张 / 共 {total} 张</span><div className="progress-track"><span style={{ width: `${total === 0 ? 0 : (position + 1) / total * 100}%` }} /></div></div>
+      <div className="recall-card__prompt"><Prompt card={card} /></div>
       {revealed ? (
         <>
           <Answer card={card} content={content} />
           {gradeError ? (
             <p role="alert">评分未提交：{gradeError}（同一评分请求会安全重放，不会重复计分）</p>
           ) : null}
-          <div role="group" aria-label="选择评分">
+          <div className="rating-grid" role="group" aria-label="选择评分">
             {RATINGS.map((rating) => (
               <button
                 key={rating.value}
                 type="button"
-                className="btn"
+                className={`rating-btn rating-btn--${rating.value}`}
                 disabled={gradePending}
                 onClick={() => onRate(rating.value)}
               >
@@ -344,35 +342,33 @@ export function ReviewCard({
           </div>
         </>
       ) : (
-        <button type="button" className="btn btn--primary" onClick={onReveal}>
+        <button type="button" className="btn btn--primary btn--block" onClick={onReveal}>
           揭示答案
         </button>
       )}
 
+      <div className="study-card__utilities">
       {wordKey ? (
-        <p>
           <Link className="btn" to={`/dictionary/words/${wordKey}`}>
             查看完整词条
           </Link>
-        </p>
       ) : null}
 
       {audioUrl ? (
-        <p>
           <button type="button" className="btn" onClick={onPlayAudio}>
             播放读音
           </button>
-        </p>
       ) : null}
+      </div>
       {/* Audio failure is announced inline; the review is never blocked. */}
       {audioFailed ? <p role="status">音频暂时无法播放，可先继续学习。</p> : null}
 
       {canUndo ? (
-        <p>
+        <div className="undo-row">
           <button type="button" className="btn" disabled={undoPending} onClick={onUndo}>
             {undoPending ? "撤销中…" : "撤销上次评分"}
           </button>
-        </p>
+        </div>
       ) : null}
       {undoError ? <p role="alert">撤销失败：{undoError}</p> : null}
     </article>

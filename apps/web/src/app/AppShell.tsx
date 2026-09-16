@@ -20,16 +20,28 @@ import { clearPersonalState, type AppQueryClient } from "../lib/query-cache";
 export interface NavItem {
   path: "/today" | "/learn" | "/review" | "/dictionary" | "/stats";
   label: string;
+  icon: "today" | "learn" | "review" | "dictionary" | "stats";
 }
 
 /** The five destinations (spec 9.1): mobile bottom nav and desktop sidebar. */
 export const NAV_ITEMS: readonly NavItem[] = [
-  { path: "/today", label: "今日" },
-  { path: "/learn", label: "学习" },
-  { path: "/review", label: "复习" },
-  { path: "/dictionary", label: "词典" },
-  { path: "/stats", label: "数据" },
+  { path: "/today", label: "今日", icon: "today" },
+  { path: "/learn", label: "学习", icon: "learn" },
+  { path: "/review", label: "复习", icon: "review" },
+  { path: "/dictionary", label: "词典", icon: "dictionary" },
+  { path: "/stats", label: "数据", icon: "stats" },
 ] as const;
+
+function NavIcon({ name }: { name: NavItem["icon"] }): React.JSX.Element {
+  const paths = {
+    today: <><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v10h13V10M9 20v-6h6v6"/></>,
+    learn: <><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v17H6.5A2.5 2.5 0 0 0 4 22Z"/><path d="M20 5.5A2.5 2.5 0 0 0 17.5 3H13v17h4.5A2.5 2.5 0 0 1 20 22Z"/></>,
+    review: <><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 1-2.05-4.95L20 10"/></>,
+    dictionary: <><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></>,
+    stats: <><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></>,
+  } as const;
+  return <svg className="app-nav__icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+}
 
 export interface AppShellProps {
   api: ApiClient;
@@ -47,7 +59,8 @@ function NavList(): React.JSX.Element {
               isActive ? "app-nav__item app-nav__item--active" : "app-nav__item"
             }
           >
-            {item.label}
+            <NavIcon name={item.icon} />
+            <span>{item.label}</span>
           </NavLink>
         </li>
       ))}
@@ -102,9 +115,10 @@ export function AppShell({ api, queryClient }: AppShellProps): React.JSX.Element
         跳到主内容
       </a>
       <header className="app-header">
-        <p className="app-title">LexiLoop</p>
-        <button type="button" className="btn" onClick={handleLogout} disabled={loggingOut}>
-          {loggingOut ? "退出中…" : "退出登录"}
+        <p className="app-title"><span className="app-title__mark">L</span><span>LexiLoop</span></p>
+        <button type="button" className="header-action" onClick={handleLogout} disabled={loggingOut} aria-label="退出登录">
+          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M10 17l5-5-5-5M15 12H3"/><path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5"/></svg>
+          <span>{loggingOut ? "退出中…" : "退出"}</span>
         </button>
       </header>
       <div className="app-body">

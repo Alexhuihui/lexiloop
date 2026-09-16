@@ -211,28 +211,28 @@ function QuestionPrompt({ card }: { card: QuickRecallCard | null }): React.JSX.E
       return (
         <div>
           <h2>{card.headword}</h2>
-          {card.phonetic ? <p className="text-(--ink-soft)">/{card.phonetic}/</p> : null}
+          {card.phonetic ? <p className="phonetic">{card.phonetic}</p> : null}
         </div>
       );
     case "context":
       return (
         <div>
-          <p className="text-(--ink-soft)">语境回忆</p>
-          <p>{card.sentence}</p>
+          <p className="eyebrow">CONTEXT RECALL</p>
+          <p className="recall-prompt">{card.sentence}</p>
         </div>
       );
     case "phrase":
       return (
         <div>
-          <p className="text-(--ink-soft)">短语回忆</p>
-          <p>{card.text}</p>
+          <p className="eyebrow">PHRASE RECALL</p>
+          <p className="recall-prompt">{card.text}</p>
         </div>
       );
     case "discrimination":
       return (
         <div>
-          <p className="text-(--ink-soft)">词义辨析</p>
-          <p>{card.prompt}</p>
+          <p className="eyebrow">WORD CHOICE</p>
+          <p className="recall-prompt">{card.prompt}</p>
         </div>
       );
     case "generic":
@@ -250,7 +250,7 @@ function Answer({ card }: { card: QuickRecallCard | null }): React.JSX.Element {
   }
   const answer = card.answer;
   return (
-    <div>
+    <div className="answer-panel">
       {answer.senses ? (
         <ul>
           {answer.senses.map((sense) => (
@@ -288,24 +288,22 @@ export function QuickRecall({
   onRate,
 }: QuickRecallProps): React.JSX.Element {
   return (
-    <section>
-      <p>
-        第 {cardIndex + 1} 张 / 共 {total} 张
-      </p>
-      <QuestionPrompt card={card} />
+    <section className="study-card recall-card">
+      <div className="study-progress"><span>第 {cardIndex + 1} 张 / 共 {total} 张</span><div className="progress-track"><span style={{ width: `${total === 0 ? 0 : (cardIndex + 1) / total * 100}%` }} /></div></div>
+      <div className="recall-card__prompt"><QuestionPrompt card={card} /></div>
       {revealed ? (
         <>
           <Answer card={card} />
           {gradeError ? (
             <p role="alert">评分未提交：{gradeError}（同一评分请求会安全重放，不会重复计分）</p>
           ) : null}
-          <div role="group" aria-labelledby="recall-rating-label">
+          <div className="rating-grid" role="group" aria-labelledby="recall-rating-label">
             <p id="recall-rating-label">选择评分</p>
             {RATINGS.map((rating) => (
               <button
                 key={rating.value}
                 type="button"
-                className="btn"
+                className={`rating-btn rating-btn--${rating.value}`}
                 disabled={gradePending}
                 onClick={() => onRate(rating.value)}
               >
@@ -315,7 +313,7 @@ export function QuickRecall({
           </div>
         </>
       ) : (
-        <button type="button" className="btn btn--primary" onClick={onReveal}>
+        <button type="button" className="btn btn--primary btn--block" onClick={onReveal}>
           揭示答案
         </button>
       )}

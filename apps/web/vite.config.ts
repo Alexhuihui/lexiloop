@@ -4,8 +4,16 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
+// Make every production build publish a distinct Service Worker. The worker
+// uses this id for its shell cache, so a newly deployed frontend cannot keep
+// serving an older cached document while its hashed assets have changed.
+const buildId = Date.now().toString(36);
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  define: {
+    __LEXILOOP_BUILD_ID__: JSON.stringify(buildId),
+  },
   build: {
     outDir: "dist",
     sourcemap: true,
