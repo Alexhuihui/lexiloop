@@ -34,3 +34,10 @@ period = 60
 # scripts/restore-drill.ts (docs/runbooks/backup-and-restore.md).
 [triggers]
 crons = ["0 19 * * *"]
+
+# PWA static assets. Unknown navigation routes fall back to index.html so
+# React Router deep links work after a refresh or from a shared URL.
+[assets]
+directory = "../../apps/web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"

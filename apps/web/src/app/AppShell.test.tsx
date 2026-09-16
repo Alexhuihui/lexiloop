@@ -9,7 +9,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -185,6 +185,29 @@ describe("shell routing", () => {
     const active = within(bottomNav).getByRole("link", { name: "复习" });
     expect(active.getAttribute("aria-current")).toBe("page");
   });
+
+  it("returns to the top when the user changes sections", async () => {
+    const scrollTo = vi.fn();
+    const previous = globalThis.scrollTo;
+    Object.defineProperty(globalThis, "scrollTo", { configurable: true, value: scrollTo });
+    try {
+      renderApp({ initialEntries: ["/today"], stub: meOkStub() });
+      await screen.findByRole("heading", { name: "今日" });
+      scrollTo.mockClear();
+
+      const user = userEvent.setup();
+      await user.click(
+        within(screen.getByRole("navigation", { name: "主导航" })).getByRole("link", {
+          name: "学习",
+        }),
+      );
+
+      await screen.findByRole("heading", { name: "学习" });
+      expect(scrollTo).toHaveBeenCalledWith(0, 0);
+    } finally {
+      Object.defineProperty(globalThis, "scrollTo", { configurable: true, value: previous });
+    }
+  });
 });
 
 describe("responsive navigation", () => {
@@ -348,6 +371,14 @@ describe("personal state clearing", () => {
 });
 
 describe("PWA app shell artifacts", () => {
+  it("configures Cloudflare assets to serve the SPA shell on deep links", () => {
+    const wrangler = readFileSync(
+      join(WEB_ROOT, "../../infra/wrangler/wrangler.toml.example"),
+      "utf8",
+    );
+    expect(wrangler).toContain('not_found_handling = "single-page-application"');
+  });
+
   it("links a valid web-app manifest and theme color from index.html", () => {
     const html = readWebFile("index.html");
     expect(html).toContain('lang="zh-CN"');

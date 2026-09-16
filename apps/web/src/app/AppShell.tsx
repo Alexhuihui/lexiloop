@@ -78,6 +78,12 @@ export function AppShell({ api, queryClient }: AppShellProps): React.JSX.Element
     locationRef.current = location;
   }, [location]);
 
+  // Section changes should begin at their own heading. Without this reset,
+  // React Router can carry a long page's scroll offset into the next tab.
+  useEffect(() => {
+    globalThis.scrollTo?.(0, 0);
+  }, [location.pathname]);
+
   // Central auth-expiry handling: every 401 from any API call lands here.
   useEffect(() => {
     api.setOnUnauthorized(() => {
