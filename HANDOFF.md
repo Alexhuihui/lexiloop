@@ -7,7 +7,8 @@
 Task 1–18 全部完成并通过评审；Task 19 的私有教材发布已激活
 （`rel-dc997f599668b817`，批准的 V1 范围为 21/22 个 Unit），Worker+PWA 已部署到
 Cloudflare 并绑定自定义域名 `https://lexiloop.juzong.cloud`。生产学习写入故障已修复，
-完整冒烟通过。
+完整冒烟通过。移动端界面已整体改版，当前生产 Worker 版本为
+`55ebd60e-e7df-4f56-ab27-a85739c45ce9`。
 
 ## 已上线的东西
 
@@ -41,6 +42,20 @@ D1 查询，检查 8 条词记录、8 张卡定义和分布在 8 个哈希范围
 抽检通过。这个结果是样本证据，不代表所有远程对象已逐个读取。离线 release
 bundle 的全文件哈希验证、全仓测试和 Playwright 端到端另行通过。
 
+## 移动端界面改版
+
+- 今日、学习设置、单词学习、快速回忆、复习、词典、词条和数据页已统一为新的
+  移动优先视觉系统；底部导航加入图标和明确选中态，长词表限制在卡片内滚动，
+  30 天预测改为横向图表。
+- 页面切换会回到新页面顶部，直接访问 `/login`、`/learn` 等 SPA 深链接会返回
+  `index.html`，不会再由 Cloudflare Assets 返回 404。
+- Service Worker shell cache 现在随前端构建变化，激活时删除旧 shell cache；登出
+  清理等待异步缓存事件完成。现有用户刷新后会取得新版界面，离线壳不会永久停留
+  在旧版本。
+- 本地全仓门禁为 44 个测试文件、668 个测试全部通过，Playwright 24/24；生产仅用
+  一个现有账号在 390px 视口抽检今日、学习、词典和数据页以及 Service Worker，
+  没有对 D1 或 R2 做全量读取。
+
 ## 其他已知问题（按优先级）
 
 1. `wrangler login` 的 OAuth 令牌时效短（几小时～1天），自动化跑长了会中途
@@ -54,8 +69,6 @@ bundle 的全文件哈希验证、全仓测试和 Playwright 端到端另行通�
 4. Deferred minors 全记录在
    `.superpowers/sdd/2026-09-10-lexiloop-implementation/progress.md`
    （含最终全分支评审的分级处置），修 P0 后建议扫一遍。
-5. Service Worker shell cache 仍使用固定版本名；未来 PWA 改版时应给
-   `sw.js` 生成随前端构建变化的版本并清理旧 shell cache。
 
 ## 常用命令
 
