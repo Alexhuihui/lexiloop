@@ -8,7 +8,7 @@
  *                                 [--release-id <id>] [--remote]
  *
  * Gates (all must pass):
- *   schema    — integrity_check, every required table present (incl. the FTS
+ *   schema    — quick_check, every required table present (incl. the FTS
  *               table), app_meta singleton intact
  *   fk        — foreign_key_check reports zero violations
  *   key       — content keys are well-formed stable keys and every stored
@@ -35,11 +35,10 @@
  *   is judged by a recursive-CTE probe (ambiguity / cycle / sink mismatch)
  *   through the same evaluator local mode feeds its resolve() failures into.
  * - audio: every audio_asset row is fetched from the private bucket via
- *   `wrangler r2 object get <bucket>/<key> --pipe` and judged by the same
- *   per-object checker as local mode (hash, WAV header, validation). More
- *   than REMOTE_AUDIO_BUDGET (1000) rows is a gate FAILURE directing the
- *   operator to the documented export path, never a silent truncation; a
- *   bucket that cannot be configured is a NAMED SKIP counted as a failure.
+ *   `wrangler r2 object get <bucket>/<key> --remote --pipe` and judged by the
+ *   same per-object checker as local mode. More than REMOTE_AUDIO_BUDGET
+ *   rows fails closed; operators can use the separate read-only sample tool
+ *   when full remote readback would exceed account limits.
  * - api/e2e always run locally over a fresh synthetic fixture (they verify
  *   the shipped code paths, not the target data).
  * - The database file-size sub-check is local-only (a remote target has no
@@ -106,14 +105,21 @@ export const REQUIRED_TABLES: readonly string[] = [
 ];
 
 /** The same malformed-stable-key probe local and remote modes run. */
-function sqlMalformedKeyCount(releaseId?: string): string {
+export function sqlMalformedKeyCount(releaseId?: string): string {
   const scope = releaseId === undefined ? "" : ` WHERE release_id = '${releaseId}'`;
+  const invalidWhere = (valid: string) =>
+    ` WHERE ${releaseId === undefined ? "" : `release_id = '${releaseId}' AND `}NOT (${valid})`;
+  const hex = (column: string) => `(length(${column}) = 64 AND ${column} NOT GLOB '*[^0-9a-f]*')`;
   return `SELECT
-     (SELECT COUNT(*) FROM card_definition${scope} WHERE content_card_key NOT GLOB '[0-9a-f]*' OR length(content_card_key) != 64)
-   + (SELECT COUNT(*) FROM word${scope} WHERE word_key NOT GLOB '[0-9a-f]*' OR length(word_key) != 64)
-   + (SELECT COUNT(*) FROM sense${scope} WHERE sense_key NOT GLOB '[0-9a-f]*' OR length(sense_key) != 64)
-   + (SELECT COUNT(*) FROM phrase${scope} WHERE phrase_key NOT GLOB '[0-9a-f]*' OR length(phrase_key) != 64)
-   + (SELECT COUNT(*) FROM example${scope} WHERE example_key NOT GLOB '[0-9a-f]*' OR length(example_key) != 64) AS malformed,
+     (SELECT COUNT(*) FROM card_definition${invalidWhere(hex("content_card_key"))})
+   + (SELECT COUNT(*) FROM word${invalidWhere(`${hex("word_key")}
+       OR word_key = 'w.' || unit_key || '.' || printf('%04d', source_order) || '.' || headword`)})
+   + (SELECT COUNT(*) FROM sense${invalidWhere(`${hex("sense_key")}
+       OR sense_key = 's.' || word_key || '.' || sense_order`)})
+   + (SELECT COUNT(*) FROM phrase${invalidWhere(`${hex("phrase_key")}
+       OR phrase_key = 'ph.' || word_key || '.' || source_order`)})
+   + (SELECT COUNT(*) FROM example${invalidWhere(`${hex("example_key")}
+       OR example_key = 'ex.' || word_key || '.' || source_order`)}) AS malformed,
    (SELECT COUNT(*) FROM card_definition${scope}) + (SELECT COUNT(*) FROM word${scope})
    + (SELECT COUNT(*) FROM sense${scope}) + (SELECT COUNT(*) FROM phrase${scope})
    + (SELECT COUNT(*) FROM example${scope}) AS total`;
@@ -177,7 +183,7 @@ export function evaluateSchema(input: {
   meta: { active_release_id: string | null; config_version: number } | null;
 }): GateVerdict {
   const details: string[] = [];
-  details.push(`integrity_check ${input.integrityOk ? "ok" : "FAILED"}`);
+  details.push(`quick_check ${input.integrityOk ? "ok" : "FAILED"}`);
   const present = new Set(input.tableNames);
   const missing = REQUIRED_TABLES.filter((table) => !present.has(table));
   details.push(
@@ -231,24 +237,36 @@ export function evaluateKeys(input: {
   };
 }
 
-/** Minimal WAV header parse: RIFF/WAVE + PCM fmt chunk; also reads rate. */
+/** Minimal RIFF/WAVE parse: the compiler may place LIST/INFO before fmt. */
 function wavHeaderOf(bytes: Uint8Array): { valid: boolean; sampleRateHz: number } {
-  if (bytes.length < 44) {
+  if (bytes.length < 12) {
     return { valid: false, sampleRateHz: 0 };
   }
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return {
-    valid:
-      buffer.toString("ascii", 0, 4) === "RIFF" &&
-      buffer.toString("ascii", 8, 12) === "WAVE" &&
-      buffer.toString("ascii", 12, 16) === "fmt " &&
-      buffer.readUInt16LE(20) === 1,
-    sampleRateHz: buffer.readUInt32LE(24),
-  };
+  if (buffer.toString("ascii", 0, 4) !== "RIFF" || buffer.toString("ascii", 8, 12) !== "WAVE") {
+    return { valid: false, sampleRateHz: 0 };
+  }
+  let offset = 12;
+  let sampleRateHz = 0;
+  let pcmFormat = false;
+  let hasData = false;
+  while (offset + 8 <= buffer.length) {
+    const kind = buffer.toString("ascii", offset, offset + 4);
+    const size = buffer.readUInt32LE(offset + 4);
+    const start = offset + 8;
+    if (size > buffer.length - start) return { valid: false, sampleRateHz: 0 };
+    if (kind === "fmt " && size >= 16) {
+      pcmFormat = buffer.readUInt16LE(start) === 1;
+      sampleRateHz = buffer.readUInt32LE(start + 4);
+    }
+    if (kind === "data" && size > 0) hasData = true;
+    offset = start + size + (size % 2);
+  }
+  return { valid: pcmFormat && hasData, sampleRateHz };
 }
 
 /** One audio row's verdict — the SAME check local and remote modes apply. */
-function audioRowProblem(
+export function audioRowProblem(
   bytes: Uint8Array | null,
   row: { content_sha256: string; validation: string; sample_rate_hz: number },
 ): string | null {
@@ -480,7 +498,7 @@ async function openTarget(args: Args): Promise<Target> {
 // ---------------------------------------------------------------------------
 
 function gateSchema(target: Target, reporter: Reporter): void {
-  const integrity = target.sqlite.pragma("integrity_check") as Array<{ integrity_check: string }>;
+  const integrity = target.sqlite.pragma("quick_check") as Array<{ quick_check: string }>;
   const tables = target.sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
     name: string;
   }>;
@@ -490,7 +508,7 @@ function gateSchema(target: Target, reporter: Reporter): void {
   reporter.record(
     "schema",
     evaluateSchema({
-      integrityOk: integrity.every((row) => row.integrity_check === "ok"),
+      integrityOk: integrity.every((row) => row.quick_check === "ok"),
       tableNames: tables.map((row) => row.name),
       meta: meta ?? null,
     }),
@@ -618,7 +636,7 @@ export async function runRemoteDataGates(input: {
 
   // schema
   try {
-    const integrityRows = await runner.d1("PRAGMA integrity_check");
+    const integrityRows = await runner.d1("PRAGMA quick_check");
     const integrityOk = integrityRows.length > 0 && integrityRows.every((row) => Object.values(row)[0] === "ok");
     const tableRows = await runner.d1("SELECT name FROM sqlite_master WHERE type = 'table'");
     const metaRows = await runner.d1("SELECT active_release_id, config_version FROM app_meta WHERE id = 1");
@@ -682,13 +700,7 @@ export async function runRemoteDataGates(input: {
       sample_rate_hz: number;
     }>;
     if (rows.length > REMOTE_AUDIO_BUDGET) {
-      out.push(
-        namedSkip(
-          "audio",
-          `${rows.length} audio rows exceed the remote verification budget of ${REMOTE_AUDIO_BUDGET}; ` +
-            "export the D1 snapshot and audio objects and run local mode with --db/--r2-dir",
-        ),
-      );
+      out.push(namedSkip("audio", `${rows.length} audio rows exceed the full remote verification budget`));
     } else {
       const problems = { missing: 0, hashMismatch: 0, unvalidated: 0, badHeader: 0 };
       for (const row of rows) {
@@ -698,9 +710,7 @@ export async function runRemoteDataGates(input: {
           validation: String(row["validation"] ?? ""),
           sample_rate_hz: Number(row["sample_rate_hz"] ?? 0),
         });
-        if (problem !== null) {
-          problems[problem as keyof typeof problems] += 1;
-        }
+        if (problem !== null) problems[problem as keyof typeof problems] += 1;
       }
       out.push({ gate: "audio", verdict: evaluateAudio(rows.length, problems) });
     }
@@ -779,13 +789,10 @@ function createWranglerRunner(config: WranglerConfig): RemoteRunner {
       }
       const result = spawnSync(
         "wrangler",
-        ["r2", "object", "get", `${config.bucket}/${key}`, "--config", config.configPath, "--pipe"],
+        ["r2", "object", "get", `${config.bucket}/${key}`, "--remote", "--config", config.configPath, "--pipe"],
         { cwd: repoRoot, encoding: "buffer", timeout: 120_000, maxBuffer: 64 * 1024 * 1024 },
       );
-      if (result.status !== 0 || result.error) {
-        return null;
-      }
-      return new Uint8Array(result.stdout);
+      return result.status === 0 && !result.error ? new Uint8Array(result.stdout) : null;
     },
   };
 }

@@ -66,6 +66,15 @@ not predate the web bundle).
 4. One grade + undo with a designated test user.
 5. Structured logs contain no credentials, tokens, cookies, or textbook text.
 
+For a bounded remote spot check under free-tier limits, run
+`pnpm exec tsx scripts/remote-sample.ts <release-id>`. It makes 13 small D1
+queries and reads at most 8 R2 audio objects across hash-key ranges, checking
+the active pointer, sampled source/card keys, object hashes, and WAV headers.
+This is sample evidence only. The full release-bundle file-hash check is
+`pnpm compiler release verify --bundle .lexiloop-private/releases/<release-id>`
+and runs locally. Do not run the full remote verifier when quota limits require
+sampling.
+
 ## Backups
 
 The scheduled handler uploads gzip JSONL + manifest to the private R2 bucket

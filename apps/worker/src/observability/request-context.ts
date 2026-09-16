@@ -182,6 +182,10 @@ interface D1ResultMeta {
  * bound on the true rows_read. `first()` is forwarded untouched.
  */
 export function instrumentD1(db: D1Database, usage: RequestUsageRecorder): D1Database {
+  // D1 batch() accepts only its native prepared-statement objects. Keep the
+  // underlying statement for each instrumented wrapper so batch can pass
+  // native objects back to the binding while still recording result metadata.
+  const nativeStatements = new WeakMap<object, D1PreparedStatement>();
   const recordMeta = (result: unknown): void => {
     const meta = (result as D1ResultMeta | null | undefined)?.meta;
     if (meta) {
@@ -212,7 +216,9 @@ export function instrumentD1(db: D1Database, usage: RequestUsageRecorder): D1Dat
       first: statement.first.bind(statement),
     };
     // Faithful forwarder for the statement shape drizzle's D1 driver uses.
-    return instrumented as unknown as D1PreparedStatement;
+    const wrapper = instrumented as unknown as D1PreparedStatement;
+    nativeStatements.set(wrapper, statement);
+    return wrapper;
   };
   return new Proxy(db, {
     get(target, property) {
@@ -221,7 +227,7 @@ export function instrumentD1(db: D1Database, usage: RequestUsageRecorder): D1Dat
       }
       if (property === "batch") {
         return async (statements: D1PreparedStatement[]) => {
-          const results = await target.batch(statements);
+          const results = await target.batch(statements.map((item) => nativeStatements.get(item) ?? item));
           for (const result of results) {
             recordMeta(result);
           }

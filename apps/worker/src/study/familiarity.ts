@@ -78,15 +78,15 @@ export interface PatchResult {
  * renames (spec 6.4), evaluated against the session's pinned release only.
  */
 async function groupWordKeys(service: StudyService, session: StudySessionRecord): Promise<Set<string>> {
-  const keys = new Set<string>();
-  for (const card of session.queue.cards) {
-    const definition = await service.content.getCard(session.releaseId, card.presented_card_key);
-    if (!definition) {
-      continue;
-    }
-    keys.add(await service.aliases.resolve({ releaseId: session.releaseId, key: definition.wordKey }));
-  }
-  return keys;
+  const definitions = await service.content.getCards(
+    session.releaseId,
+    session.queue.cards.map((card) => card.presented_card_key),
+  );
+  const roots = await service.aliases.resolveMany({
+    releaseId: session.releaseId,
+    keys: definitions.map((definition) => definition.wordKey),
+  });
+  return new Set(definitions.map((definition) => roots.get(definition.wordKey)!));
 }
 
 /**

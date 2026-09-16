@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { LexiloopDatabase } from "../schema";
 import {
   audioAsset,
@@ -105,6 +105,34 @@ export class ContentRepository {
       .from(cardDefinition)
       .where(and(eq(cardDefinition.releaseId, releaseId), eq(cardDefinition.contentCardKey, contentCardKey)))
       .get();
+  }
+
+  /** Fetches session card definitions without one D1 request per card.
+   * Chunks leave room for the release id under D1's 100 bound-parameter cap. */
+  async getCards(releaseId: string, contentCardKeys: readonly string[]): Promise<CardDefinitionRow[]> {
+    const keys = [...new Set(contentCardKeys)];
+    const rows: CardDefinitionRow[] = [];
+    for (let start = 0; start < keys.length; start += 90) {
+      rows.push(...await this.db
+        .select()
+        .from(cardDefinition)
+        .where(and(eq(cardDefinition.releaseId, releaseId), inArray(cardDefinition.contentCardKey, keys.slice(start, start + 90)))));
+    }
+    return rows;
+  }
+
+  /** Fetches the cards for many words in one D1 request. A JSON array keeps
+   * the statement at two bindings regardless of the number of word keys. */
+  async listCardsForWords(releaseId: string, wordKeys: readonly string[]): Promise<CardDefinitionRow[]> {
+    const keys = [...new Set(wordKeys)];
+    if (keys.length === 0) return [];
+    return await this.db
+      .select()
+      .from(cardDefinition)
+      .where(and(
+        eq(cardDefinition.releaseId, releaseId),
+        sql`${cardDefinition.wordKey} IN (SELECT value FROM json_each(${JSON.stringify(keys)}))`,
+      ));
   }
 
   async listCards(releaseId: string, wordKey: string): Promise<CardDefinitionRow[]> {

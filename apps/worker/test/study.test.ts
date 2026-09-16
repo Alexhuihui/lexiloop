@@ -571,6 +571,80 @@ describe("session resume (GET)", () => {
 });
 
 describe("PATCH /api/study/sessions/:id (StudyPatch)", () => {
+  it("keeps a 100+ card session within the D1 free query and binding budgets", async () => {
+    // Local SQLite normally has neither D1 limit. Enforce both at prepare
+    // time so this reproduces the production failure rather than just
+    // asserting that the final response is successful.
+    for (let start = 0; start < 110; start += 50) {
+      const extra = Array.from({ length: Math.min(50, 110 - start) }, (_, offset) => {
+        const index = start + offset;
+        return {
+          releaseId: R1,
+          contentCardKey: `k-budget-${index}`,
+          cardType: "WORD_MEANING" as const,
+          targetEntityKey: `t-budget-${index}`,
+          wordKey: "w1",
+          unitKey: "u-1",
+          templateVersion: "tv-1",
+          status: "ACTIVE" as const,
+        };
+      });
+      await fx.db.insert(cardDefinition).values(extra);
+    }
+
+    const originalPrepare = fx.env.sqlite.prepare.bind(fx.env.sqlite);
+    let queryCount = 0;
+    fx.env.sqlite.prepare = ((source: string) => {
+      queryCount += 1;
+      if (queryCount > 50) throw new Error("simulated D1 free query limit");
+      if ((source.match(/\?/g) ?? []).length > 100) throw new Error("simulated D1 binding limit");
+      return originalPrepare(source);
+    }) as typeof fx.env.sqlite.prepare;
+    try {
+      const withinBudget = async <T>(request: () => Promise<T>): Promise<T> => {
+        queryCount = 0;
+        const result = await request();
+        expect(queryCount).toBeLessThanOrEqual(50);
+        return result;
+      };
+      const created = await withinBudget(() => createSession(fx.bobAuth, "NEW_WORDS"));
+      expect(created.status).toBe(201);
+      expect(created.body.cards.length).toBeGreaterThan(100);
+      const resumed = await withinBudget(() => getSession(fx.bobAuth, created.body.session_id));
+      expect(resumed.status).toBe(200);
+      expect(resumed.body.word_keys).toEqual(["w-old", "w1", "w2"]);
+      const presented = await withinBudget(() => patchSession(fx.bobAuth, created.body.session_id, {
+        event_id: "budget-presented", action: "WORD_PRESENTED", word_key: "w2",
+      }));
+      expect(presented.status).toBe(200);
+      const familiarity = await withinBudget(() => patchSession(fx.bobAuth, created.body.session_id, {
+        event_id: "budget-familiarity", action: "FAMILIARITY_SET", word_key: "w1",
+        familiarity: "VERY_UNFAMILIAR",
+      }));
+      expect(familiarity.status).toBe(200);
+      const first = await withinBudget(() => grade(fx.bobAuth, {
+        event_id: "budget-grade", session_id: created.body.session_id,
+        card_key: created.body.current_card_key!, rating: 3,
+      }));
+      expect(first.status).toBe(200);
+      const supplemental = await withinBudget(() => createSession(fx.aliceAuth, "QUICK_TEST"));
+      expect(supplemental.status).toBe(201);
+      expect(supplemental.body.cards.length).toBeGreaterThan(100);
+      const clone = originalPrepare(`INSERT INTO study_session
+        (session_id, user_id, mode, release_id, queue_snapshot, position, created_at, expires_at)
+        SELECT ?, user_id, mode, release_id, queue_snapshot, position, created_at, expires_at
+        FROM study_session WHERE session_id = ?`);
+      for (let index = 0; index < 30; index += 1) clone.run(`budget-clone-${index}`, supplemental.body.session_id);
+      queryCount = 0;
+      const listed = await fx.app.request("/api/study/sessions", { headers: { cookie: fx.aliceAuth.cookie } });
+      expect(listed.status).toBe(200);
+      expect(queryCount).toBeLessThanOrEqual(50);
+      expect(((await listed.json()) as { sessions: unknown[] }).sessions).toHaveLength(31);
+    } finally {
+      fx.env.sqlite.prepare = originalPrepare as typeof fx.env.sqlite.prepare;
+    }
+  });
+
   it("records WORD_PRESENTED: creates word_progress moving UNSEEN -> IN_PROGRESS and snapshots the event id", async () => {
     const created = await createSession(fx.bobAuth, "NEW_WORDS");
     const outcome = await patchSession(fx.bobAuth, created.body.session_id, {

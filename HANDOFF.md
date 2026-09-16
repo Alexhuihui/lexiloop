@@ -1,13 +1,13 @@
 # LexiLoop 交接说明（给下一位接手的同事）
 
-> 更新时间：2026-09-16。分支 `plan/lexiloop-implementation`，工作树干净，所有已
-> 完成工作均已提交。接手前先读完本文档。
+> 更新时间：2026-09-16。分支 `plan/lexiloop-implementation`。接手前先读完本文档。
 
 ## 当前状态（一句话）
 
-Task 1–18 全部完成并通过评审；Task 19 的私有教材编译已完成到**发布已激活**
-（`rel-dc997f599668b817`，21/22 个 Unit），Worker+PWA 已部署到 Cloudflare 并
-绑定自定义域名 `https://lexiloop.juzong.cloud`。
+Task 1–18 全部完成并通过评审；Task 19 的私有教材发布已激活
+（`rel-dc997f599668b817`，批准的 V1 范围为 21/22 个 Unit），Worker+PWA 已部署到
+Cloudflare 并绑定自定义域名 `https://lexiloop.juzong.cloud`。生产学习写入故障已修复，
+完整冒烟通过。
 
 ## 已上线的东西
 
@@ -18,25 +18,28 @@ Task 1–18 全部完成并通过评审；Task 19 的私有教材编译已完成
 - 账号: 3 个（alice/bob/carol）。**密码明文在
   `.lexiloop-private/users.private.txt`**（git-ignored），格式 `user:pass`。
 
-## 唯一未完成的任务（P0）
+## 已解决的生产写入故障（P0）
 
-**`PATCH /api/study/sessions/:id`（WORD_PRESENTED / FAMILIARITY_SET）在生产环境
-返回 500 INTERNAL。** 本地/E2E 全绿，仅生产炸。
+`PATCH /api/study/sessions/:id` 和首次评分此前在生产返回 500；现已修复并部署。
 
-- 根因（已定位，未修）：Cloudflare Workers **免费版每请求限 50 次子请求**
-  （每次 D1 查询算一次）。`apps/worker/src/study/familiarity.ts` 的
-  `groupWordKeys` 对会话里每张卡发逐卡 `content.getCard` + 逐 key
-  `aliases.resolve`（75 卡会话 ≈ 150+ 次查询）→ 超 50 上限 → D1 抛
-  "Too many API requests" → 被包成 INTERNAL 500。
-- 修法：批量查询。卡片定义用一次 IN 查询取齐（`packages/db` 可能需要加
-  `getCards(releaseId, keys)` 批量方法），别名用现成的
-  `AliasRepository.resolveMany` 一次解析。同时排查 grade.ts 的完整性检查、
-  service.ts 的 toSessionView/newWordsCards/supplementalCards 是否有同类
-  逐 key 循环。语义不变，纯查询数削减。
-- 复现：部署后跑 `.lexiloop-private/prod-smoke.mjs`（完整冒烟脚本，注意它
-  第 9 行的 header 合并 bug 已修：`{cookie:..., ...extra}`）。
-- 日志抓取：`npx wrangler tail` 的 websocket 在大陆网络不通（这是为什么
-  调试走了弯路）—— 用 D1 查询 + 本地复现代替。
+- 卡片定义和别名改为批量读取，`IN` 查询按 90 个 key 分块以遵守 D1 每条查询
+  100 个绑定参数的上限；会话返回、建队列、PATCH、评分完整性检查和多会话列表
+  均覆盖。新增模拟 D1 免费版预算的 110+ 卡 / 30 会话测试。
+- 生产日志另外揭示了直接阻断写入的根因：请求统计的 `instrumentD1`
+  把原生 prepared statement 包成普通对象，`D1.batch()` 因 `Malformed input`
+  拒绝执行。`batch()` 现会解开包装并传回原生对象；增加 D1 形状测试。
+- 生产完整冒烟：75 卡会话创建 201，WORD_PRESENTED / FAMILIARITY_SET / 评分 /
+  重放 / 撤销 / 音频流 / 登出均为预期状态。生产 Worker 版本
+  `f3244d62-c978-401e-abbe-557b855190c9`。
+- `wrangler tail` 本轮已可用；调试时只提取状态和错误摘要，避免输出请求头。
+
+## 免费额度下的远程抽检
+
+按当前运行约束，不对生产 D1 和 R2 做全量读取。运行
+`pnpm exec tsx scripts/remote-sample.ts rel-dc997f599668b817`：固定 13 条小范围
+D1 查询，检查 8 条词记录、8 张卡定义和分布在 8 个哈希范围的 8 个 R2 音频对象；
+抽检通过。这个结果是样本证据，不代表所有远程对象已逐个读取。离线 release
+bundle 的全文件哈希验证、全仓测试和 Playwright 端到端另行通过。
 
 ## 其他已知问题（按优先级）
 
@@ -51,12 +54,15 @@ Task 1–18 全部完成并通过评审；Task 19 的私有教材编译已完成
 4. Deferred minors 全记录在
    `.superpowers/sdd/2026-09-10-lexiloop-implementation/progress.md`
    （含最终全分支评审的分级处置），修 P0 后建议扫一遍。
+5. Service Worker shell cache 仍使用固定版本名；未来 PWA 改版时应给
+   `sw.js` 生成随前端构建变化的版本并清理旧 shell cache。
 
 ## 常用命令
 
 ```bash
 pnpm typecheck && pnpm test && pnpm test:python   # 全仓门禁
 node .lexiloop-private/prod-smoke.mjs             # 生产冒烟
+pnpm exec tsx scripts/remote-sample.ts rel-dc997f599668b817  # 有限远程抽检
 npx wrangler deploy -c infra/wrangler/wrangler.toml
 npx wrangler d1 execute lexiloop --remote -c infra/wrangler/wrangler.toml --json --command "SELECT ..."
 ```

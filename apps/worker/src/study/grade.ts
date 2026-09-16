@@ -180,11 +180,14 @@ function sqlFlipWordIntroduced(
   canonicalCardKeys: readonly string[],
   now: number,
 ): SQL {
-  const keys = sql.join(canonicalCardKeys.map((key) => sql`${key}`), sql`, `);
+  // One JSON array parameter avoids exceeding D1's 100 bindings when a
+  // single word has many active cards; D1 supports SQLite's json_each.
+  const keysJson = JSON.stringify(canonicalCardKeys);
   return sql`UPDATE word_progress
     SET stage = 'INTRODUCED', introduced_release_id = ${releaseId}, introduced_at = ${now}, last_seen_at = ${now}
     WHERE user_id = ${userId} AND word_key = ${canonicalWordKey} AND stage = 'IN_PROGRESS'
-      AND (SELECT COUNT(*) FROM card_state cs WHERE cs.user_id = ${userId} AND cs.content_card_key IN (${keys})) = ${canonicalCardKeys.length}`;
+      AND (SELECT COUNT(*) FROM card_state cs WHERE cs.user_id = ${userId}
+           AND cs.content_card_key IN (SELECT value FROM json_each(${keysJson}))) = ${canonicalCardKeys.length}`;
 }
 
 /** True when the driver rejected the INSERT for a duplicate event_id. */

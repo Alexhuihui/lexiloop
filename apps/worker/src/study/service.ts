@@ -10,7 +10,7 @@
  * user-scoped through `UserContext` (spec 6.3).
  */
 
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type { SQL } from "drizzle-orm";
 import {
@@ -23,7 +23,6 @@ import {
   UserSettingsRepository,
   WordProgressRepository,
   createAtomicBatchRunner,
-  cardDefinition,
   cardState,
   schema,
   unit,
@@ -91,15 +90,14 @@ export interface SessionView {
   word_keys: string[];
 }
 
-async function toSessionView(service: StudyService, record: StudySessionRecord): Promise<SessionView> {
-  // The snapshot stores card keys only; the pinned release's definitions
-  // recover the group's words and units (spec 6.4: pinned-release reads).
-  const definitions = await Promise.all(
-    record.queue.cards.map((card) => service.content.getCard(record.releaseId, card.presented_card_key)),
-  );
+function sessionViewFromDefinitions(
+  record: StudySessionRecord,
+  definitionsByKey: ReadonlyMap<string, CardDefinitionRow>,
+): SessionView {
   const unitKeys = new Set<string>();
   const wordKeys = new Set<string>();
-  for (const definition of definitions) {
+  for (const entry of record.queue.cards) {
+    const definition = definitionsByKey.get(entry.presented_card_key);
     if (!definition) {
       continue;
     }
@@ -121,6 +119,16 @@ async function toSessionView(service: StudyService, record: StudySessionRecord):
     unit_keys: [...unitKeys].sort(),
     word_keys: [...wordKeys].sort(),
   };
+}
+
+async function toSessionView(service: StudyService, record: StudySessionRecord): Promise<SessionView> {
+  // The snapshot stores card keys only; the pinned release's definitions
+  // recover the group's words and units (spec 6.4: pinned-release reads).
+  const definitions = await service.content.getCards(
+    record.releaseId,
+    record.queue.cards.map((card) => card.presented_card_key),
+  );
+  return sessionViewFromDefinitions(record, new Map(definitions.map((row) => [row.contentCardKey, row])));
 }
 
 /** Group size when the user has no settings row (the schema default). */
@@ -170,7 +178,18 @@ export class StudyService {
 
   async listSessions(ctx: UserContext): Promise<SessionView[]> {
     const records = await this.sessions.listActive(ctx, this.now());
-    return await Promise.all(records.map((record) => toSessionView(this, record)));
+    const keysByRelease = new Map<string, Set<string>>();
+    for (const record of records) {
+      const keys = keysByRelease.get(record.releaseId) ?? new Set<string>();
+      for (const entry of record.queue.cards) keys.add(entry.presented_card_key);
+      keysByRelease.set(record.releaseId, keys);
+    }
+    const definitionsByRelease = new Map<string, Map<string, CardDefinitionRow>>();
+    for (const [releaseId, keys] of keysByRelease) {
+      const definitions = await this.content.getCards(releaseId, [...keys]);
+      definitionsByRelease.set(releaseId, new Map(definitions.map((row) => [row.contentCardKey, row])));
+    }
+    return records.map((record) => sessionViewFromDefinitions(record, definitionsByRelease.get(record.releaseId)!));
   }
 
   async getSession(ctx: UserContext, sessionId: string): Promise<SessionView> {
@@ -275,31 +294,21 @@ export class StudyService {
     if (words.length === 0) {
       return [];
     }
-    const definitions = await this.definitionsOf(releaseId, words.map((w) => w.word_key));
+    const definitions = await this.definitionsOf(releaseId, words.map((word) => word.word_key));
     // card_state rows are keyed canonically too: resolve each definition's
     // local card key to its root before the graded check, so a card already
     // graded under another presentation is not re-introduced.
-    const canonicalByCard = new Map<string, string>();
-    for (const definition of definitions) {
-      canonicalByCard.set(
-        definition.contentCardKey,
-        await this.aliases.resolve({ releaseId, key: definition.contentCardKey }),
-      );
-    }
+    const canonicalByCard = await this.aliases.resolveMany({
+      releaseId,
+      keys: definitions.map((definition) => definition.contentCardKey),
+    });
     const gradedCanonical = new Set(
-      definitions.length === 0
-        ? []
-        : (
-            await builder(this.db)
-              .select({ contentCardKey: cardState.contentCardKey })
-              .from(cardState)
-              .where(
-                and(
-                  eq(cardState.userId, ctx.userId),
-                  inArray(cardState.contentCardKey, [...new Set(canonicalByCard.values())]),
-                ),
-              )
-          ).map((row) => row.contentCardKey),
+      definitions.length === 0 ? [] : (
+        await builder(this.db)
+          .select({ contentCardKey: cardState.contentCardKey })
+          .from(cardState)
+          .where(eq(cardState.userId, ctx.userId))
+      ).map((row) => row.contentCardKey),
     );
     const entries = buildSupplementalQueue(
       words,
@@ -324,17 +333,8 @@ export class StudyService {
       content_card_key: record.contentCardKey,
       due: record.state.due_at,
     }));
-    const presentable = await builder(this.db)
-      .select({ contentCardKey: cardDefinition.contentCardKey })
-      .from(cardDefinition)
-      .where(
-        and(
-          eq(cardDefinition.releaseId, releaseId),
-          inArray(cardDefinition.contentCardKey, candidates.map((c) => c.content_card_key)),
-          eq(cardDefinition.status, "ACTIVE"),
-        ),
-      );
-    const presentableKeys = new Set(presentable.map((row) => row.contentCardKey));
+    const presentable = await this.content.getCards(releaseId, candidates.map((c) => c.content_card_key));
+    const presentableKeys = new Set(presentable.filter((row) => row.status === "ACTIVE").map((row) => row.contentCardKey));
     return dueQueueCards(
       candidates.filter((candidate) => presentableKeys.has(candidate.content_card_key)),
       now,
@@ -342,10 +342,7 @@ export class StudyService {
   }
 
   private definitionsOf(releaseId: string, wordKeys: readonly string[]): Promise<CardDefinitionRow[]> {
-    return this.db
-      .select()
-      .from(cardDefinition)
-      .where(and(eq(cardDefinition.releaseId, releaseId), inArray(cardDefinition.wordKey, [...wordKeys])));
+    return this.content.listCardsForWords(releaseId, wordKeys);
   }
 
   /** The release's words in the binding textbook order (unit, tier, source, key). */
@@ -372,10 +369,10 @@ export class StudyService {
     releaseId: string,
     entries: readonly IntroductionQueueEntry[],
   ): Promise<StudyQueueCard[]> {
-    const canonicalByKey = new Map<string, string>();
-    for (const entry of entries) {
-      canonicalByKey.set(entry.content_card_key, await this.aliases.resolve({ releaseId, key: entry.content_card_key }));
-    }
+    const canonicalByKey = await this.aliases.resolveMany({
+      releaseId,
+      keys: entries.map((entry) => entry.content_card_key),
+    });
     return queueCardsFromEntries(entries, (presented) => canonicalByKey.get(presented)!);
   }
 
@@ -404,11 +401,9 @@ export class StudyService {
    */
   async canonicalCardKeys(releaseId: string, localWordKey: string): Promise<string[]> {
     const rows = await this.definitionsOf(releaseId, [localWordKey]);
-    const keys = new Set<string>();
-    for (const row of rows) {
-      if (row.status !== "ACTIVE") continue;
-      keys.add(await this.aliases.resolve({ releaseId, key: row.contentCardKey }));
-    }
+    const activeKeys = rows.filter((row) => row.status === "ACTIVE").map((row) => row.contentCardKey);
+    const roots = await this.aliases.resolveMany({ releaseId, keys: activeKeys });
+    const keys = new Set(activeKeys.map((key) => roots.get(key)!));
     return [...keys];
   }
 

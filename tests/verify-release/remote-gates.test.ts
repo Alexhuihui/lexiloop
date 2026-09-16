@@ -17,9 +17,12 @@ import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import {
   REQUIRED_TABLES,
+  audioRowProblem,
   runRemoteDataGates,
+  sqlMalformedKeyCount,
   type RemoteRunner,
   type Row,
 } from "../../scripts/verify-release";
@@ -43,8 +46,8 @@ interface FakeD1Handlers {
 /** Builds a runner whose D1 responses match the given (healthy or broken) state. */
 function fakeD1(state: FakeD1Handlers): RemoteRunner["d1"] {
   return async (sql: string): Promise<Row[]> => {
-    if (sql.startsWith("PRAGMA integrity_check")) {
-      return [{ integrity_check: state.integrity ?? "ok" }];
+    if (sql.startsWith("PRAGMA quick_check")) {
+      return [{ quick_check: state.integrity ?? "ok" }];
     }
     if (sql.includes("sqlite_master")) {
       return (state.tables ?? []).map((name) => ({ name }));
@@ -141,6 +144,42 @@ function failuresOf(results: Awaited<ReturnType<typeof runRemoteDataGates>>): st
 }
 
 describe("verify-release remote gates (injected wrangler boundary)", () => {
+  it("accepts PCM WAVs whose compiler INFO metadata precedes the fmt chunk", () => {
+    const plain = Buffer.from(syntheticWav("metadata"));
+    const list = Buffer.alloc(12);
+    list.write("LIST", 0, "ascii");
+    list.writeUInt32LE(4, 4);
+    list.write("INFO", 8, "ascii");
+    const withInfo = Buffer.concat([plain.subarray(0, 12), list, plain.subarray(12)]);
+    withInfo.writeUInt32LE(withInfo.length - 8, 4);
+    expect(audioRowProblem(withInfo, {
+      content_sha256: sha256HexOf(withInfo), validation: "PASSED", sample_rate_hz: 8000,
+    })).toBeNull();
+  });
+
+  it("accepts compiler source keys and detects a changed key or non-hex card", () => {
+    const db = new Database(":memory:");
+    try {
+      db.exec(`CREATE TABLE word(release_id TEXT, word_key TEXT, unit_key TEXT, source_order INTEGER, headword TEXT);
+        CREATE TABLE sense(release_id TEXT, sense_key TEXT, word_key TEXT, sense_order INTEGER);
+        CREATE TABLE phrase(release_id TEXT, phrase_key TEXT, word_key TEXT, source_order INTEGER);
+        CREATE TABLE example(release_id TEXT, example_key TEXT, word_key TEXT, source_order INTEGER);
+        CREATE TABLE card_definition(release_id TEXT, content_card_key TEXT);`);
+      const wordKey = "w.c1.u1.0001.coworker";
+      db.prepare("INSERT INTO word VALUES (?,?,?,?,?)").run("real", wordKey, "c1.u1", 1, "coworker");
+      db.prepare("INSERT INTO sense VALUES (?,?,?,?)").run("real", `s.${wordKey}.1`, wordKey, 1);
+      db.prepare("INSERT INTO phrase VALUES (?,?,?,?)").run("real", `ph.${wordKey}.1`, wordKey, 1);
+      db.prepare("INSERT INTO example VALUES (?,?,?,?)").run("real", `ex.${wordKey}.1`, wordKey, 1);
+      db.prepare("INSERT INTO card_definition VALUES (?,?)").run("real", "a".repeat(64));
+      expect((db.prepare(sqlMalformedKeyCount("real")).get() as { malformed: number }).malformed).toBe(0);
+      db.prepare("UPDATE word SET word_key = ?").run(`${wordKey}-changed`);
+      db.prepare("UPDATE card_definition SET content_card_key = ?").run("g".repeat(64));
+      expect((db.prepare(sqlMalformedKeyCount("real")).get() as { malformed: number }).malformed).toBe(2);
+    } finally {
+      db.close();
+    }
+  });
+
   it("FAILS the schema gate when the remote D1 is missing a required table", async () => {
     const state = healthyState();
     state.tables = state.tables!.filter((table) => table !== "word");

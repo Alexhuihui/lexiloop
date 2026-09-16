@@ -51,7 +51,14 @@ audio, bundles) live exclusively under git-ignored private paths.
 
 ## 验证
 
-- 全仓门禁：`pnpm lint`、`pnpm typecheck`（7 包）、`pnpm test`（659 TS）、
+- 全仓门禁：`pnpm lint`、`pnpm typecheck`（7 包）、`pnpm test`、
   `pnpm test:python`（72+1）、Playwright 24 条端到端（含账户隔离、别名
   激活/回滚、重试幂等、安全头）、`pnpm --filter @lexiloop/web build` 全部
   通过；秘密扫描确认无密钥/PDF/教材内容入库。
+- 生产 Worker 版本 `f3244d62-c978-401e-abbe-557b855190c9`：75 卡会话
+  创建及 WORD_PRESENTED、FAMILIARITY_SET、评分、重放、撤销均通过冒烟；
+  音频流与登出也返回预期状态。修复了逐卡 D1 查询超出免费版预算，以及请求
+  统计包装 prepared statement 后导致 `D1.batch()` 拒绝写入的故障。
+- 根据免费额度约束，远程只做有限抽检：13 条小范围 D1 查询，抽到 8 条词、
+  8 张卡及 8 个跨哈希范围的 R2 音频对象，均通过 key、内容哈希和 WAV 校验。
+  这不代表全量远程完整性证明；发布 bundle 的全文件哈希已在本地验证。

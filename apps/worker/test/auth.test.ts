@@ -612,6 +612,40 @@ describe("binding usage instrumentation", () => {
     expect(usage.d1RowsWritten).toBe(4);
   });
 
+  it("passes native prepared statements to D1 batch after instrumentation", async () => {
+    const usage = { d1RowsRead: 0, d1RowsWritten: 0, r2Operations: 0 };
+    const nativeBound = {
+      native: true,
+      first: async () => null,
+      all: async () => ({ results: [] }),
+      run: async () => ({ meta: { rows_read: 0, rows_written: 0 } }),
+      raw: async () => [],
+    } as unknown as D1PreparedStatement;
+    const nativePrepared = {
+      bind: () => nativeBound,
+      first: async () => null,
+      all: async () => ({ results: [] }),
+      run: async () => ({ meta: { rows_read: 0, rows_written: 0 } }),
+      raw: async () => [],
+    } as unknown as D1PreparedStatement;
+    let received: D1PreparedStatement[] = [];
+    const stubDb = {
+      prepare: () => nativePrepared,
+      batch: async (statements: D1PreparedStatement[]) => {
+        received = statements;
+        if (statements[0] !== nativeBound) throw new Error("D1_ERROR: Malformed input");
+        return [{ meta: { rows_read: 0, rows_written: 2 } }];
+      },
+    } as unknown as D1Database;
+
+    const instrumented = instrumentD1(stubDb, recorderFor(usage));
+    const wrapped = instrumented.prepare("INSERT ...").bind("value");
+    expect(wrapped).not.toBe(nativeBound);
+    await instrumented.batch([wrapped]);
+    expect(received).toEqual([nativeBound]);
+    expect(usage.d1RowsWritten).toBe(2);
+  });
+
   it("counts R2 operations", async () => {
     const usage = { d1RowsRead: 0, d1RowsWritten: 0, r2Operations: 0 };
     const stubBucket = {
