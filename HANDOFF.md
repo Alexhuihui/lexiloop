@@ -3,8 +3,9 @@
 ## 2026-09-21 发布请求与门禁实测
 
 - 用户已明确要求直接发布、清理旧生产数据、提交并推送代码，无需再次询问授权。
+- 代码提交 `981bc64` 已推送 `origin/plan/lexiloop-implementation`；前端/Worker 已部署生产，Cloudflare Worker 版本 `7088e6bb-02a3-4873-b2d0-5f89ebd687ca`。生产完整冒烟通过：登录、CSRF、21 Unit bootstrap、75 卡会话、呈现/熟悉度事件、评分重放、撤销、统计、搜索、音频流、登出。按免费额度限制只运行 `remote-sample.ts`：13 条 D1 查询、8 词、8 卡、8 个 R2 对象均通过。
 - 本轮执行 `pnpm compiler release package --source-hash 08496ec8927e15f59365319b243556f69922b42c6c7aa9635bde79a005d09e5e --previous-release rel-dc997f599668b817`，被 `RELEASE_GATE_UNMET` 拒绝：`IMAGE_EXTRACT` 账本状态为 `FAILED`（2026-09-18 的 `MEDIA_CONFIG_INVALID`）。后续结构、卡片、音频账本仍是内容修订前的记录，不能将旧产物重新命名为新发布。
-- 视觉队列实测 `4394 total / 490 pending / 3904 resolved / 0 blocked`。另有未复核的例句字符质量问题；新内容、真题句音频和清理旧内容必须等真实编译与质量门禁完成后处理。紧邻上一 release 按设计至少保留 14 天且供回滚，用户学习记录引用亦阻止直接删除。
+- 视觉队列实测 `4394 total / 490 pending / 3904 resolved / 0 blocked`。另有未复核的例句字符质量问题；新内容、真题句音频和清理旧内容必须等真实编译与质量门禁完成后处理。当前 active release 仍是 `rel-dc997f599668b817`，不能删除正在服务用户的教材数据；即使新 release 激活，紧邻上一 release 按设计至少保留 14 天且供回滚，用户学习记录引用亦阻止直接删除。
 - 本轮全仓 `pnpm verify` 通过（47 文件、802 Vitest、根目录 Python 1 项）；Playwright 24/24、OCR 专项 35/35、前端生产构建与 `git diff --check` 通过。Cloudflare Wrangler 登录状态正常。
 
 ## 2026-09-21 增量（生产仍是旧版）
