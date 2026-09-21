@@ -34,6 +34,7 @@ export const VISUAL_OCR_QUEUE_DIR = path.join("agent-queue", "visual-ocr");
 export const PACKETS_FILE = "packets.jsonl";
 export const RESULTS_FILE = "results.jsonl";
 export const CORRECTIONS_FILE = "corrections.jsonl";
+export const REVISIONS_FILE = "revisions.jsonl";
 
 /** Versioned prompt carried by every emitted packet. */
 export const VISUAL_OCR_PROMPT_VERSION = "visual-ocr-v1";
@@ -132,8 +133,10 @@ async function appendJsonl(filePath: string, row: unknown): Promise<void> {
 }
 
 /**
- * Write (or refresh) packets idempotently: an existing packet_id is kept as
- * a single row, so re-running normalization never duplicates review work.
+ * Reconcile the queue with the current normalization pass. Resolved packets
+ * remain immutable provenance; current unresolved packets are upserted; stale
+ * unresolved packets from an older parser/config pass are removed so they do
+ * not keep blocking a source after the underlying field disappeared.
  */
 export async function enqueuePackets(
   queueDir: string,
@@ -144,8 +147,15 @@ export async function enqueuePackets(
     queueFile(queueDir, PACKETS_FILE),
     parseStoredPacket,
   );
-  const byId = new Map(stored.map((entry) => [entry.packet.packet_id, entry]));
+  const results = await readJsonlStrict(queueFile(queueDir, RESULTS_FILE), parseStoredResult);
+  const resolvedIds = new Set(results.map((result) => result.packet_id));
+  const byId = new Map(
+    stored
+      .filter((entry) => resolvedIds.has(entry.packet.packet_id))
+      .map((entry) => [entry.packet.packet_id, entry]),
+  );
   for (const packet of validated) {
+    if (resolvedIds.has(packet.packet_id)) continue;
     byId.set(packet.packet_id, { packet, packet_hash: hashPacket(packet) });
   }
   await writeJsonlAtomic(queueFile(queueDir, PACKETS_FILE), [...byId.values()]);
@@ -210,6 +220,27 @@ export async function ingestResult(
   sourceHash: string,
   result: unknown,
 ): Promise<QueueEntry> {
+  return recordResult(queueDir, sourceHash, result);
+}
+
+/** Supersede an erroneous review without erasing its result or raw evidence. */
+export async function reviseResult(
+  queueDir: string,
+  sourceHash: string,
+  result: unknown,
+  previousAgentRunId: string,
+  reason: string,
+): Promise<QueueEntry> {
+  if (!reason.trim()) throw new VisualQueueError("REVISION_REASON_REQUIRED", "reason is empty");
+  return recordResult(queueDir, sourceHash, result, { previousAgentRunId, reason });
+}
+
+async function recordResult(
+  queueDir: string,
+  sourceHash: string,
+  result: unknown,
+  revision?: { previousAgentRunId: string; reason: string },
+): Promise<QueueEntry> {
   const parsed = VisualOcrResult.safeParse(result);
   if (!parsed.success) {
     throw new VisualQueueError("RESULT_INVALID", parsed.error.message);
@@ -240,10 +271,17 @@ export async function ingestResult(
     throw new VisualQueueError("SOURCE_HASH_MISMATCH", `packet ${response.packet_id}`);
   }
   const results = await readJsonlStrict(queueFile(queueDir, RESULTS_FILE), parseStoredResult);
-  if (results.some((existing) => existing.packet_id === response.packet_id)) {
+  const previous = results.filter((existing) => existing.packet_id === response.packet_id).at(-1);
+  if (!revision && previous) {
     throw new VisualQueueError(
       "RESULT_ALREADY_RESOLVED",
       `packet ${response.packet_id} already has a result`,
+    );
+  }
+  if (revision && (!previous || previous.agent_run_id !== revision.previousAgentRunId)) {
+    throw new VisualQueueError(
+      "REVISION_PREDECESSOR_MISMATCH",
+      `packet ${response.packet_id} has a different latest review`,
     );
   }
   if (results.some((existing) => existing.agent_run_id === response.agent_run_id)) {
@@ -254,6 +292,15 @@ export async function ingestResult(
   }
 
   await appendJsonl(queueFile(queueDir, RESULTS_FILE), response);
+  if (revision) {
+    await appendJsonl(queueFile(queueDir, REVISIONS_FILE), {
+      packet_id: response.packet_id,
+      previous_agent_run_id: revision.previousAgentRunId,
+      agent_run_id: response.agent_run_id,
+      reason: revision.reason,
+      reviewed_at: response.reviewed_at,
+    });
+  }
   if (response.verdict === "REPAIR") {
     // Separate provenance record: the correction, never a rewrite of evidence.
     await appendJsonl(

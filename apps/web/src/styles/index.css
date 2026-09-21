@@ -303,6 +303,15 @@ ul { padding-left: 1.2rem; }
 .phrase-list li + li, .example-list li + li { padding-top: 12px; border-top: 1px solid var(--line); }
 .example-list p { margin-bottom: 4px; }
 .example-list .tag { margin-right: 7px; }
+.example-audio-control { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 7px; }
+.example-audio-button {
+  min-height: 34px; display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; color: var(--brand); background: var(--brand-soft);
+  border: 1px solid rgba(23,74,59,0.14); border-radius: 999px;
+  font-size: 0.76rem; font-weight: 750; cursor: pointer;
+}
+.example-audio-button svg { width: 17px; height: 17px; }
+.example-audio-error { color: var(--danger); font-size: 0.72rem; }
 .explanation-block {
   margin-top: 12px; padding: 15px 18px; background: #f8f5ee;
   border: 1px solid var(--line); border-radius: 14px;

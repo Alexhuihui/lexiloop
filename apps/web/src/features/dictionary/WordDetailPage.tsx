@@ -9,6 +9,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { ApiError, type ApiClient } from "../../lib/api-client";
+import { ExampleAudioButton } from "../../components/ExampleAudioButton";
 
 export interface WordDetailPageProps {
   api: ApiClient;
@@ -172,6 +173,14 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
                   {example.text}
                 </p>
                 {example.source_ref ? <p>来源：{example.source_ref}</p> : null}
+                {(() => {
+                  const asset = data.audio.find(
+                    (candidate) =>
+                      candidate.entity_type === "example" &&
+                      candidate.entity_key === example.example_key,
+                  );
+                  return asset ? <ExampleAudioButton url={api.audioUrl(asset.asset_key)} /> : null;
+                })()}
               </li>
             ))}
           </ul>

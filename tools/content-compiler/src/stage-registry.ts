@@ -50,9 +50,20 @@ import {
   validateOcrArtifacts,
   type OcrBlockRecord,
 } from "./ocr-adapter";
+import {
+  ACCEPTED_SPACING_FILE,
+  applyAcceptedSpacingCorrections,
+  loadAcceptedSpacingCorrections,
+} from "./ocr-spacing";
+import {
+  ACCEPTED_SENSE_FILE,
+  applyAcceptedSenseCorrections,
+  loadAcceptedSenseCorrections,
+} from "./sense-corrections";
 import { assignReadingOrder } from "./normalize/reading-order";
 import { LLCY_2024_NORMALIZE_CONFIG } from "./normalize/config";
 import { segmentStructure, type NormalizeOutput } from "./normalize/segmentation";
+import { findContentOwnershipFindings } from "./normalize/content-quality";
 import {
   VISUAL_OCR_PROMPT_VERSION,
   enqueuePackets,
@@ -350,7 +361,7 @@ export interface MediaStageOptions {
   runPython: SpawnPythonFn;
   /** Watermark rule for WATERMARK_CLEAN. */
   rulePath?: string;
-  /** Versioned PP-StructureV3 config for LAYOUT_OCR. */
+  /** Versioned bounded-memory PaddleOCR config for LAYOUT_OCR. */
   ocrConfigPath?: string;
   /**
    * LAYOUT_OCR chunk size: pages per worker spawn. The full book is never
@@ -582,17 +593,27 @@ export const StructureNormalizeOutputSchema = z.object({
 });
 export type StructureNormalizeOutput = z.output<typeof StructureNormalizeOutputSchema>;
 
+const OcrRuntimeIdentitySchema = z.object({
+  pipeline: z.string().min(1),
+  pipeline_version: z.string().min(1),
+  model_version: z.string().min(1),
+  config_version: z.number().int().positive(),
+});
+type OcrRuntimeIdentity = z.output<typeof OcrRuntimeIdentitySchema>;
+
 /**
  * Pages of `ocr.jsonl` considered COMPLETE for a resume: the page is in scope,
- * rows exist for it, and every row's `page_image_sha256` matches the clean
- * record's cleaned image hash. Anything else (missing rows, stale hashes, an
- * unreadable artifact) counts as missing, so the reconcile-then-fill loop
- * re-spawns exactly the pages a previous run never finished.
+ * rows exist for it, and every row's `page_image_sha256` matches the cleaned
+ * image or the original-image recognition fallback hash. Every row must also
+ * name the active OCR pipeline/model/config identity. Anything else (missing
+ * rows, stale hashes/config, or an unreadable artifact) counts as missing, so
+ * the reconcile-then-fill loop re-spawns exactly the affected pages.
  */
 async function completedOcrPages(
   workDir: string,
   expectedPages: readonly number[],
   cleanByPage: ReadonlyMap<number, CleanRecord>,
+  expectedIdentity: OcrRuntimeIdentity,
 ): Promise<Set<number>> {
   let rows: OcrBlockRecord[];
   try {
@@ -611,7 +632,20 @@ async function completedOcrPages(
     const clean = cleanByPage.get(page);
     const pageRows = rowsByPage.get(page);
     if (!clean || !pageRows || pageRows.length === 0) continue;
-    if (pageRows.every((row) => row.page_image_sha256 === clean.cleaned_image_sha256)) {
+    if (
+      pageRows.every(
+        (row) =>
+          row.page_image_sha256 === clean.cleaned_image_sha256 ||
+          row.page_image_sha256 === clean.original_image_sha256,
+      )
+      && pageRows.every(
+        (row) =>
+          row.pipeline === expectedIdentity.pipeline &&
+          row.pipeline_version === expectedIdentity.pipeline_version &&
+          row.model_version === expectedIdentity.model_version &&
+          row.config_version === expectedIdentity.config_version,
+      )
+    ) {
       complete.add(page);
     }
   }
@@ -619,7 +653,7 @@ async function completedOcrPages(
 }
 
 /**
- * LAYOUT_OCR: runs the versioned PP-StructureV3 worker over every cleaned
+ * LAYOUT_OCR: runs the versioned tiled PaddleOCR worker over every cleaned
  * page image, then validates `ocr.jsonl` — schema, source/page-image hash
  * chain, and the private raw-text evidence — before the ledger may advance.
  *
@@ -640,7 +674,7 @@ export function createLayoutOcrStage(options: MediaStageOptions): AnyStage {
     throw new Error(`ocrChunkPages must be a positive integer, got ${chunkPages}`);
   }
   const chunkTimeoutMs = options.ocrChunkTimeoutMs ?? DEFAULT_OCR_CHUNK_TIMEOUT_MS;
-  const configVersion = "1";
+  const configVersion = "14";
   return {
     name: "LAYOUT_OCR",
     configVersion,
@@ -664,7 +698,15 @@ export function createLayoutOcrStage(options: MediaStageOptions): AnyStage {
         // only the pages the existing artifact does not already cover.
         const cleanRecords = await validateCleanArtifacts(workDir, ctx.sourceHash, media.pages);
         const cleanByPage = new Map(cleanRecords.map((record) => [record.page, record]));
-        const complete = await completedOcrPages(workDir, media.pages, cleanByPage);
+        const expectedIdentity = OcrRuntimeIdentitySchema.parse(
+          JSON.parse(await readFile(ocrConfigPath, "utf8")),
+        );
+        const complete = await completedOcrPages(
+          workDir,
+          media.pages,
+          cleanByPage,
+          expectedIdentity,
+        );
         const missingPages = media.pages.filter((page) => !complete.has(page)).sort((a, b) => a - b);
         for (let index = 0; index < missingPages.length; index += chunkPages) {
           const chunk = missingPages.slice(index, index + chunkPages);
@@ -735,29 +777,60 @@ export function createStructureNormalizeStage(options: MediaStageOptions): AnySt
   // v4: CJK-leading gloss blocks attach to the open entry (multi-line gloss
   // continuations, and glosses of headword lines ending at their POS marker)
   // instead of being silently dropped.
+  // v5: two-column ordering tolerates gutter bleed, exam sentences preserve
+  // wrapped/cross-page lines without footer numbers, and mnemonic/reference
+  // prose is excluded from source senses.
+  // v6: source ownership is fail-closed; split related-word/header recovery,
+  // same-line and cross-page example assembly, and source-verified OCR repairs
+  // prevent senses, phrases, and examples from leaking between entries.
+  // v7: numbered entries retain their real split phonetic, split critical
+  // fields keep field-specific confidence, and multiline examples cannot be
+  // promoted into duplicate inferred headwords. Visual review precedes the
+  // terminal ownership gate and always reconciles an empty current queue.
+  // v8: separate original-page, two-model whitespace corrections are bound
+  // by their private artifact hash and may add only ASCII-letter spaces.
+  // v9: source-identified sense-tail trims use a separate immutable evidence
+  // artifact; only exact-prefix trims with matching provenance are accepted.
   // Bumped so cached ledgers invalidate and re-segment.
-  const configVersion = "4";
+  const configVersion = "9";
   return {
     name: "STRUCTURE_NORMALIZE",
     configVersion,
     inputSchema: z.unknown(),
     outputSchema: StructureNormalizeOutputSchema,
-    computeInputHash: (ctx) =>
-      hashJson({
+    computeInputHash: async (ctx) => {
+      const spacingPath = path.join(
+        workDirectoryFor(options.privateRoot, ctx.sourceHash),
+        ACCEPTED_SPACING_FILE,
+      );
+      const sensePath = path.join(
+        workDirectoryFor(options.privateRoot, ctx.sourceHash),
+        ACCEPTED_SENSE_FILE,
+      );
+      return hashJson({
         stage: "STRUCTURE_NORMALIZE",
         configVersion,
         sourceHash: ctx.sourceHash,
         media: ctx.config.media ?? null,
         normalize_config: LLCY_2024_NORMALIZE_CONFIG,
         upstream: ctx.upstream?.outputHash ?? null,
-      }),
+        spacing_sha256: (await fileExists(spacingPath)) ? await sha256File(spacingPath) : null,
+        sense_trim_sha256: (await fileExists(sensePath)) ? await sha256File(sensePath) : null,
+      });
+    },
     run: async (_input, ctx) => {
       try {
         const media = mediaConfig(ctx);
         const workDir = workDirectoryFor(options.privateRoot, ctx.sourceHash);
         const cleanRecords = await validateCleanArtifacts(workDir, ctx.sourceHash, media.pages);
         const records = await validateOcrArtifacts(workDir, ctx.sourceHash, cleanRecords);
-        const blocks = assignReadingOrder(toNormalizeInputBlocks(records));
+        const spacingCorrections = await loadAcceptedSpacingCorrections(workDir);
+        const spacedRecords = applyAcceptedSpacingCorrections(
+          records,
+          spacingCorrections,
+          new Map(cleanRecords.map((record) => [record.page, record.original_image_sha256])),
+        );
+        const blocks = assignReadingOrder(toNormalizeInputBlocks(spacedRecords));
 
         // Fold resolved visual decisions (separate provenance records) in.
         const queueDir = path.join(workDir, VISUAL_OCR_QUEUE_DIR);
@@ -772,9 +845,19 @@ export function createStructureNormalizeStage(options: MediaStageOptions): AnySt
               : {}),
             agent_run_id: entry.result!.agent_run_id,
             round: entry.packet.round,
+            field: entry.packet.field,
+            page_number: entry.packet.page_number,
+            page_image_sha256: entry.packet.page_image_sha256,
+            bbox: entry.packet.bbox,
+            original_text: entry.packet.current_text,
           }));
 
         const normalized = segmentStructure(blocks, LLCY_2024_NORMALIZE_CONFIG, corrections);
+        normalized.senses = applyAcceptedSenseCorrections(
+          normalized.senses,
+          await loadAcceptedSenseCorrections(workDir),
+          new Map(cleanRecords.map((record) => [record.page, record.original_image_sha256])),
+        );
 
         // Fail closed on a structurally invalid book: word entries recovered
         // before any unit banner matched would reference a synthetic unit that
@@ -808,8 +891,13 @@ export function createStructureNormalizeStage(options: MediaStageOptions): AnySt
             { blocked: true },
           );
         }
+
+        // Reconcile even when the current parser emits no reviews: otherwise
+        // the final stale pending packet from an earlier parser/config pass
+        // would remain in the queue forever. Resolved/BLOCK provenance stays
+        // immutable inside enqueuePackets.
+        await enqueuePackets(queueDir, normalized.fieldReviews.map(packetForReview));
         if (normalized.fieldReviews.length > 0) {
-          await enqueuePackets(queueDir, normalized.fieldReviews.map(packetForReview));
           const pending = await loadQueue(queueDir);
           const units = unresolvedUnitKeys(pending);
           throw new StageError(
@@ -817,6 +905,22 @@ export function createStructureNormalizeStage(options: MediaStageOptions): AnySt
             `${normalized.fieldReviews.length} critical field(s) await visual review; ` +
               `${pending.filter((entry) => entry.status === "pending").length} packet(s) pending` +
               (units.length > 0 ? ` (blocking units: ${units.join(",")})` : ""),
+          );
+        }
+
+
+        // Ownership is terminal only after every low-confidence critical
+        // field has completed the visual repair path. Running it earlier can
+        // strand a repairable headword behind a BLOCKED ledger entry.
+        const ownershipFindings = findContentOwnershipFindings(normalized);
+        if (ownershipFindings.length > 0) {
+          const first = ownershipFindings[0]!;
+          throw new StageError(
+            "SOURCE_CONTENT_OWNERSHIP_INVALID",
+            `${ownershipFindings.length} source-content ownership error(s) detected ` +
+              `(first: ${first.code} on ${first.entityKey}: ${first.message}); ` +
+              "repair OCR/segmentation before semantic review",
+            { blocked: true },
           );
         }
 

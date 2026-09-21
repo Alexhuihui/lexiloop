@@ -375,6 +375,19 @@ describe("new-word learning journey", () => {
     expect(screen.getByRole("heading", { name: "abandon" })).toBeTruthy();
   });
 
+  it("offers the session-pinned audio beside each real-exam sentence", async () => {
+    const server = createFakeServer();
+    renderLearn(server.stub);
+    await startSession();
+
+    const button = await screen.findByRole("button", { name: "播放真题句音频" });
+    const example = button.closest("li");
+    const audio = example?.querySelector("audio");
+    expect(audio).toBeTruthy();
+    expect(audio?.getAttribute("src")).toContain("audio/ex/def222.wav");
+    expect(audio?.getAttribute("src")).toContain("session=sess-created-1");
+  });
+
   it("resumes an interrupted session through the Session APIs without re-presenting studied words", async () => {
     const server = createFakeServer();
     const user = userEvent.setup();

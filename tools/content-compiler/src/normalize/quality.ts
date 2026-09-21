@@ -42,6 +42,15 @@ export interface VisualCorrection {
   agent_run_id: string;
   /** Round of the packet this decision answers. */
   round: number;
+  /**
+   * Immutable packet evidence used to replay a decision after structural
+   * parsing changes shift the word's source_order (and therefore word_key).
+   */
+  field?: CriticalField;
+  page_number?: number;
+  page_image_sha256?: string;
+  bbox?: [number, number, number, number];
+  original_text?: string;
 }
 
 /** A field that consumed its repair budget or was explicitly BLOCKed. */

@@ -3,7 +3,7 @@
 These exercise the ``lexiloop_media ocr`` command with the deterministic
 selftest engine (no Paddle models needed): the emitted ``ocr.jsonl`` must be
 strict, hash-chained to the cleaned page images, and byte-for-byte
-deterministic. The real PP-StructureV3 engine is exercised by an opt-in smoke
+deterministic. The real bounded-memory PaddleOCR engine is exercised by an opt-in smoke
 test that skips cleanly when Paddle is unavailable.
 """
 
@@ -59,8 +59,309 @@ def test_ocr_config_exists_and_is_versioned() -> None:
     raw = json.loads(OCR_CONFIG_PATH.read_text(encoding="utf-8"))
     config = ocr.OcrConfig.model_validate(raw)
     assert config.config_version >= 1
-    assert config.pipeline == "PP-StructureV3"
+    assert config.pipeline == "PaddleOCR"
     assert config.model_version  # locked model spec string
+    assert config.tiling.tile_width_px * config.tiling.tile_height_px <= 800_000
+    assert config.engine_params["text_recognition_batch_size"] == 1
+    assert config.engine_params["use_textline_orientation"] is False
+    assert "mobile" in config.engine_params["text_detection_model_name"]
+    assert "server" in config.engine_params["text_recognition_model_name"]
+    assert config.original_fallback_regions == [(0.46, 0.76, 0.94, 0.875)]
+
+
+def test_tile_regions_cover_a_full_page_under_the_pixel_budget() -> None:
+    regions = ocr.tile_regions(
+        image_width=1907,
+        image_height=2824,
+        tile_width=1000,
+        tile_height=1400,
+        overlap=96,
+    )
+    assert len(regions) > 1
+    assert regions[0][:2] == (0, 0)
+    assert max(region[2] for region in regions) == 1907
+    assert max(region[3] for region in regions) == 2824
+    assert all((x1 - x0) * (y1 - y0) <= 1_400_000 for x0, y0, x1, y1 in regions)
+
+
+def test_paddle_ocr_runs_tiles_sequentially_and_remaps_boxes() -> None:
+    class FakePipeline:
+        def __init__(self) -> None:
+            self.shapes: list[tuple[int, int]] = []
+
+        def predict(self, image):
+            height, width = image.shape[:2]
+            self.shapes.append((height, width))
+            return [
+                {
+                    "rec_texts": [f"tile-{len(self.shapes)}"],
+                    "rec_scores": [0.99],
+                    "rec_boxes": [[10, 10, width - 10, min(height - 10, 50)]],
+                }
+            ]
+
+    image = ocr.np.zeros((2824, 1907, 3), dtype=ocr.np.uint8)
+    pipeline = FakePipeline()
+    rows = ocr.paddle_blocks_tiled(
+        pipeline,
+        image,
+        tile_width=1000,
+        tile_height=1400,
+        overlap=96,
+    )
+
+    assert len(pipeline.shapes) > 1
+    assert all(height * width <= 1_400_000 for height, width in pipeline.shapes)
+    # Overlap detections are collapsed after all tiles have been remapped.
+    assert 1 < len(rows) <= len(pipeline.shapes)
+    assert all(0 <= value <= 1 for row in rows for value in row["bbox"])
+
+
+def test_original_fallback_region_is_detected_and_remapped_without_a_full_page_pass() -> None:
+    class FakePipeline:
+        def __init__(self) -> None:
+            self.shapes = []
+
+        def predict(self, image):
+            height, width = image.shape[:2]
+            self.shapes.append((height, width))
+            return [{"rec_texts": ["overstate"], "rec_scores": [0.98], "rec_boxes": [[5, 5, width - 5, height - 5]]}]
+
+    image = ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8)
+    pipeline = FakePipeline()
+    rows = ocr.paddle_blocks_regions(pipeline, image, [(0.46, 0.76, 0.94, 0.875)])
+
+    assert pipeline.shapes == [(322, 912)]
+    assert rows[0]["text"] == "overstate"
+    assert rows[0]["bbox"][0] == pytest.approx(0.46, abs=0.01)
+    assert rows[0]["bbox"][1] == pytest.approx(0.76, abs=0.01)
+    assert rows[0]["bbox"][2] == pytest.approx(0.94, abs=0.01)
+    assert rows[0]["bbox"][3] == pytest.approx(0.875, abs=0.01)
+
+
+def test_original_fallback_region_can_add_a_thresholded_pass_for_watermark_text() -> None:
+    class FakePipeline:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict(self, image):
+            self.calls += 1
+            height, width = image.shape[:2]
+            text = "noise" if self.calls == 1 else "leak secrets intentionally 故意泄露秘密"
+            return [{"rec_texts": [text], "rec_scores": [0.98], "rec_boxes": [[5, 5, width - 5, height - 5]]}]
+
+    image = ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8)
+    pipeline = FakePipeline()
+    rows = ocr.paddle_blocks_regions(
+        pipeline,
+        image,
+        [(0.46, 0.76, 0.94, 0.875)],
+        binary_thresholds=[180],
+    )
+
+    assert pipeline.calls == 2
+    assert any("intentionally" in row["text"] for row in rows)
+
+
+def test_tile_seam_fragments_are_rejoined_with_text_overlap_removed() -> None:
+    rows = [
+        {
+            "bbox": (0.117, 0.263, 0.523, 0.283),
+            "layout_label": "text",
+            "text": "vi.工作；产生作用；争取v.（使）运转",
+            "confidence": 0.93,
+        },
+        {
+            "bbox": (0.481, 0.264, 0.793, 0.282),
+            "layout_label": "text",
+            "text": "运转n.工作；工作成果；作品",
+            "confidence": 0.91,
+        },
+        {
+            "bbox": (0.49, 0.265, 0.51, 0.279),
+            "layout_label": "text",
+            "text": "转",
+            "confidence": 0.72,
+        },
+    ]
+
+    joined = ocr.deduplicate_line_variants(ocr.merge_tile_seam_fragments(rows))
+
+    assert len(joined) == 1
+    assert joined[0]["text"] == "vi.工作；产生作用；争取v.（使）运转n.工作；工作成果；作品"
+    assert joined[0]["bbox"] == pytest.approx((0.117, 0.263, 0.793, 0.283))
+
+
+def test_threshold_pass_drops_a_near_duplicate_line_variant() -> None:
+    rows = [
+        {
+            "bbox": (0.498, 0.708, 0.611, 0.725),
+            "layout_label": "text",
+            "text": "人的幸福感。",
+            "confidence": 0.97,
+        },
+        {
+            "bbox": (0.502, 0.718, 0.611, 0.724),
+            "layout_label": "text",
+            "text": "人的半临感。",
+            "confidence": 0.89,
+        },
+    ]
+
+    assert ocr.deduplicate_line_variants(rows) == [rows[0]]
+
+
+def test_cross_gutter_row_is_recognized_as_two_independent_lines() -> None:
+    rows = [
+        {
+            "bbox": (0.119, 0.068, 0.949, 0.085),
+            "layout_label": "text",
+            "text": "左栏内容English-speaking countries is likely to continue.",
+            "confidence": 0.96,
+        }
+    ]
+    original = ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8)
+    readings = iter((("左栏内容", 0.97), ("English-speaking countries is likely to continue.", 0.98)))
+
+    split = ocr.split_cross_gutter_rows(rows, original, lambda _crop: next(readings), "ab" * 32)
+
+    assert [row["text"] for row in split] == [
+        "左栏内容",
+        "English-speaking countries is likely to continue.",
+    ]
+    assert split[0]["bbox"][2] == pytest.approx(0.49)
+    assert split[1]["bbox"][0] == pytest.approx(0.51)
+    assert all(row["page_image_sha256"] == "ab" * 32 for row in split)
+
+
+def test_original_image_recognition_recovers_a_missing_headword_left_of_phonetics() -> None:
+    rows = [
+        {
+            "bbox": (0.648, 0.795, 0.899, 0.815),
+            "layout_label": "text",
+            "text": "['leiba(r)] n. 劳动；(统称)",
+            "confidence": 0.86,
+        }
+    ]
+    original = ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8)
+    calls = []
+
+    def recognize(crop):
+        calls.append(crop.shape)
+        return "labo(u)r", 0.94
+
+    recovered = ocr.recover_missing_headwords(rows, original, recognize)
+    assert calls
+    assert recovered == [
+        pytest.approx(
+            {
+                "bbox": (0.49, 0.789, 0.66, 0.821),
+                "layout_label": "text",
+                "text": "labo(u)r",
+                "confidence": 0.94,
+            },
+            abs=0.002,
+        )
+    ]
+
+
+def test_original_image_recognition_enriches_a_truncated_phonetic_pos_anchor() -> None:
+    rows = [
+        {
+            "bbox": (0.648, 0.795, 0.735, 0.815),
+            "layout_label": "text",
+            "text": "[leiba(r)]",
+            "confidence": 0.86,
+        }
+    ]
+    original = ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8)
+    calls = []
+
+    def recognize(crop):
+        calls.append(crop.shape)
+        return "[leiba(r)] n. 劳动；(统称)", 0.91
+
+    enriched = ocr.enrich_phonetic_anchors(rows, original, recognize)
+
+    assert calls
+    assert enriched[0]["text"] == "[leiba(r)] n. 劳动；(统称)"
+    assert enriched[0]["confidence"] == pytest.approx(0.91)
+    assert enriched[0]["bbox"][2] > rows[0]["bbox"][2]
+
+
+def test_original_image_recognition_enriches_spanning_pos_summary() -> None:
+    row = {
+        "bbox": (0.125, 0.531, 0.647, 0.55),
+        "layout_label": "text",
+        "text": "n.状态；国家；州；政府vt.陈述；规定adi州的：",
+        "confidence": 0.82,
+    }
+    enriched = ocr.enrich_spanning_pos_lines(
+        [row],
+        ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8),
+        lambda _crop: ("n.状态；国家；州；政府vt.陈述；规定adj州的；国家的", 0.91),
+    )
+
+    assert enriched[0]["text"] == "n.状态；国家；州；政府vt.陈述；规定adj州的；国家的"
+    assert enriched[0]["bbox"][2] == pytest.approx(0.92)
+
+
+def test_original_image_recognition_restores_pos_on_numbered_source_line() -> None:
+    row = {
+        "bbox": (0.102, 0.072, 0.48, 0.089),
+        "layout_label": "text",
+        "text": "②努力做（困难的事）（2012年新题型）",
+        "confidence": 0.83,
+    }
+    enriched = ocr.enrich_source_sense_lines(
+        [row],
+        ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8),
+        lambda _crop: ("②vi努力做(困难的事)(2012年新题型)", 0.90),
+    )
+
+    assert enriched[0]["text"].startswith("②vi")
+
+
+def test_original_image_recognition_keeps_anchor_when_candidate_is_not_better() -> None:
+    row = {
+        "bbox": (0.648, 0.795, 0.899, 0.815),
+        "layout_label": "text",
+        "text": "[leiba(r)] n. 劳动；(统称)",
+        "confidence": 0.86,
+    }
+    enriched = ocr.enrich_phonetic_anchors(
+        [row],
+        ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8),
+        lambda _crop: ("[leiba(r)]", 0.99),
+    )
+
+    assert enriched == [row]
+
+
+def test_original_image_recognition_does_not_duplicate_an_existing_headword() -> None:
+    rows = [
+        {"bbox": (0.52, 0.795, 0.64, 0.815), "layout_label": "text", "text": "labour", "confidence": 0.9},
+        {"bbox": (0.648, 0.795, 0.899, 0.815), "layout_label": "text", "text": "[leiba] n. 劳动", "confidence": 0.86},
+    ]
+    recovered = ocr.recover_missing_headwords(
+        rows,
+        ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8),
+        lambda _crop: (_ for _ in ()).throw(AssertionError("recognizer should not run")),
+    )
+    assert recovered == []
+
+
+def test_original_image_recognition_ignores_a_thin_overlap_from_the_other_column() -> None:
+    rows = [
+        {"bbox": (0.11, 0.19, 0.494, 0.21), "layout_label": "text", "text": "root note govern", "confidence": 0.9},
+        {"bbox": (0.624, 0.19, 0.91, 0.21), "layout_label": "text", "text": "['gʌvn] vt. 治理", "confidence": 0.86},
+    ]
+    recovered = ocr.recover_missing_headwords(
+        rows,
+        ocr.np.zeros((2800, 1900, 3), dtype=ocr.np.uint8),
+        lambda _crop: (")govern", 0.95),
+    )
+    assert recovered[0]["text"] == "govern"
 
 
 def test_ocr_selftest_emits_strict_block_jsonl(
@@ -82,7 +383,7 @@ def test_ocr_selftest_emits_strict_block_jsonl(
         clean_row = clean_by_page[record.page]
         assert record.source_sha256 == clean_row["source_sha256"]
         assert record.page_image_sha256 == clean_row["cleaned_image_sha256"]
-        assert record.pipeline == "PP-StructureV3"
+        assert record.pipeline == "PaddleOCR"
         assert record.config_version >= 1
         assert record.model_version
         x0, y0, x1, y1 = record.bbox
@@ -261,7 +562,7 @@ def test_ocr_paddle_engine_unavailable_is_machine_readable(
     def _raise_import_error():
         raise ImportError("paddle not installed")
 
-    monkeypatch.setattr(ocr, "_import_ppstructure", _raise_import_error)
+    monkeypatch.setattr(ocr, "_import_paddleocr", _raise_import_error)
     with pytest.raises(SystemExit) as excinfo:
         _run_ocr(work_dir, ["--engine", "paddle"])
     assert excinfo.value.code == 2
@@ -283,7 +584,7 @@ def test_ocr_unknown_engine_rejected(
 
 
 def test_ocr_real_paddle_smoke(fixture_pdf_path: Path, tmp_path: Path) -> None:
-    """Step-4 smoke: real PP-StructureV3 over one fixture page.
+    """Step-4 smoke: real bounded-memory PaddleOCR over one fixture page.
 
     Skips when Paddle is not installed or its models cannot initialize, so the
     fast suite stays green without the heavy optional dependency.

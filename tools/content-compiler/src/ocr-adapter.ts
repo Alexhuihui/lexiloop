@@ -4,7 +4,8 @@
  * `lexiloop_media ocr` emits one strict `OcrBlockRecord` per OCR text line in
  * `ocr.jsonl` plus private per-page raw text under `ocr-raw/`. This module
  * mirrors the record schema in Zod and validates EVERY line — plus its hash
- * chaining to the cleaned page images and the raw-text evidence — before
+ * chaining to either the cleaned page or an original-image recognition
+ * fallback crop, and the raw-text evidence — before
  * normalization may consume it.
  */
 import { readFile } from "node:fs/promises";
@@ -119,10 +120,13 @@ export async function validateOcrArtifacts(
     if (!clean) {
       throw new MediaOutputInvalidError(where, `page ${record.page} was not cleaned`);
     }
-    if (record.page_image_sha256 !== clean.cleaned_image_sha256) {
+    if (
+      record.page_image_sha256 !== clean.cleaned_image_sha256 &&
+      record.page_image_sha256 !== clean.original_image_sha256
+    ) {
       throw new MediaOutputInvalidError(
         where,
-        `page ${record.page}: page image hash mismatch against clean.jsonl`,
+        `page ${record.page}: page image hash matches neither cleaned nor original image in clean.jsonl`,
       );
     }
     const texts = textByPage.get(record.page) ?? [];

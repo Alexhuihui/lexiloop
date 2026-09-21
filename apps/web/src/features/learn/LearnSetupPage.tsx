@@ -247,6 +247,11 @@ function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls
   const wordAudio = word.content?.audio.find(
     (asset) => asset.entity_type === "word" && asset.entity_key === word.wordKey,
   );
+  const exampleAudioUrls = Object.fromEntries(
+    (word.content?.audio ?? [])
+      .filter((asset) => asset.entity_type === "example")
+      .map((asset) => [asset.entity_key, api.audioUrl(asset.asset_key, study.session!.session_id)]),
+  );
   const isLastWord = study.studyIndex === study.words.length - 1;
   return (
     <div className="study-flow">
@@ -260,6 +265,7 @@ function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls
         word={word}
         familiarityPending={study.familiarityPending}
         audioUrl={wordAudio ? api.audioUrl(wordAudio.asset_key, study.session.session_id) : null}
+        exampleAudioUrls={exampleAudioUrls}
         onFamiliarity={(choice) => void study.chooseFamiliarity(word.wordKey, choice)}
         onRetryPresentation={() => void study.retryPresentation(word.wordKey)}
         onRetryContent={() => study.retryContent(word.wordKey)}

@@ -11,6 +11,8 @@
  *   r2/audio-manifest.jsonl        the validated audio artifact, verbatim
  *   qa/unit-status.json            sanitized per-unit status (no source text)
  *   qa/validation-summary.json     sanitized finding statistics
+ *   qa/key-continuity.json         exact previous/new stable-key accounting
+ *   aliases.json                   activation-ready word/card alias edges
  *   rollback.json                  rollback metadata + compatibility demands
  *
  * Fail-closed guarantees (spec 5.9/5.6/17): every one of the 13 stages must
@@ -59,12 +61,15 @@ import {
 import { loadQueue, VISUAL_OCR_QUEUE_DIR } from "../agents/visual-ocr";
 import { LLCY_2024_NORMALIZE_CONFIG } from "../normalize/config";
 import { segmentStructure } from "../normalize/segmentation";
+import { findContentOwnershipFindings } from "../normalize/content-quality";
 import { assignReadingOrder } from "../normalize/reading-order";
 import { OCR_JSONL, OcrBlockRecordSchema, toNormalizeInputBlocks } from "../ocr-adapter";
 import { COMPILER_ROOT, DEFAULT_RULE_PATH, fileExists, MediaOutputInvalidError, readJsonl, sha256File } from "../media";
 import { DEFAULT_OCR_CONFIG_PATH } from "../ocr-adapter";
 import { hashJson, StageError, type AnyStage, type StageRunContext } from "../stage";
 import type { LedgerEntry } from "../ledger";
+import { buildKeyContinuity, parseReleaseSnapshot } from "./continuity";
+import { verifyBundle } from "./validate";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -554,6 +559,11 @@ async function assertFreshArtifacts(input: {
             : {}),
           agent_run_id: entry.result!.agent_run_id,
           round: entry.packet.round,
+          field: entry.packet.field,
+          page_number: entry.packet.page_number,
+          page_image_sha256: entry.packet.page_image_sha256,
+          bbox: entry.packet.bbox,
+          original_text: entry.packet.current_text,
         }));
       const normalized = segmentStructure(
         assignReadingOrder(toNormalizeInputBlocks(records)),
@@ -768,6 +778,16 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
       // the scoped units; unknown scope keys fail closed. Default: every
       // unit recovered by STRUCTURE_NORMALIZE (unchanged behavior).
       const content = await parseNormalizedRows(workDir);
+      const ownershipFindings = findContentOwnershipFindings(content);
+      if (ownershipFindings.length > 0) {
+        const first = ownershipFindings[0]!;
+        throw new StageError(
+          "RELEASE_SOURCE_CONTENT_INVALID",
+          `${ownershipFindings.length} source-content ownership error(s) remain ` +
+            `(first: ${first.code} on ${first.entityKey}: ${first.message})`,
+          { blocked: true },
+        );
+      }
       const cards = await parseCards(workDir);
       const allUnitKeys = content.units.map((unit) => unit.unit_key);
       if (options.units !== undefined) {
@@ -1038,6 +1058,47 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
       const validationSummaryBytes = Buffer.from(`${JSON.stringify(validationSummary, null, 2)}\n`, "utf8");
       const rollbackBytes = Buffer.from(`${JSON.stringify(rollback, null, 2)}\n`, "utf8");
 
+      let continuityBytes: Buffer | undefined;
+      let aliasesBytes: Buffer | undefined;
+      if (options.previousReleaseId !== undefined) {
+        const previousBundleDir = path.join(privateRoot, RELEASES_DIR, options.previousReleaseId);
+        const verifiedPrevious = await verifyBundle(previousBundleDir);
+        if (!verifiedPrevious.ok || verifiedPrevious.manifest?.release_id !== options.previousReleaseId) {
+          const details = verifiedPrevious.errors.map((error) => `${error.path}: ${error.reason}`).join("; ");
+          throw new StageError(
+            "KEY_CONTINUITY_INVALID",
+            `previous release ${options.previousReleaseId} is not an intact local bundle` +
+              (details ? `: ${details}` : ""),
+            { blocked: true },
+          );
+        }
+        try {
+          const snapshot = parseReleaseSnapshot(
+            await readFile(path.join(previousBundleDir, "d1", "001-content.sql"), "utf8"),
+            await readFile(path.join(previousBundleDir, "d1", "002-cards.sql"), "utf8"),
+          );
+          if (snapshot.releaseId !== options.previousReleaseId) {
+            throw new Error(
+              `bundle SQL identifies ${snapshot.releaseId}, expected ${options.previousReleaseId}`,
+            );
+          }
+          const continuity = buildKeyContinuity(snapshot, {
+            releaseId,
+            words: contentRows.words,
+            cards,
+          });
+          continuityBytes = Buffer.from(`${JSON.stringify(continuity.report, null, 2)}\n`, "utf8");
+          aliasesBytes = Buffer.from(`${JSON.stringify(continuity.aliasFile, null, 2)}\n`, "utf8");
+        } catch (err) {
+          throw new StageError(
+            "KEY_CONTINUITY_INVALID",
+            `cannot prove exact stable-key continuity from ${options.previousReleaseId}: ` +
+              (err instanceof Error ? err.message : String(err)),
+            { blocked: true },
+          );
+        }
+      }
+
       const fileBodies = new Map<string, Buffer>([
         ["d1/001-content.sql", Buffer.from(contentSql, "utf8")],
         ["d1/002-cards.sql", Buffer.from(cardsSql, "utf8")],
@@ -1047,6 +1108,10 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
         ["r2/audio-manifest.jsonl", audioManifestBytes],
         ["rollback.json", rollbackBytes],
       ]);
+      if (continuityBytes !== undefined && aliasesBytes !== undefined) {
+        fileBodies.set("qa/key-continuity.json", continuityBytes);
+        fileBodies.set("aliases.json", aliasesBytes);
+      }
       const files = [...fileBodies.entries()]
         .map(([filePath, body]) => ({
           path: filePath,
@@ -1099,6 +1164,9 @@ export function createReleasePackageStage(options: ReleasePackageStageOptions): 
           { name: "audio_complete", passed: true },
           { name: "artifact_hashes_verified", passed: true },
           { name: "source_text_excluded", passed: true },
+          ...(options.previousReleaseId !== undefined
+            ? [{ name: "stable_key_continuity", passed: true }]
+            : []),
         ],
       });
       const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");

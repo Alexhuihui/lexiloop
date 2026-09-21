@@ -607,6 +607,19 @@ async function listBundleFiles(bundleDir: string): Promise<string[]> {
 // ---------------------------------------------------------------------------
 
 describe("RELEASE_PACKAGE bundle (spec 5.9)", () => {
+  it("fails closed when a declared previous release has no intact local bundle", async () => {
+    const fixture = await makeReleaseFixture();
+    const stage = createReleasePackageStage({
+      privateRoot: fixture.privateRoot,
+      previousReleaseId: "rel-missing",
+    });
+
+    await expect(stage.run(undefined, fixture.ctx)).rejects.toMatchObject({
+      code: "KEY_CONTINUITY_INVALID",
+      blocked: true,
+    });
+  });
+
   it("produces exactly the spec bundle layout with a self-verifying manifest", async () => {
     const fixture = await makeReleaseFixture();
     const { bundleDir } = await packageBundle(fixture);

@@ -13,6 +13,7 @@
 import { useEffect, useState } from "react";
 import type { FamiliarityChoice } from "../../lib/api-client";
 import type { StudyWordState } from "./useStudySession";
+import { ExampleAudioButton } from "../../components/ExampleAudioButton";
 
 const FAMILIARITY_CHOICES: ReadonlyArray<{ value: FamiliarityChoice; label: string }> = [
   { value: "VERY_UNFAMILIAR", label: "很陌生" },
@@ -28,6 +29,8 @@ export interface WordStudyCardProps {
   familiarityPending: boolean;
   /** Fully-qualified audio URL for the word, or null when unavailable. */
   audioUrl: string | null;
+  /** Session-pinned example audio URLs by example_key. */
+  exampleAudioUrls: Readonly<Record<string, string>>;
   onFamiliarity(choice: FamiliarityChoice): void;
   onRetryPresentation(): void;
   onRetryContent(): void;
@@ -42,6 +45,7 @@ export function WordStudyCard({
   word,
   familiarityPending,
   audioUrl,
+  exampleAudioUrls,
   onFamiliarity,
   onRetryPresentation,
   onRetryContent,
@@ -128,6 +132,9 @@ export function WordStudyCard({
                       {example.text}
                     </p>
                     {example.source_ref ? <p>来源：{example.source_ref}</p> : null}
+                    {exampleAudioUrls[example.example_key] ? (
+                      <ExampleAudioButton url={exampleAudioUrls[example.example_key]!} />
+                    ) : null}
                   </li>
                 ))}
               </ul>

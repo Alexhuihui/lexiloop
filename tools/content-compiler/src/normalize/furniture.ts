@@ -25,11 +25,13 @@ export interface FurnitureConfig {
 /** Default bands for the llcy-2024 raster (see config/watermarks). */
 export const DEFAULT_FURNITURE_CONFIG: FurnitureConfig = {
   header_y_max: 0.06,
-  footer_y_min: 0.93,
+  // Footer slogans can begin just above 0.93 because OCR boxes hug the
+  // glyphs rather than the printed footer band.
+  footer_y_min: 0.925,
   // Calibrated on the real raster: the left-rail chapter tab's number block
-  // ends at x1 ~= 0.06, past the previous 0.055 cutoff, and must still be
-  // furniture. Body text starts at x0 ~= 0.10, so 0.07 leaves a safe gap.
-  sidebar_x_max: 0.07,
+  // ends as far right as x1 ~= 0.078 when the word and chapter number are
+  // detected separately. Body text starts at x0 ~= 0.10, so 0.08 is safe.
+  sidebar_x_max: 0.08,
   min_header_repeat_pages: 3,
 };
 
@@ -56,7 +58,37 @@ function isFooter(block: FurnitureBlock, config: FurnitureConfig): boolean {
 }
 
 function isSidebar(block: FurnitureBlock, config: FurnitureConfig): boolean {
-  return block.bbox[2] <= config.sidebar_x_max;
+  // The book places the one-character exam marker at the same left edge as
+  // the decorative chapter rail. It is semantic content: removing it also
+  // prevents the following source sentence from being recognized as an
+  // example. The rail itself contains chapter numbers, never this marker.
+  const text = block.text.normalize("NFKC").trim();
+  return block.bbox[2] <= config.sidebar_x_max && text !== "真";
+}
+
+function isBottomBrandBanner(block: FurnitureBlock): boolean {
+  if (block.bbox[0] < 0.5 || block.bbox[1] < 0.8) return false;
+  const text = block.text.normalize("NFKC").replace(/\s+/gu, "");
+  return /^(?:考研人|相关词家园)/u.test(text);
+}
+
+function isKnownPromoWatermark(block: FurnitureBlock): boolean {
+  const [x0, y0, x1, y1] = block.bbox;
+  const inTopPromo = x1 >= 0.2 && x0 <= 0.725 && y1 >= 0.03 && y0 <= 0.1;
+  const inBottomPromo = x1 >= 0.46 && x0 <= 0.94 && y1 >= 0.76 && y0 <= 0.925;
+  if (!inTopPromo && !inBottomPromo) return false;
+  const text = block.text.normalize("NFKC").replace(/\s+/gu, "");
+  if (/(?:微信|公众号|神灯|考研资源|客服|QQ群|KYFT\d*|获取更多)/iu.test(text)) return true;
+  return inBottomPromo && /^(?:老石|的精神)$/u.test(text);
+}
+
+function isBottomContactStrip(block: FurnitureBlock): boolean {
+  const [x0, y0, x1, y1] = block.bbox;
+  // The repeated four-part contact strip sits above the printed slogan. Its
+  // pale glyphs are often recognized as unrelated garbage, so text matching
+  // alone cannot remove it. Body text ends above this thin fixed band; the
+  // slogan beneath it begins at y ~= .923.
+  return y0 >= 0.895 && y0 <= 0.922 && y1 - y0 <= 0.026 && x0 >= 0.15 && x1 <= 0.85;
 }
 
 /**
@@ -84,7 +116,14 @@ export function partitionPageFurniture<T extends FurnitureBlock>(
     const repeatedHeader =
       isHeaderCandidate(block, config) &&
       (headerRepeatPages.get(block.text)?.size ?? 0) >= config.min_header_repeat_pages;
-    if (isFooter(block, config) || isSidebar(block, config) || repeatedHeader) {
+    if (
+      isFooter(block, config) ||
+      isSidebar(block, config) ||
+      isBottomBrandBanner(block) ||
+      isKnownPromoWatermark(block) ||
+      isBottomContactStrip(block) ||
+      repeatedHeader
+    ) {
       furniture.push(block);
     } else {
       content.push(block);

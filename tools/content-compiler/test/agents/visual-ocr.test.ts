@@ -19,6 +19,7 @@ import {
   ingestResult,
   loadQueue,
   queueStatus,
+  reviseResult,
   unresolvedUnitKeys,
 } from "../../src/agents/visual-ocr";
 
@@ -94,6 +95,49 @@ describe("visual-ocr packet lifecycle", () => {
     expect(entries[0]!.packet).toEqual(packet);
     expect(entries[0]!.status).toBe("pending");
     expect(entries[0]!.result).toBeUndefined();
+  });
+
+  it("prunes stale pending packets while preserving resolved provenance", async () => {
+    const resolved = makePacket();
+    const stale = makePacket({
+      packet_id: "vo.phonetic.p1.r1.stale001",
+      field: "phonetic",
+      current_text: "[stale]",
+    });
+    const current = makePacket({
+      packet_id: "vo.phonetic.p1.r1.current1",
+      field: "phonetic",
+      current_text: "[current]",
+    });
+    await enqueuePackets(queueDir, [resolved, stale]);
+    await ingestResult(queueDir, SOURCE_HASH, resultFixture(resolved));
+
+    await enqueuePackets(queueDir, [current]);
+
+    const entries = await loadQueue(queueDir);
+    expect(entries.map((entry) => entry.packet.packet_id).sort()).toEqual(
+      [resolved.packet_id, current.packet_id].sort(),
+    );
+    expect(entries.find((entry) => entry.packet.packet_id === resolved.packet_id)?.status).toBe("resolved");
+    expect(entries.find((entry) => entry.packet.packet_id === current.packet_id)?.status).toBe("pending");
+  });
+
+  it("prunes every stale pending packet when the current review set is empty", async () => {
+    const resolved = makePacket();
+    const stale = makePacket({
+      packet_id: "vo.phonetic.p1.r1.stale001",
+      field: "phonetic",
+      current_text: "[stale]",
+    });
+    await enqueuePackets(queueDir, [resolved, stale]);
+    await ingestResult(queueDir, SOURCE_HASH, resultFixture(resolved));
+
+    await enqueuePackets(queueDir, []);
+
+    const entries = await loadQueue(queueDir);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.packet.packet_id).toBe(resolved.packet_id);
+    expect(entries[0]?.status).toBe("resolved");
   });
 
   it("ingests a corrected REPAIR as a separate provenance record without mutating the packet", async () => {
@@ -211,6 +255,28 @@ describe("visual-ocr packet lifecycle", () => {
     await expect(
       ingestResult(queueDir, SOURCE_HASH, resultFixture(packet, { agent_run_id: "run-B" })),
     ).rejects.toMatchObject({ code: "RESULT_ALREADY_RESOLVED" });
+  });
+
+  it("keeps the original review and audits a visual correction to it", async () => {
+    const packet = makePacket({ current_text: "ift" });
+    await enqueuePackets(queueDir, [packet]);
+    await ingestResult(queueDir, SOURCE_HASH, resultFixture(packet));
+    const corrected = resultFixture(packet, {
+      agent_run_id: "agent-run-2",
+      verdict: "REPAIR",
+      corrected_text: "shift",
+      corrected_bbox: [0.08, 0.42, 0.48, 0.47],
+      evidence_codes: ["SOURCE_HEADER_VISUAL_REVIEW"],
+    });
+    await expect(
+      reviseResult(queueDir, SOURCE_HASH, corrected, "wrong-run", "book page shows shift"),
+    ).rejects.toMatchObject({ code: "REVISION_PREDECESSOR_MISMATCH" });
+    await reviseResult(queueDir, SOURCE_HASH, corrected, "agent-run-1", "book page shows shift");
+    expect((await loadQueue(queueDir))[0]?.result?.corrected_text).toBe("shift");
+    expect((await readFile(path.join(queueDir, "results.jsonl"), "utf8")).trim().split("\n"))
+      .toHaveLength(2);
+    expect(await readFile(path.join(queueDir, "revisions.jsonl"), "utf8"))
+      .toContain("book page shows shift");
   });
 
   it("reports pending packets past the round cap as blocking the owning unit", async () => {

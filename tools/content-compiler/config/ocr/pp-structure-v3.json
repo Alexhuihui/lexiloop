@@ -1,24 +1,31 @@
 {
-  "config_version": 1,
-  "pipeline": "PP-StructureV3",
+  "config_version": 14,
+  "pipeline": "PaddleOCR",
   "pipeline_version": "3.7.0",
-  "model_version": "PP-StructureV3/PP-OCRv5_server@3.0.0",
+  "model_version": "PaddleOCR/mobile-det+PP-OCRv5-server-rec@3.0.0",
   "device": "cpu",
+  "tiling": {
+    "tile_width_px": 1000,
+    "tile_height_px": 800,
+    "overlap_px": 64
+  },
+  "original_fallback_regions": [[0.46, 0.76, 0.94, 0.875]],
+  "original_fallback_binary_thresholds": [180],
   "engine_params": {
     "use_doc_orientation_classify": false,
     "use_doc_unwarping": false,
-    "use_textline_orientation": true,
-    "use_seal_recognition": false,
-    "use_table_recognition": false,
-    "use_formula_recognition": false,
-    "use_chart_recognition": false,
-    "use_region_detection": false,
-    "text_detection_model_name": "PP-OCRv5_server_det",
+    "use_textline_orientation": false,
+    "text_detection_model_name": "PP-OCRv5_mobile_det",
     "text_recognition_model_name": "PP-OCRv5_server_rec",
-    "text_det_limit_side_len": 1920,
+    "text_recognition_batch_size": 1,
+    "text_det_limit_side_len": 1024,
     "text_det_limit_type": "max",
-    "layout_threshold": 0.5,
-    "layout_nms": true
+    "text_rec_score_thresh": 0.15,
+    "enable_hpi": false,
+    "enable_mkldnn": false,
+    "mkldnn_cache_capacity": 1,
+    "cpu_threads": 2,
+    "enable_cinn": false
   },
-  "notes": "Layout OCR is locked to PP-StructureV3 (design doc 5.4). The scanned source pages are already cropped/cleaned, so document orientation/unwarp classification is disabled; textline orientation stays on because entry numbers (019) and CJK glosses share lines. engine_params are passed verbatim to the PPStructureV3 constructor; every emitted OCR block records model_version + config_version for provenance."
+  "notes": "Text-only PaddleOCR processes one 1000x800 tile at a time with 64px overlap. This caps live detector input at 0.8 megapixels and aligns the two horizontal tiles with the textbook gutter so text lines are not cut through. It uses the mobile detector with the more accurate server recognizer, avoids direction/document/table/formula/layout models, disables oneDNN/HPI, limits CPU threads to two, and caps recognition batches at one line. A measured textbook-page run peaks near 1.0 GB RSS. The original page is detector-scanned only in the 0.3-megapixel bottom-promo region where cleaning can erase book text; an additional thresholded pass recovers dark textbook text beneath the pale promo watermark. Narrow recognition-only crops restore truncated phonetic/POS lines and erased headwords, and split accidental cross-gutter row merges, without loading another detector."
 }

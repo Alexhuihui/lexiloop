@@ -70,7 +70,10 @@ const WORD_CONTENT: Record<string, unknown> = {
       },
     ],
     related: [{ to_word_key: "w-2", relation_type: "confusable" }],
-    audio: [{ entity_type: "word", entity_key: "w-1", asset_key: "audio/ab/abc111.wav" }],
+    audio: [
+      { entity_type: "word", entity_key: "w-1", asset_key: "audio/ab/abc111.wav" },
+      { entity_type: "example", entity_key: "e-1-1", asset_key: "audio/ex/def222.wav" },
+    ],
   },
   "w-2": {
     word: {
@@ -197,6 +200,10 @@ describe("word detail", () => {
     // The headword audio is offered as a playable element.
     const audio = container.querySelector("audio");
     expect(audio?.getAttribute("src")).toContain("audio/ab/abc111.wav");
+    const exampleAudioButton = examples.getByRole("button", { name: "播放真题句音频" });
+    expect(exampleAudioButton.closest("li")?.querySelector("audio")?.getAttribute("src")).toContain(
+      "audio/ex/def222.wav",
+    );
 
     const results = await axe(container);
     expect(results.violations).toEqual([]);
