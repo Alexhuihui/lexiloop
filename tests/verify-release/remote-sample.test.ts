@@ -13,7 +13,7 @@ function fixture(corrupt = false): { runner: SampleRunner; queries: string[]; fe
       if (sql.includes("FROM app_meta")) return [{ active_release_id: "rel-a" }];
       if (sql.includes("FROM content_release")) return [{ status: "ACTIVE" }];
       if (sql.includes("FROM release_unit")) return [{ unit_key: "u01", status: "PASSED" }];
-      if (sql.includes("FROM word")) return [{ word_key: "w.u01.0001.anchor", unit_key: "u01", source_order: 1, headword: "anchor" }];
+      if (sql.includes("FROM word")) return [{ word_key: "w.u01.0001.labor", unit_key: "u01", source_order: 1, headword: "labo(u)r" }];
       if (sql.includes("FROM card_definition")) return [{ content_card_key: "a".repeat(64) }];
       if (sql.includes("FROM audio_asset")) {
         const prefix = sql.split("asset_key >= 'audio/")[1]?.slice(0, 2);

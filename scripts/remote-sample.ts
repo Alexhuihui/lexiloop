@@ -53,8 +53,12 @@ export async function runRemoteSample(releaseId: string, runner: SampleRunner): 
   if (words.length === 0) problems.push("no sampled words");
   for (const row of words) {
     const key = String(row["word_key"] ?? "");
-    const expected = `w.${row["unit_key"]}.${String(row["source_order"]).padStart(4, "0")}.${row["headword"]}`;
-    if (!HEX_KEY.test(key) && key !== expected) { problems.push("sampled word key mismatch"); break; }
+    const expectedPrefix = `w.${row["unit_key"]}.${String(row["source_order"]).padStart(4, "0")}.`;
+    const normalizedHeadword = key.slice(expectedPrefix.length);
+    if (!HEX_KEY.test(key) && (!key.startsWith(expectedPrefix) || !/^[a-z0-9][a-z0-9._-]*$/.test(normalizedHeadword))) {
+      problems.push("sampled word key mismatch");
+      break;
+    }
   }
 
   const cards = await read(`SELECT content_card_key FROM card_definition WHERE release_id = '${releaseId}' ORDER BY content_card_key LIMIT 8`);

@@ -1437,6 +1437,20 @@ describe("release publish lifecycle (D1/R2)", () => {
     const again = await uploadAudioAssets(r2, manifestRows, fixture.workDir);
     expect(again).toEqual({ uploaded: 0, reused: manifestRows.length });
 
+    let activePuts = 0;
+    let maxActivePuts = 0;
+    const parallel = await uploadAudioAssets({
+      async head() { return null; },
+      async put() {
+        activePuts += 1;
+        maxActivePuts = Math.max(maxActivePuts, activePuts);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        activePuts -= 1;
+      },
+    }, manifestRows, fixture.workDir, undefined, 2);
+    expect(parallel).toEqual({ uploaded: manifestRows.length, reused: 0 });
+    expect(maxActivePuts).toBe(2);
+
     // Staging the same bundle twice fails closed.
     await expect(stageBundle({ db: env.db, r2, bundleDir, audioRoot: fixture.workDir, now: NOW_MS })).rejects.toMatchObject({
       code: "RELEASE_ALREADY_STAGED",

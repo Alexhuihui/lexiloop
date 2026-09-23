@@ -102,6 +102,7 @@ import {
   AUDIO_MANIFEST,
   AudioInspectionRowSchema,
   loadAudioManifest,
+  readWavInfoComment,
   withWavInfoComment,
   writeAudioManifest,
   type AudioManifestRow,
@@ -1765,10 +1766,33 @@ export function createTtsSynthesizeStage(options: TtsSynthesizeStageOptions): An
         for (const entry of entries) {
           const prior = existing.find((row) => row.cache_key === entry.cacheKey) ?? null;
           let valid: AudioManifestRow | null = null;
+          const absPath = path.join(workDir, entry.objectKey);
           if (entry.cached && prior) {
-            const absPath = path.join(workDir, entry.objectKey);
             if (await fileExists(absPath)) {
               if ((await sha256File(absPath)) === prior.sha256) valid = prior;
+            }
+          } else if (await fileExists(absPath)) {
+            // A prior synthesis may have been interrupted after the atomic WAV
+            // write but before the manifest rewrite. Recover that immutable,
+            // content-addressed asset when its embedded text hash still binds
+            // it to this exact plan entry; this avoids paying for it twice.
+            const wav = await readFile(absPath);
+            if (readWavInfoComment(wav) === entry.textSha256) {
+              valid = {
+                cache_key: entry.cacheKey,
+                object_key: entry.objectKey,
+                wav_path: path.posix.relative(AUDIO_DIR, entry.objectKey),
+                text_sha256: entry.textSha256,
+                text_chars: entry.textChars,
+                min_seconds: entry.minSeconds,
+                max_seconds: entry.maxSeconds,
+                sha256: await sha256File(absPath),
+                bytes: wav.length,
+                provider: config.provider,
+                model: config.model,
+                voice: config.voice,
+                synthesis_config_version: config.synthesis_config_version,
+              };
             }
           }
           decided.push({ entry, cached: valid });
@@ -1800,16 +1824,21 @@ export function createTtsSynthesizeStage(options: TtsSynthesizeStageOptions): An
           });
         }
 
-        const rows: AudioManifestRow[] = [];
-        let cacheHits = 0;
-        let synthesized = 0;
-        for (const { entry, cached } of decided) {
+        const resolved = new Array<{ row: AudioManifestRow; synthesized: boolean }>(decided.length);
+        let cursor = 0;
+        let workerFailure: unknown = null;
+        const resolveNext = async (): Promise<void> => {
+          while (workerFailure === null) {
+            const index = cursor;
+            cursor += 1;
+            if (index >= decided.length) return;
+            const { entry, cached } = decided[index]!;
+            try {
           let fileSha256: string;
           let bytes: number;
           if (cached) {
             fileSha256 = cached.sha256;
             bytes = cached.bytes;
-            cacheHits += 1;
           } else {
             const result = await provider!.synthesize({ text: entry.text });
             // The WAV carries its text hash as metadata: the audio gate's
@@ -1820,26 +1849,41 @@ export function createTtsSynthesizeStage(options: TtsSynthesizeStageOptions): An
             await writeFile(absPath, wav);
             fileSha256 = await sha256File(absPath);
             bytes = wav.length;
-            synthesized += 1;
           }
-          rows.push({
-            cache_key: entry.cacheKey,
-            object_key: entry.objectKey,
-            // Relative to the manifest's directory (`audio/`), mirroring the
-            // other private JSONL artifacts.
-            wav_path: path.posix.relative(AUDIO_DIR, entry.objectKey),
-            text_sha256: entry.textSha256,
-            text_chars: entry.textChars,
-            min_seconds: entry.minSeconds,
-            max_seconds: entry.maxSeconds,
-            sha256: fileSha256,
-            bytes,
-            provider: config.provider,
-            model: config.model,
-            voice: config.voice,
-            synthesis_config_version: config.synthesis_config_version,
-          });
-        }
+            resolved[index] = {
+              synthesized: cached === null,
+              row: {
+                cache_key: entry.cacheKey,
+                object_key: entry.objectKey,
+                // Relative to the manifest's directory (`audio/`), mirroring the
+                // other private JSONL artifacts.
+                wav_path: path.posix.relative(AUDIO_DIR, entry.objectKey),
+                text_sha256: entry.textSha256,
+                text_chars: entry.textChars,
+                min_seconds: entry.minSeconds,
+                max_seconds: entry.maxSeconds,
+                sha256: fileSha256,
+                bytes,
+                provider: config.provider,
+                model: config.model,
+                voice: config.voice,
+                synthesis_config_version: config.synthesis_config_version,
+              },
+            };
+            } catch (err) {
+              workerFailure = err;
+            }
+          }
+        };
+        // MiMo requests are independent and the provider already applies its
+        // bounded retry/backoff policy. A small fixed pool cuts full-book TTS
+        // wall time while bounding in-memory responses and provider pressure.
+        const workerCount = decided.length >= 100 ? Math.min(16, decided.length) : 1;
+        await Promise.all(Array.from({ length: workerCount }, () => resolveNext()));
+        if (workerFailure !== null) throw workerFailure;
+        const rows = resolved.map((value) => value.row);
+        const synthesized = resolved.filter((value) => value.synthesized).length;
+        const cacheHits = resolved.length - synthesized;
         rows.sort((a, b) => (a.cache_key < b.cache_key ? -1 : a.cache_key > b.cache_key ? 1 : 0));
         const manifestSha256 = await writeAudioManifest(workDir, rows);
         ctx.logger.info("tts_synthesize_completed", {

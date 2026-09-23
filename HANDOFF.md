@@ -1,5 +1,34 @@
 # LexiLoop 交接说明（给下一位接手的同事）
 
+## 2026-09-23 校对版全书发布（当前生产状态）
+
+- 权威内容源改为 `/home/alex/workspace/ocr/out/恋练有词6500-校对版.md` 及
+  `/home/alex/workspace/ocr/out/pages_md_校对/`，合并文件 SHA-256 为
+  `9fbfecfb3cff95f6011ca0ab4ee17e41bc80628fd10cb82125f45a242492d2ba`。
+  新增确定性校对稿导入器，直接生成规范化内容、语义结果、卡片和阶段账本，避免
+  再次运行高分辨率整页 OCR。
+- 当前生产 release 为 `rel-511f279b0946a763`：22 个 Unit、3,641 词、5,628 条
+  释义、1,586 条常用短语、1,270 条原书例句、3,641 条记忆讲解、8,484 张卡。
+  词和例句共引用 4,911 次 TTS，按文本去重后为 4,902 个 MiMo 音频；全部通过
+  WAV 哈希、采样率和时长门禁。例句音频已随 release 上线。
+- Cloudflare Worker 版本为 `0833415e-33ef-4a60-abd5-bf330ea0694d`，绑定
+  `WORKER_RELEASE_ID=rel-511f279b0946a763`。生产完整冒烟通过：登录、22 Unit
+  bootstrap、35 卡会话、事件幂等、熟悉度、评分重放、撤销、统计、搜索、音频流、
+  登出。清理后再次运行固定抽检：13 条 D1 查询、8 词、8 卡、8 个 R2 对象均通过。
+- 旧生产 release `rel-dc997f599668b817` 及其 D1 内容已删除；旧学习进度、卡片状态、
+  复习日志和学习会话已清空。3 个用户账号和登录数据保留。R2 没有全桶扫描：依据
+  两份 manifest 精确删除 2,011 个旧版独占对象，保留 1,395 个新版复用对象及所有
+  `backups/` 对象。本地旧 bundle、旧工作目录和发布演练副本也已删除。
+- 远程发布器现在使用 16 路有界并发上传 R2，并异步运行 Wrangler；大型 D1 文件的
+  超时单独放宽到 10 分钟。单个对象仍逐一校验 SHA-256、最多重试三次，任何失败都
+  在激活前停止。`remote-sample.ts` 也支持展示词头与稳定键规范化结果不同的合法词条
+  （例如 `labo(u)r` → `labor`）。
+- 最终验证通过：`pnpm verify`（47 个 Vitest 文件、802 项测试，另含 Lint、全仓
+  TypeScript 和 Python 环境门禁）、Playwright 24/24、前端生产构建、bundle 全文件
+  哈希验证、4,902 个音频确定性检查及 `git diff --check`。
+- 下方 2026-09-21 及更早段落是历史记录；其中“生产仍是旧版”“尚未发布”等描述
+  已被本节取代。
+
 ## 2026-09-21 发布请求与门禁实测
 
 - 用户已明确要求直接发布、清理旧生产数据、提交并推送代码，无需再次询问授权。
@@ -76,18 +105,17 @@ pnpm compiler agents visual-ocr status \
 
 ## 当前状态（一句话）
 
-Task 1–18 全部完成并通过评审；Task 19 的私有教材发布已激活
-（`rel-dc997f599668b817`，批准的 V1 范围为 21/22 个 Unit），Worker+PWA 已部署到
-Cloudflare 并绑定自定义域名 `https://lexiloop.juzong.cloud`。生产学习写入故障已修复，
-完整冒烟通过。移动端界面已整体改版，当前生产 Worker 版本为
-`55ebd60e-e7df-4f56-ab27-a85739c45ce9`。
+全书校对版 release `rel-511f279b0946a763` 已激活，22/22 个 Unit 均已上线；
+Worker+PWA 部署在 `https://lexiloop.juzong.cloud`，当前 Worker 版本为
+`0833415e-33ef-4a60-abd5-bf330ea0694d`。旧教材 release、旧学习状态和旧版独占
+音频均已清理，账号保留。
 
 ## 已上线的东西
 
 - Worker: `lexiloop-worker`（含每日备份 cron 0 19 * * *）
 - 域名: `https://lexiloop.juzong.cloud`（workers.dev 在大陆被墙，用这个域名）
-- D1: `lexiloop`（迁移 0001+0002 已应用；active_release_id 指向上述发布）
-- R2: `lexiloop-audio`（私有；2,899+ 音频资产，实际 3,406 个清单条目）
+- D1: `lexiloop`（迁移 0001+0002 已应用；active_release_id 指向 `rel-511f279b0946a763`）
+- R2: `lexiloop-audio`（私有；当前 release 清单为 4,902 个内容寻址音频）
 - 账号: 3 个（alice/bob/carol）。**密码明文在
   `.lexiloop-private/users.private.txt`**（git-ignored），格式 `user:pass`。
 
@@ -109,7 +137,7 @@ Cloudflare 并绑定自定义域名 `https://lexiloop.juzong.cloud`。生产学�
 ## 免费额度下的远程抽检
 
 按当前运行约束，不对生产 D1 和 R2 做全量读取。运行
-`pnpm exec tsx scripts/remote-sample.ts rel-dc997f599668b817`：固定 13 条小范围
+`pnpm exec tsx scripts/remote-sample.ts rel-511f279b0946a763`：固定 13 条小范围
 D1 查询，检查 8 条词记录、8 张卡定义和分布在 8 个哈希范围的 8 个 R2 音频对象；
 抽检通过。这个结果是样本证据，不代表所有远程对象已逐个读取。离线 release
 bundle 的全文件哈希验证、全仓测试和 Playwright 端到端另行通过。
@@ -133,12 +161,11 @@ bundle 的全文件哈希验证、全仓测试和 Playwright 端到端另行通�
 1. `wrangler login` 的 OAuth 令牌时效短（几小时～1天），自动化跑长了会中途
    失效；`refresh_token` 用一次就轮换，脚本刷新易翻车。建议用 API Token
    （env `CLOUDFLARE_API_TOKEN`）替代交互式 OAuth。
-2. c4.u1 BLOCKED（depredation 释义行在水印污染区被 OCR 整行漏识别）。修法：
-   视觉转录补充该词证据 → 重新编译该 Unit → 用 unit-scope 重新打包。
-3. TTS 对 MiMo 偶发空音频响应/慢挂起敏感；重试包装器 +
+2. TTS 对 MiMo 偶发空音频响应/慢挂起敏感；重试包装器 +
    `.lexiloop-private/rebuild-audio-manifest.mts`（从磁盘重建缓存清单）是
-   现成的恢复工具。
-4. Deferred minors 全记录在
+   现成的恢复工具。TTS 阶段现可收养内容哈希匹配的中断后 WAV，并用 16 路有界
+   并发生成缺失项。
+3. Deferred minors 全记录在
    `.superpowers/sdd/2026-09-10-lexiloop-implementation/progress.md`
    （含最终全分支评审的分级处置），修 P0 后建议扫一遍。
 
@@ -147,14 +174,14 @@ bundle 的全文件哈希验证、全仓测试和 Playwright 端到端另行通�
 ```bash
 pnpm typecheck && pnpm test && pnpm test:python   # 全仓门禁
 node .lexiloop-private/prod-smoke.mjs             # 生产冒烟
-pnpm exec tsx scripts/remote-sample.ts rel-dc997f599668b817  # 有限远程抽检
+pnpm exec tsx scripts/remote-sample.ts rel-511f279b0946a763  # 有限远程抽检
 npx wrangler deploy -c infra/wrangler/wrangler.toml
 npx wrangler d1 execute lexiloop --remote -c infra/wrangler/wrangler.toml --json --command "SELECT ..."
 ```
 
 ## 编译产物位置
 
-- 发布 bundle: `.lexiloop-private/releases/rel-dc997f599668b817`
-- 工作目录: `.lexiloop-private/work/08496ec8927e15f5936…/`（OCR、规范化、
-  卡片、音频、阶段账本）
+- 发布 bundle: `.lexiloop-private/releases/rel-511f279b0946a763`
+- 工作目录: `.lexiloop-private/work/9fbfecfb3cff95f6011ca0ab4ee17e41bc80628fd10cb82125f45a242492d2ba/`
+  （规范化、卡片、音频、阶段账本；不再保存重复的整页 OCR）
 - SDD 交接账本: `.superpowers/sdd/2026-09-10-lexiloop-implementation/progress.md`

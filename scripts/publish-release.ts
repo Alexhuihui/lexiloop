@@ -173,6 +173,7 @@ async function runRemote(args: Args): Promise<number> {
     privateRoot: toAbs(args.privateRoot ?? ".lexiloop-private"),
     ...(aliases !== undefined ? { aliases } : {}),
     activate: !args.noActivate,
+    uploadConcurrency: 16,
     now: Date.now(),
     log: (line) => console.log(line),
   });

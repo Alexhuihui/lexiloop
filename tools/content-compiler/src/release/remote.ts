@@ -44,10 +44,10 @@
  * Upload progress prints one line per 50 assets (`uploaded K/total`).
  *
  * The wrangler spawn boundary is injected (`WranglerCli`: argument arrays in,
- * structured results out); production wires spawnSync over the repo-local
- * wrangler binary, tests inject fakes.
+ * structured results out); production asynchronously spawns the repo-local
+ * wrangler binary, while tests inject fakes.
  */
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -386,6 +386,7 @@ export async function remoteStageBundle(input: {
   now: number;
   log?: (line: string) => void;
   sleep?: (ms: number) => Promise<void>;
+  uploadConcurrency?: number;
 }): Promise<RemoteStageResult> {
   const { cli, target, bundleDir, privateRoot, now } = input;
   const log = input.log ?? (() => {});
@@ -413,7 +414,7 @@ export async function remoteStageBundle(input: {
     if (done % UPLOAD_PROGRESS_EVERY === 0 || done === total) {
       log(`uploaded ${done}/${total}`);
     }
-  });
+  }, input.uploadConcurrency ?? 1);
 
   // Release-status preamble: the release row in IMPORTING + its unit reports,
   // the same column list and values ReleaseRepository.create/insertUnitReport
@@ -685,6 +686,8 @@ export async function runRemotePublish(input: {
   log?: (line: string) => void;
   /** Retry backoff override (tests); default sleeps 5s/15s between put attempts. */
   sleep?: (ms: number) => Promise<void>;
+  /** Bounded parallelism for production R2 puts; tests and callers default to serial. */
+  uploadConcurrency?: number;
 }): Promise<RemotePublishOutcome> {
   const { cli, target, bundleDir, privateRoot, now } = input;
   const log = input.log ?? (() => {});
@@ -705,7 +708,11 @@ export async function runRemotePublish(input: {
       `manifest ${verified.manifestSha256.slice(0, 12)})`,
   );
 
-  const staged = await remoteStageBundle({ cli, target, bundleDir, privateRoot, now, log, ...(input.sleep !== undefined ? { sleep: input.sleep } : {}) });
+  const staged = await remoteStageBundle({
+    cli, target, bundleDir, privateRoot, now, log,
+    ...(input.sleep !== undefined ? { sleep: input.sleep } : {}),
+    ...(input.uploadConcurrency !== undefined ? { uploadConcurrency: input.uploadConcurrency } : {}),
+  });
   log(
     `stage OK: release ${staged.releaseId} IMPORTING (audio uploaded=${staged.uploaded} reused=${staged.reused}; app_meta untouched)`,
   );
@@ -761,16 +768,34 @@ export async function runRemotePublish(input: {
 export function createWranglerCli(): WranglerCli {
   return {
     run(argv: readonly string[], input?: Uint8Array): Promise<WranglerResult> {
-      const result = spawnSync(process.execPath, [WRANGLER_BIN, ...argv], {
-        cwd: REPO_ROOT,
-        timeout: WRANGLER_TIMEOUT_MS,
-        maxBuffer: 256 * 1024 * 1024,
-        ...(input !== undefined ? { input: Buffer.from(input) } : {}),
-      });
-      return Promise.resolve({
-        status: result.status ?? 1,
-        stdout: result.stdout?.toString("utf8") ?? "",
-        stderr: result.error !== undefined ? `${String(result.error)}` : (result.stderr?.toString("utf8") ?? ""),
+      return new Promise((resolveResult) => {
+        const timeoutMs = argv[0] === "d1" && argv.includes("--file") ? 10 * 60_000 : WRANGLER_TIMEOUT_MS;
+        const child = spawn(process.execPath, [WRANGLER_BIN, ...argv], {
+          cwd: REPO_ROOT,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        const stdout: Buffer[] = [];
+        const stderr: Buffer[] = [];
+        let settled = false;
+        const finish = (status: number, extra = ""): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolveResult({
+            status,
+            stdout: Buffer.concat(stdout).toString("utf8"),
+            stderr: `${Buffer.concat(stderr).toString("utf8")}${extra}`,
+          });
+        };
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          finish(1, `wrangler timed out after ${timeoutMs}ms`);
+        }, timeoutMs);
+        child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+        child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+        child.on("error", (err) => finish(1, String(err)));
+        child.on("close", (code) => finish(code ?? 1));
+        child.stdin.end(input === undefined ? undefined : Buffer.from(input));
       });
     },
   };

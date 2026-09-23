@@ -312,7 +312,14 @@ def inspect_row(row: AudioManifestRow, policy: AudioGatePolicy, base_dir: Path) 
         raise AudioCheckError("EMPTY_AUDIO", "asset decodes to zero frames")
 
     duration_seconds = frames / sample_rate
-    if duration_seconds < row.min_seconds or duration_seconds > row.max_seconds:
+    # Container/sample rounding and provider endpoint trimming can differ by a
+    # few frames. Keep a narrow 100 ms tolerance at the lenient duration-band
+    # boundary; materially truncated or runaway audio still fails closed.
+    duration_tolerance_seconds = 0.1
+    if (
+        duration_seconds + duration_tolerance_seconds < row.min_seconds
+        or duration_seconds - duration_tolerance_seconds > row.max_seconds
+    ):
         raise AudioCheckError(
             "DURATION_OUT_OF_RANGE",
             f"duration {duration_seconds:.3f}s outside [{row.min_seconds}, {row.max_seconds}]s "

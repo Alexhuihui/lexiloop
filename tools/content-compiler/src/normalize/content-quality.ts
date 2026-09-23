@@ -51,6 +51,7 @@ function variants(headword: string): Set<string> {
   }
   const irregulars: Readonly<Record<string, readonly string[]>> = {
     bear: ["bore", "born", "borne"],
+    hypothesis: ["hypotheses"],
     mean: ["meant"],
   };
   for (const form of irregulars[headword.normalize("NFKC").toLowerCase()] ?? []) {

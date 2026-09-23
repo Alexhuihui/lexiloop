@@ -73,39 +73,56 @@ export async function uploadAudioAssets(
   rows: readonly AudioManifestRow[],
   audioRoot: string,
   onProgress?: (done: number, total: number) => void,
+  concurrency = 1,
 ): Promise<UploadResult> {
   const total = rows.length;
   let done = 0;
   let uploaded = 0;
   let reused = 0;
+  let cursor = 0;
+  let failure: unknown;
   const report = (): void => {
     done += 1;
     onProgress?.(done, total);
   };
-  for (const row of rows) {
-    if (await r2.head(row.object_key)) {
-      reused += 1;
-      report();
-      continue;
+  const worker = async (): Promise<void> => {
+    while (failure === undefined) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= rows.length) return;
+      const row = rows[index]!;
+      try {
+        if (await r2.head(row.object_key)) {
+          reused += 1;
+          report();
+          continue;
+        }
+        const filePath = path.join(audioRoot, row.object_key);
+        let bytes: Buffer;
+        try {
+          bytes = await readFile(filePath);
+        } catch {
+          throw new PublishError("RELEASE_AUDIO_MISSING", `audio asset ${row.cache_key.slice(0, 12)} missing: ${filePath}`);
+        }
+        const actualSha = createHash("sha256").update(bytes).digest("hex");
+        if (actualSha !== row.sha256) {
+          throw new PublishError(
+            "RELEASE_AUDIO_HASH_MISMATCH",
+            `audio asset ${row.cache_key.slice(0, 12)} bytes changed (${actualSha.slice(0, 12)} != ${row.sha256.slice(0, 12)})`,
+          );
+        }
+        await r2.put(row.object_key, bytes);
+        uploaded += 1;
+        report();
+      } catch (err) {
+        failure ??= err;
+      }
     }
-    const filePath = path.join(audioRoot, row.object_key);
-    let bytes: Buffer;
-    try {
-      bytes = await readFile(filePath);
-    } catch {
-      throw new PublishError("RELEASE_AUDIO_MISSING", `audio asset ${row.cache_key.slice(0, 12)} missing: ${filePath}`);
-    }
-    const actualSha = createHash("sha256").update(bytes).digest("hex");
-    if (actualSha !== row.sha256) {
-      throw new PublishError(
-        "RELEASE_AUDIO_HASH_MISMATCH",
-        `audio asset ${row.cache_key.slice(0, 12)} bytes changed (${actualSha.slice(0, 12)} != ${row.sha256.slice(0, 12)})`,
-      );
-    }
-    await r2.put(row.object_key, bytes);
-    uploaded += 1;
-    report();
-  }
+  };
+  const requestedConcurrency = Number.isFinite(concurrency) ? Math.trunc(concurrency) : 1;
+  const workerCount = Math.max(1, Math.min(requestedConcurrency, rows.length || 1));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (failure !== undefined) throw failure;
   return { uploaded, reused };
 }
 

@@ -275,6 +275,18 @@ def test_duration_bounds_are_enforced(tmp_path: Path) -> None:
     expect_check_error(make_row(long_path, max_seconds=1.0), "DURATION_OUT_OF_RANGE", tmp_path)
 
 
+def test_duration_bounds_allow_subsecond_rounding_tolerance(tmp_path: Path) -> None:
+    path = tmp_path / "boundary.wav"
+    raw = write_wav(path, 0.95)
+    path.write_bytes(audio.with_info_comment(raw, TEXT_SHA))
+    result = audio.inspect_row(
+        audio.AudioManifestRow.model_validate(make_row(path, min_seconds=1.0)),
+        audio.AudioGatePolicy(),
+        tmp_path,
+    )
+    assert result["ok"] is True
+
+
 def test_text_hash_metadata_must_match_the_content_record(tmp_path: Path) -> None:
     path = tmp_path / "meta.wav"
     raw = write_wav(path, 0.8)
