@@ -8,9 +8,13 @@ with the exact commands. Real IDs live in the untracked
 ## Preconditions
 
 - `npx wrangler whoami` authenticated against the production account.
-- Cloudflare resources exist: exactly one D1 database (`lexiloop`) and one
-  private R2 bucket (`lexiloop-audio`). No public R2 access; the Worker and
-  the publish script are the only writers.
+- The configured D1 database and private R2 bucket are dedicated to LexiLoop.
+  During an APAC migration the old and new resources coexist for rollback.
+  No public R2 access; the Worker and the publish script are the only writers.
+- For APAC production, follow
+  [`apac-resource-migration.md`](./apac-resource-migration.md) before changing
+  bindings. The tracked placement default is `gcp:asia-east1`; real resource
+  IDs and any evidence-based region override stay in the ignored config.
 - `infra/wrangler/wrangler.toml` contains the real D1 id / R2 bucket, the
   login rate limiter, the daily backup cron, and the `[assets]` PWA binding.
 - Migrations applied: `npx wrangler d1 migrations apply lexiloop --remote -c infra/wrangler/wrangler.toml`.

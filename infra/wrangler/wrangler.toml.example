@@ -9,6 +9,12 @@ name = "lexiloop-worker"
 main = "../../apps/worker/src/index.ts"
 compatibility_date = "2026-09-01"
 
+# Keep the Worker close to the APAC D1 primary. gcp:asia-east1 is the default
+# for mainland-China-adjacent traffic; production may choose another supported
+# Asia region after checking the APAC D1 `served_by_colo` value.
+[placement]
+region = "gcp:asia-east1"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "lexiloop"
