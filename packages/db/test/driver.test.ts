@@ -89,6 +89,29 @@ describe("driver-agnostic repositories", () => {
       // Alias resolution: no edge -> identity; canonical root disagreement throws.
       const aliases = new AliasRepository(db);
       await expect(aliases.resolve({ releaseId: "r-driver-2", key: "word-1" })).resolves.toBe("word-1");
+
+      const users = new UserRepository(db);
+      const user = await users.create({
+        userId: "user-driver",
+        normalizedUsername: "driver",
+        passwordSalt: "salt",
+        passwordVerifier: "verifier",
+        createdAt: 1_700_000_000_000,
+      });
+      const authSessions = new AuthSessionRepository(db);
+      await authSessions.create(
+        { userId: user.userId },
+        {
+          sessionId: "session-driver",
+          tokenHash: "token-hash-driver",
+          issuedAt: 1_700_000_000_000,
+          expiresAt: 1_700_086_400_000,
+          sessionVersion: user.sessionVersion,
+        },
+      );
+      const principal = await authSessions.resolveByTokenHash("token-hash-driver");
+      expect(principal?.session.sessionId).toBe("session-driver");
+      expect(principal?.user.userId).toBe(user.userId);
     } finally {
       env.cleanup();
     }

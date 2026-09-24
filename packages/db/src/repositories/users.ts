@@ -117,6 +117,11 @@ export interface CreateAuthSessionInput {
   sessionVersion?: number;
 }
 
+export interface ResolvedAuthSession {
+  session: AuthSessionRow;
+  user: AppUserRow;
+}
+
 /**
  * Server-side auth sessions (spec 7.2). Token-hash lookup is the one global
  * path (login happens before an identity is known); every other method is
@@ -150,6 +155,17 @@ export class AuthSessionRepository {
   /** Resolution of a presented cookie token to its session row. */
   async getByTokenHash(tokenHash: string): Promise<AuthSessionRow | undefined> {
     return await this.db.select().from(authSession).where(eq(authSession.tokenHash, tokenHash)).get();
+  }
+
+  /** Resolves the cookie hash and its owning account in one database read. */
+  async resolveByTokenHash(tokenHash: string): Promise<ResolvedAuthSession | undefined> {
+    const row = await this.db
+      .select()
+      .from(authSession)
+      .innerJoin(appUser, eq(appUser.userId, authSession.userId))
+      .where(eq(authSession.tokenHash, tokenHash))
+      .get();
+    return row ? { session: row.auth_session, user: row.app_user } : undefined;
   }
 
   async get(ctx: UserContext, sessionId: string): Promise<AuthSessionRow | undefined> {

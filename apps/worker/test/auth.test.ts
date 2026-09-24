@@ -367,6 +367,35 @@ describe("session validation on every authenticated request", () => {
     const row = fx.env.sqlite.prepare("SELECT last_used_at FROM auth_session").get() as { last_used_at: number | null };
     expect(row.last_used_at).toBe(T0 + 5 * 60 * 1000);
   });
+
+  it("limits last_used_at writes to once per five minutes and ignores clock skew", async () => {
+    const { token } = await loginAlice();
+    const authenticatedMe = async (): Promise<void> => {
+      const response = await fx.app.request("/api/auth/me", {
+        headers: { cookie: `${SESSION_COOKIE}=${token}` },
+      });
+      expect(response.status).toBe(200);
+    };
+    const lastUsedAt = (): number | null =>
+      (fx.env.sqlite.prepare("SELECT last_used_at FROM auth_session").get() as { last_used_at: number | null })
+        .last_used_at;
+
+    fx.clock.now = T0 + 5 * 60 * 1000;
+    await authenticatedMe();
+    expect(lastUsedAt()).toBe(T0 + 5 * 60 * 1000);
+
+    fx.clock.now += 5 * 60 * 1000 - 1;
+    await authenticatedMe();
+    expect(lastUsedAt()).toBe(T0 + 5 * 60 * 1000);
+
+    fx.clock.now += 1;
+    await authenticatedMe();
+    expect(lastUsedAt()).toBe(T0 + 10 * 60 * 1000);
+
+    fx.clock.now = T0;
+    await authenticatedMe();
+    expect(lastUsedAt()).toBe(T0 + 10 * 60 * 1000);
+  });
 });
 
 describe("logout (POST /api/auth/logout)", () => {

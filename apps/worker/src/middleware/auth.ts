@@ -23,6 +23,9 @@ export interface AuthenticatedPrincipal {
   session: AuthSessionRow;
 }
 
+/** Audit freshness without turning every high-frequency API call into a D1 write. */
+export const AUTH_SESSION_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+
 export function requireAuth(): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
     const deps = c.var.deps;
@@ -44,7 +47,10 @@ export function requireAuth(): MiddlewareHandler<AppEnv> {
       session: resolution.session,
     };
     c.set("auth", principal);
-    await new AuthSessionRepository(deps.db).touch({ userId: principal.userId }, principal.sessionId, now);
+    const lastUsedAt = principal.session.lastUsedAt;
+    if (lastUsedAt === null || now - lastUsedAt >= AUTH_SESSION_TOUCH_INTERVAL_MS) {
+      await new AuthSessionRepository(deps.db).touch({ userId: principal.userId }, principal.sessionId, now);
+    }
     await next();
   };
 }

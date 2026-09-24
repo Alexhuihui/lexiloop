@@ -8,7 +8,6 @@
 
 import {
   AuthSessionRepository,
-  UserRepository,
   type AppUserRow,
   type AuthSessionRow,
   type LexiloopDatabase,
@@ -69,19 +68,16 @@ export type SessionResolution =
  */
 export async function resolveSession(db: LexiloopDatabase, rawToken: string, now: number): Promise<SessionResolution> {
   const tokenHash = await sha256Hex(rawToken);
-  const session = await new AuthSessionRepository(db).getByTokenHash(tokenHash);
-  if (!session) {
+  const principal = await new AuthSessionRepository(db).resolveByTokenHash(tokenHash);
+  if (!principal) {
     return { ok: false, reason: "INVALID" };
   }
+  const { session, user } = principal;
   if (session.revokedAt !== null) {
     return { ok: false, reason: "REVOKED" };
   }
   if (session.expiresAt <= now) {
     return { ok: false, reason: "EXPIRED" };
-  }
-  const user = await new UserRepository(db).getById(session.userId);
-  if (!user) {
-    return { ok: false, reason: "INVALID" };
   }
   if (user.status !== "ACTIVE") {
     return { ok: false, reason: "DISABLED" };
