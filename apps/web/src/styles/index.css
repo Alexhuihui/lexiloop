@@ -367,7 +367,12 @@ ul { padding-left: 1.2rem; }
 .rating-btn {
   padding: 7px 4px; color: var(--ink); background: #f2f1eb;
   border: 1px solid transparent; border-radius: 11px; font-weight: 750; cursor: pointer;
+  touch-action: manipulation;
 }
+.rating-btn:active:not(:disabled), .rating-btn[aria-pressed="true"] {
+  transform: scale(0.97); box-shadow: inset 0 0 0 2px currentColor;
+}
+.rating-btn:disabled[aria-pressed="true"] { opacity: 1; }
 .rating-btn--1 { color: #a34c42; background: #fae8e3; }
 .rating-btn--2 { color: #8a651e; background: #f7edcf; }
 .rating-btn--3 { color: var(--brand); background: var(--brand-soft); }

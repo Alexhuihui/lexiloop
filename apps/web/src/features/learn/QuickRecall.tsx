@@ -1,18 +1,18 @@
 /**
  * Quick recall (spec 9.3 step 5/6): after the group's words are studied, the
- * session's queue is graded card by card in the SERVER's snapshot order (the
- * client never reshuffles). Each card first shows the prompt — the word, the
- * exam sentence with the target blanked, the phrase, or the discrimination
- * prompt — and only after the explicit reveal do the four FSRS ratings
- * (Again/Hard/Good/Easy) appear and submit.
+ * session's queue is graded in the SERVER's snapshot order (the client never
+ * reshuffles). Consecutive WORD_MEANING cards for one word are presented as
+ * one visible card and batch-graded atomically; context, phrase, and
+ * discrimination cards stay independent. Each visible card first shows the
+ * prompt, and only after the explicit reveal do the four FSRS ratings appear.
  *
  * `buildQuickRecallCards` aligns the server's queue with the cards the
  * client can derive from the group's word contents (spec 5.7 rule 2 order:
  * card-type rank -> word source order -> target key). The alignment drives
- * PROMPT RENDERING ONLY — the graded `card_key` always comes from the
+ * PROMPT RENDERING/GROUPING ONLY — graded `card_key`s always come from the
  * server's queue snapshot. When the derivable model does not match the
- * queue's length, every card degrades to a generic prompt instead of
- * risking a mismatched prompt.
+ * queue's length, every card degrades to a generic prompt instead of risking
+ * a mismatched prompt.
  */
 
 import type { GradeRating } from "../../lib/api-client";
@@ -80,10 +80,7 @@ function entriesForWord(word: StudyWordState, headwordOf: (wordKey: string) => s
         headword: word.headword,
         phonetic: word.phonetic,
         answer: {
-          senses: content.senses.map((candidate) => ({
-            pos: candidate.pos,
-            gloss: candidate.gloss,
-          })),
+          senses: [{ pos: sense.pos, gloss: sense.gloss }],
         },
       },
     });
@@ -183,6 +180,57 @@ export function buildQuickRecallCards(
   return expected.map((entry) => entry.card);
 }
 
+/** One learner-visible recall item. Consecutive WORD_MEANING cards for the
+ * same word are one interaction: their distinct sense answers are merged,
+ * while `rawLength` preserves how many server-side FSRS cards the rating
+ * must update atomically. Other card types remain one visible item each. */
+export interface QuickRecallGroup {
+  card: QuickRecallCard;
+  rawStart: number;
+  rawLength: number;
+}
+
+export function groupQuickRecallCards(cards: readonly QuickRecallCard[]): QuickRecallGroup[] {
+  const groups: QuickRecallGroup[] = [];
+  let index = 0;
+  while (index < cards.length) {
+    const first = cards[index]!;
+    if (first.form !== "word") {
+      groups.push({ card: first, rawStart: index, rawLength: 1 });
+      index += 1;
+      continue;
+    }
+
+    let end = index + 1;
+    while (
+      end < cards.length &&
+      cards[end]?.form === "word" &&
+      cards[end]?.wordKey === first.wordKey
+    ) {
+      end += 1;
+    }
+    const senses = cards
+      .slice(index, end)
+      .flatMap((card) => card.answer?.senses ?? [])
+      .filter(
+        (sense, senseIndex, all) =>
+          all.findIndex(
+            (candidate) => candidate.pos === sense.pos && candidate.gloss === sense.gloss,
+          ) === senseIndex,
+      );
+    groups.push({
+      card: {
+        ...first,
+        answer: { ...first.answer, senses },
+      },
+      rawStart: index,
+      rawLength: end - index,
+    });
+    index = end;
+  }
+  return groups;
+}
+
 const RATINGS: ReadonlyArray<{ value: GradeRating; label: string }> = [
   { value: 1, label: "再次" },
   { value: 2, label: "困难" },
@@ -197,6 +245,7 @@ export interface QuickRecallProps {
   card: QuickRecallCard | null;
   revealed: boolean;
   gradePending: boolean;
+  pendingRating: GradeRating | null;
   gradeError: string | null;
   onReveal(): void;
   onRate(rating: GradeRating): void;
@@ -283,6 +332,7 @@ export function QuickRecall({
   card,
   revealed,
   gradePending,
+  pendingRating,
   gradeError,
   onReveal,
   onRate,
@@ -305,6 +355,7 @@ export function QuickRecall({
                 type="button"
                 className={`rating-btn rating-btn--${rating.value}`}
                 disabled={gradePending}
+                aria-pressed={pendingRating === rating.value}
                 onClick={() => onRate(rating.value)}
               >
                 {rating.label}

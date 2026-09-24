@@ -9,6 +9,8 @@
  * - `PATCH /api/study/sessions/:sessionId` — the StudyPatch body
  *   (WORD_PRESENTED / FAMILIARITY_SET), idempotent by event_id.
  * - `POST /api/reviews/grade` — server-side FSRS grading as one atomic batch.
+ * - `POST /api/reviews/grade-batch` — one visible word rating atomically
+ *   grades its consecutive per-sense WORD_MEANING cards.
  * - `POST /api/reviews/:eventId/undo` — latest-only revocation.
  *
  * Every route serves personal data: auth comes exclusively from the session
@@ -26,7 +28,7 @@ import { privateNoStoreHeaders } from "../http/cache";
 import { jsonError } from "../observability/request-context";
 import { StudyHttpError, StudyService } from "./service";
 import { applyStudyPatch, StudyPatchSchema } from "./familiarity";
-import { gradeReview } from "./grade";
+import { gradeReview, gradeReviewBatch } from "./grade";
 import { undoReview } from "./undo";
 import type { AppEnv } from "../app";
 
@@ -47,6 +49,26 @@ const gradeSchema = z.strictObject({
   /** Answer duration (spec 8.3); bounded to reject nonsense, stored as-is. */
   duration_ms: z.number().int().min(0).max(86_400_000).optional(),
 });
+
+const gradeBatchSchema = z
+  .strictObject({
+    session_id: z.string().min(1).max(128),
+    grades: z
+      .array(
+        z.strictObject({
+          event_id: z.string().min(1).max(128),
+          card_key: z.string().min(1).max(256),
+        }),
+      )
+      .min(2)
+      .max(50),
+    rating: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
+    duration_ms: z.number().int().min(0).max(86_400_000).optional(),
+  })
+  .refine(
+    (value) => new Set(value.grades.map((grade) => grade.event_id)).size === value.grades.length,
+    { message: "event_id values must be unique within a batch", path: ["grades"] },
+  );
 
 /** Shared validator behavior: a stable 400 with field details for bad bodies. */
 function validateBody<S extends z.ZodType>(schema: S) {
@@ -137,6 +159,24 @@ export function registerStudyRoutes(app: Hono<AppEnv>): void {
         const service = new StudyService(c.var.deps.db, c.var.deps.now ?? (() => Date.now()));
         const ctx: UserContext = { userId: c.var.auth.userId };
         const result = await gradeReview(service, ctx, c.req.valid("json"));
+        return c.json(result, 200, PRIVATE_HEADERS);
+      } catch (error) {
+        return errorResponse(c, error);
+      }
+    },
+  );
+
+  app.post(
+    "/api/reviews/grade-batch",
+    requireAuth(),
+    requireValidOrigin(),
+    requireCsrf(),
+    validateBody(gradeBatchSchema),
+    async (c) => {
+      try {
+        const service = new StudyService(c.var.deps.db, c.var.deps.now ?? (() => Date.now()));
+        const ctx: UserContext = { userId: c.var.auth.userId };
+        const result = await gradeReviewBatch(service, ctx, c.req.valid("json"));
         return c.json(result, 200, PRIVATE_HEADERS);
       } catch (error) {
         return errorResponse(c, error);

@@ -289,6 +289,13 @@ interface GradeBody {
   replayed: boolean;
 }
 
+interface GradeBatchBody {
+  session_id: string;
+  position: number;
+  results: GradeBody[];
+  replayed: boolean;
+}
+
 type ApiOutcome<B> = { status: number; headers: Headers; body: B };
 type ErrorCode = { code: string; message: string };
 
@@ -313,6 +320,21 @@ async function grade(
   input: { event_id: string; session_id: string; card_key: string; rating: number; duration_ms?: number },
 ): Promise<ApiOutcome<GradeBody & Partial<ErrorCode>>> {
   return await postJson<GradeBody>("/api/reviews/grade", auth, { duration_ms: 5000, ...input });
+}
+
+async function gradeBatch(
+  auth: Credentials,
+  input: {
+    session_id: string;
+    grades: Array<{ event_id: string; card_key: string }>;
+    rating: number;
+    duration_ms?: number;
+  },
+): Promise<ApiOutcome<GradeBatchBody & Partial<ErrorCode>>> {
+  return await postJson<GradeBatchBody>("/api/reviews/grade-batch", auth, {
+    duration_ms: 5000,
+    ...input,
+  });
 }
 
 /** Sequential grade counter so every event id is unique within the file. */
@@ -804,6 +826,55 @@ describe("PATCH /api/study/sessions/:id (StudyPatch)", () => {
 });
 
 describe("POST /api/reviews/grade", () => {
+  it("atomically grades consecutive same-word meaning cards and advances by the batch size", async () => {
+    const created = await createSession(fx.bobAuth, "NEW_WORDS");
+    const request = {
+      session_id: created.body.session_id,
+      grades: [
+        { event_id: "evt-batch-1", card_key: "k-wm-1" },
+        { event_id: "evt-batch-2", card_key: "k-wm-2" },
+      ],
+      rating: 3,
+    };
+    const outcome = await gradeBatch(fx.bobAuth, request);
+    expect(outcome.status).toBe(200);
+    expect(outcome.headers.get("cache-control")).toBe("private, no-store");
+    expect(outcome.body).toMatchObject({
+      session_id: created.body.session_id,
+      position: 2,
+      replayed: false,
+    });
+    expect(outcome.body.results.map((result) => result.presented_card_key)).toEqual([
+      "k-wm-1",
+      "k-wm-2",
+    ]);
+    expect(outcome.body.results.every((result) => result.rating === 3)).toBe(true);
+    expect(cardStateRow(fx.bob.userId, "k-wm-1")).not.toBeNull();
+    expect(cardStateRow(fx.bob.userId, "k-wm-2")).not.toBeNull();
+    expect((await getSession(fx.bobAuth, created.body.session_id)).body.position).toBe(2);
+
+    const replay = await gradeBatch(fx.bobAuth, request);
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ position: 2, replayed: true });
+    expect(replay.body.results.every((result) => result.replayed)).toBe(true);
+  });
+
+  it("rejects a batch that crosses words instead of silently over-grading", async () => {
+    const created = await createSession(fx.bobAuth, "NEW_WORDS");
+    const outcome = await gradeBatch(fx.bobAuth, {
+      session_id: created.body.session_id,
+      grades: [
+        { event_id: "evt-cross-1", card_key: "k-wm-1" },
+        { event_id: "evt-cross-2", card_key: "k-wm-2" },
+        { event_id: "evt-cross-3", card_key: "k-wm-3" },
+      ],
+      rating: 3,
+    });
+    expect(outcome.status).toBe(400);
+    expect(outcome.body.code).toBe("REVIEW_BATCH_INVALID");
+    expect((await getSession(fx.bobAuth, created.body.session_id)).body.position).toBe(0);
+  });
+
   it("creates card_state from a null before_state, appends the log, and advances the session position", async () => {
     const created = await createSession(fx.bobAuth, "NEW_WORDS");
     const outcome = await grade(fx.bobAuth, {

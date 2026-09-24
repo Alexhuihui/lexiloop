@@ -316,6 +316,22 @@ const gradeResultSchema = z.object({
 
 export type GradeResult = z.infer<typeof gradeResultSchema>;
 
+export interface GradeBatchRequestBody {
+  session_id: string;
+  grades: Array<{ event_id: string; card_key: string }>;
+  rating: GradeRating;
+  duration_ms?: number;
+}
+
+const gradeBatchResultSchema = z.object({
+  session_id: z.string(),
+  position: z.number().int().nonnegative(),
+  results: z.array(gradeResultSchema),
+  replayed: z.boolean(),
+});
+
+export type GradeBatchResult = z.infer<typeof gradeBatchResultSchema>;
+
 /** Result of the latest-only undo (apps/worker/src/study/undo.ts). */
 const undoResultSchema = z.object({
   event_id: z.string(),
@@ -464,6 +480,8 @@ export interface ApiClient {
   patchStudySession(sessionId: string, patch: StudyPatchBody): Promise<PatchResult>;
   /** Server-side FSRS grade of the queue's current card (spec 8.3). */
   gradeReview(requestBody: GradeRequestBody): Promise<GradeResult>;
+  /** Atomically grades consecutive same-word meaning cards as one UI item. */
+  gradeReviewBatch(requestBody: GradeBatchRequestBody): Promise<GradeBatchResult>;
   /** Revokes the caller's LATEST valid, un-undone review event (spec 8.3). */
   undoReview(eventId: string): Promise<UndoResult>;
   /** Stores the session CSRF token in memory only (never persisted). */
@@ -761,6 +779,12 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     async gradeReview(requestBody: GradeRequestBody): Promise<GradeResult> {
       return gradeResultSchema.parse(
         await request("/api/reviews/grade", { method: "POST", body: requestBody }),
+      );
+    },
+
+    async gradeReviewBatch(requestBody: GradeBatchRequestBody): Promise<GradeBatchResult> {
+      return gradeBatchResultSchema.parse(
+        await request("/api/reviews/grade-batch", { method: "POST", body: requestBody }),
       );
     },
 

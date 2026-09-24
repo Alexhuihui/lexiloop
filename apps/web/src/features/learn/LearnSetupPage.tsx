@@ -31,7 +31,7 @@ import {
 } from "../../lib/query-cache";
 import { useStudySession, type StudySessionControls } from "./useStudySession";
 import { WordStudyCard } from "./WordStudyCard";
-import { QuickRecall } from "./QuickRecall";
+import { groupQuickRecallCards, QuickRecall } from "./QuickRecall";
 import { useAudioPrefetch } from "../../lib/audio-prefetch";
 
 export interface LearnSetupPageProps {
@@ -305,15 +305,22 @@ function PendingPresentationsNotice({ study }: { study: StudySessionControls }):
 }
 
 function RecallView({ study }: { study: StudySessionControls }): React.JSX.Element {
-  const total = study.session?.cards.length ?? 0;
+  const groups = groupQuickRecallCards(study.recallCards ?? []);
+  const groupIndex = groups.findIndex(
+    (group) =>
+      study.queueIndex >= group.rawStart &&
+      study.queueIndex < group.rawStart + group.rawLength,
+  );
+  const activeGroup = groupIndex >= 0 ? groups[groupIndex] : null;
   return (
     <div>
       <QuickRecall
-        cardIndex={study.queueIndex}
-        total={total}
-        card={study.recallCards?.[study.queueIndex] ?? null}
+        cardIndex={Math.max(groupIndex, 0)}
+        total={groups.length}
+        card={activeGroup?.card ?? null}
         revealed={study.phase === "QUICK_RECALL_REVEALED"}
         gradePending={study.gradePending}
+        pendingRating={study.pendingRating}
         gradeError={study.gradeError}
         onReveal={study.reveal}
         onRate={(rating) => void study.rate(rating)}

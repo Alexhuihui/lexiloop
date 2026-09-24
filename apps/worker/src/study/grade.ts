@@ -42,6 +42,20 @@ export interface GradeResult {
   replayed: boolean;
 }
 
+export interface GradeBatchRequest {
+  session_id: string;
+  grades: Array<{ event_id: string; card_key: string }>;
+  rating: GradeRating;
+  duration_ms?: number;
+}
+
+export interface GradeBatchResult {
+  session_id: string;
+  position: number;
+  results: GradeResult[];
+  replayed: boolean;
+}
+
 function toResult(record: ReviewLogRecord, fallbackSessionId: string, replayed: boolean): GradeResult {
   return {
     event_id: record.eventId,
@@ -142,6 +156,160 @@ export async function gradeReview(
     reviewed_at: now,
     duration_ms: request.duration_ms ?? null,
     undone_at: null,
+    replayed: false,
+  };
+}
+
+/**
+ * Grades consecutive WORD_MEANING cards for one word in a single atomic
+ * write. The content model keeps one FSRS state per sense, while the learner
+ * sees and rates the word only once with all of its senses on the back.
+ */
+export async function gradeReviewBatch(
+  service: StudyService,
+  ctx: UserContext,
+  request: GradeBatchRequest,
+): Promise<GradeBatchResult> {
+  const existing = await Promise.all(
+    request.grades.map((grade) => service.reviewLogs.get(ctx, grade.event_id)),
+  );
+  if (existing.every((record) => record !== undefined)) {
+    const session = await service.requireSession(ctx, request.session_id);
+    return {
+      session_id: request.session_id,
+      position: session.position,
+      results: existing.map((record) => toResult(record!, request.session_id, true)),
+      replayed: true,
+    };
+  }
+  if (existing.some((record) => record !== undefined)) {
+    throw new StudyHttpError(
+      409,
+      "REVIEW_BATCH_PARTIAL_REPLAY",
+      "Batch event ids must all be new or all be a replay",
+    );
+  }
+
+  const session = await service.requireSession(ctx, request.session_id);
+  const queued = session.queue.cards.slice(
+    session.position,
+    session.position + request.grades.length,
+  );
+  if (queued.length !== request.grades.length) {
+    throw new StudyHttpError(409, "STUDY_QUEUE_EXHAUSTED", "Not enough cards remain in this session");
+  }
+  for (const [index, grade] of request.grades.entries()) {
+    if (queued[index]?.presented_card_key !== grade.card_key) {
+      throw new StudyHttpError(409, "STUDY_CARD_NOT_CURRENT", "Batch cards do not match the current queue items");
+    }
+  }
+
+  const resolved = await Promise.all(
+    queued.map((card) => service.resolvePresented(session, card.presented_card_key)),
+  );
+  const localWordKey = resolved[0]?.localWordKey;
+  if (
+    !localWordKey ||
+    resolved.some(
+      (item) => item.localWordKey !== localWordKey || item.card.cardType !== "WORD_MEANING",
+    )
+  ) {
+    throw new StudyHttpError(
+      400,
+      "REVIEW_BATCH_INVALID",
+      "Only consecutive WORD_MEANING cards for one word may be graded together",
+    );
+  }
+
+  const now = service.now();
+  const perCardDuration =
+    request.duration_ms === undefined
+      ? undefined
+      : Math.round(request.duration_ms / request.grades.length);
+  const gradeRequests: GradeRequest[] = request.grades.map((grade) => ({
+    event_id: grade.event_id,
+    session_id: request.session_id,
+    card_key: grade.card_key,
+    rating: request.rating,
+    ...(perCardDuration === undefined ? {} : { duration_ms: perCardDuration }),
+  }));
+  const beforeStates = await Promise.all(
+    resolved.map(async (item) => (await service.cardStates.get(ctx, item.canonicalCardKey))?.state ?? null),
+  );
+  const outcomes = beforeStates.map((before) =>
+    gradeCard({ before, rating: request.rating, reviewedAt: now }),
+  );
+  const statements: SQL[] = [];
+  for (const [index, gradeRequest] of gradeRequests.entries()) {
+    const item = resolved[index]!;
+    const outcome = outcomes[index]!;
+    statements.push(
+      sqlInsertReviewLog(
+        ctx.userId,
+        gradeRequest,
+        item.canonicalCardKey,
+        session.releaseId,
+        outcome,
+        now,
+      ),
+      sqlUpsertCardState(ctx.userId, item.canonicalCardKey, outcome.after, now),
+    );
+  }
+  statements.push(
+    sql`UPDATE study_session SET position = position + ${request.grades.length} WHERE session_id = ${session.sessionId} AND user_id = ${ctx.userId}`,
+  );
+  const canonicalKeys = await service.canonicalCardKeys(session.releaseId, localWordKey);
+  const progress = await service.words.get(ctx, resolved[0]!.canonicalWordKey);
+  if (progress && progress.stage === "IN_PROGRESS" && canonicalKeys.length > 0) {
+    statements.push(
+      sqlFlipWordIntroduced(
+        ctx.userId,
+        resolved[0]!.canonicalWordKey,
+        session.releaseId,
+        canonicalKeys,
+        now,
+      ),
+    );
+  }
+
+  try {
+    await service.atomic.run(statements);
+  } catch (error) {
+    if (isUniqueEventIdViolation(error)) {
+      const winners = await Promise.all(
+        request.grades.map((grade) => service.reviewLogs.get(ctx, grade.event_id)),
+      );
+      if (winners.every((record) => record !== undefined)) {
+        const refreshed = await service.requireSession(ctx, request.session_id);
+        return {
+          session_id: request.session_id,
+          position: refreshed.position,
+          results: winners.map((record) => toResult(record!, request.session_id, true)),
+          replayed: true,
+        };
+      }
+      throw new StudyHttpError(409, "REVIEW_EVENT_ID_TAKEN", "A batch event_id has already been used");
+    }
+    throw error;
+  }
+
+  return {
+    session_id: request.session_id,
+    position: session.position + request.grades.length,
+    results: gradeRequests.map((gradeRequest, index) => ({
+      event_id: gradeRequest.event_id,
+      session_id: session.sessionId,
+      card_key: resolved[index]!.canonicalCardKey,
+      presented_card_key: queued[index]!.presented_card_key,
+      release_id: session.releaseId,
+      rating: request.rating,
+      before_state: outcomes[index]!.before,
+      after_state: outcomes[index]!.after,
+      reviewed_at: now,
+      duration_ms: gradeRequest.duration_ms ?? null,
+      undone_at: null,
+      replayed: false,
+    })),
     replayed: false,
   };
 }

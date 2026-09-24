@@ -28,9 +28,10 @@
  *   never blocks the next word's controls; a failed save rolls back the
  *   optimistic choice.
  * - Grading happens only in QUICK_RECALL_REVEALED: one client-generated
- *   `event_id` per reveal->rating cycle; the SAME id is replayed when the
- *   grade request fails; the next card is enabled only after the grade and
- *   the session re-read both succeeded.
+ *   `event_id` per reveal->rating cycle (with stable suffixes for a grouped
+ *   word's sense cards); the SAME ids are replayed when a grade request
+ *   fails. A successful response already proves the atomic position advance,
+ *   so the next card paints immediately without a redundant session read.
  */
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
@@ -42,7 +43,11 @@ import {
   type SessionView,
   type WordContentResponse,
 } from "../../lib/api-client";
-import { buildQuickRecallCards, type QuickRecallCard } from "./QuickRecall";
+import {
+  buildQuickRecallCards,
+  groupQuickRecallCards,
+  type QuickRecallCard,
+} from "./QuickRecall";
 import { scheduleIdleTask } from "../../lib/audio-prefetch";
 
 export type LearnPhase =
@@ -83,6 +88,7 @@ export interface StudySessionControls {
   setupError: string | null;
   familiarityPending: boolean;
   gradePending: boolean;
+  pendingRating: GradeRating | null;
   gradeError: string | null;
   recallCards: QuickRecallCard[] | null;
   queueIndex: number;
@@ -113,6 +119,7 @@ interface MachineState {
   queueIndex: number;
   gradeEventId: string | null;
   gradePending: boolean;
+  pendingRating: GradeRating | null;
   gradeError: string | null;
   revealedAt: number | null;
   summary: { introduced: number; total: number } | null;
@@ -139,7 +146,7 @@ type MachineAction =
   | { type: "STUDY_NEXT" }
   | { type: "RECALL_STARTED"; session: SessionView; cards: QuickRecallCard[] }
   | { type: "REVEALED"; eventId: string; revealedAt: number }
-  | { type: "GRADE_PENDING" }
+  | { type: "GRADE_PENDING"; rating: GradeRating }
   | { type: "GRADE_FAILED"; message: string }
   | { type: "GRADE_ADVANCED"; session: SessionView }
   | { type: "SUMMARY"; introduced: number; total: number }
@@ -168,6 +175,7 @@ const INITIAL_STATE: MachineState = {
   queueIndex: 0,
   gradeEventId: null,
   gradePending: false,
+  pendingRating: null,
   gradeError: null,
   revealedAt: null,
   summary: null,
@@ -282,6 +290,7 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
         phase: "QUICK_RECALL_QUESTION",
         gradeError: null,
         gradeEventId: null,
+        pendingRating: null,
         revealedAt: null,
       };
     case "REVEALED":
@@ -291,16 +300,18 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
         gradeEventId: action.eventId,
         revealedAt: action.revealedAt,
         gradeError: null,
+        pendingRating: null,
       };
     case "GRADE_PENDING":
-      return { ...state, gradePending: true, gradeError: null };
+      return { ...state, gradePending: true, pendingRating: action.rating, gradeError: null };
     case "GRADE_FAILED":
-      return { ...state, gradePending: false, gradeError: action.message };
+      return { ...state, gradePending: false, pendingRating: null, gradeError: action.message };
     case "GRADE_ADVANCED": {
       const done = action.session.position >= action.session.cards.length;
       return {
         ...state,
         gradePending: false,
+        pendingRating: null,
         session: action.session,
         queueIndex: action.session.position,
         gradeEventId: null,
@@ -740,9 +751,11 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
   const rate = useCallback(
     async (rating: GradeRating) => {
       const current = stateRef.current;
-      const sessionId = current.session?.session_id;
-      const cardKey = current.session?.cards[current.queueIndex]?.presented_card_key;
+      const session = current.session;
+      const sessionId = session?.session_id;
+      const cardKey = session?.cards[current.queueIndex]?.presented_card_key;
       if (
+        !session ||
         !sessionId ||
         !cardKey ||
         !current.gradeEventId ||
@@ -751,23 +764,61 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
       ) {
         return;
       }
-      dispatch({ type: "GRADE_PENDING" });
+      dispatch({ type: "GRADE_PENDING", rating });
       try {
-        await api.gradeReview({
-          event_id: current.gradeEventId,
-          session_id: sessionId,
-          card_key: cardKey,
-          rating,
-          duration_ms: Math.max(Date.now() - current.revealedAt, 0),
-        });
-        // The client advances only on success, after re-reading the session
-        // (the advanced position lives server-side).
-        const refreshed = await api.getStudySession(sessionId);
-        await syncPendingPresentations();
-        dispatch({ type: "GRADE_ADVANCED", session: refreshed });
-        if (refreshed.position >= refreshed.cards.length) {
-          await refreshSummary();
+        const durationMs = Math.max(Date.now() - current.revealedAt, 0);
+        const activeGroup = groupQuickRecallCards(current.recallCards ?? []).find(
+          (group) =>
+            current.queueIndex >= group.rawStart &&
+            current.queueIndex < group.rawStart + group.rawLength,
+        );
+        // A resumed legacy session may already be partway through a grouped
+        // word. Grade only the still-current suffix of that visible group.
+        const gradedCount = activeGroup
+          ? activeGroup.rawStart + activeGroup.rawLength - current.queueIndex
+          : 1;
+        const cardsToGrade = session.cards.slice(
+          current.queueIndex,
+          current.queueIndex + gradedCount,
+        );
+        if (cardsToGrade.length > 1) {
+          await api.gradeReviewBatch({
+            session_id: sessionId,
+            grades: cardsToGrade.map((card, index) => ({
+              event_id: index === 0 ? current.gradeEventId! : `${current.gradeEventId!}:${index}`,
+              card_key: card.presented_card_key,
+            })),
+            rating,
+            duration_ms: durationMs,
+          });
+        } else {
+          await api.gradeReview({
+            event_id: current.gradeEventId,
+            session_id: sessionId,
+            card_key: cardKey,
+            rating,
+            duration_ms: durationMs,
+          });
         }
+        // A successful grade atomically advances the server position. Mirror
+        // that known result locally instead of paying for a second network
+        // round trip before painting the next card.
+        const nextPosition = Math.min(
+          current.queueIndex + cardsToGrade.length,
+          session.cards.length,
+        );
+        const refreshed: SessionView = {
+          ...session,
+          position: nextPosition,
+          current_card_key: session.cards[nextPosition]?.presented_card_key ?? null,
+        };
+        dispatch({ type: "GRADE_ADVANCED", session: refreshed });
+        void (async () => {
+          await syncPendingPresentations();
+          if (refreshed.position >= refreshed.cards.length) {
+            await refreshSummary();
+          }
+        })();
       } catch (cause) {
         dispatch({ type: "GRADE_FAILED", message: messageFor(cause) });
       }
@@ -786,6 +837,7 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
       state.words[state.studyIndex]?.wordKey ?? "",
     ),
     gradePending: state.gradePending,
+    pendingRating: state.pendingRating,
     gradeError: state.gradeError,
     recallCards: state.recallCards,
     queueIndex: state.queueIndex,

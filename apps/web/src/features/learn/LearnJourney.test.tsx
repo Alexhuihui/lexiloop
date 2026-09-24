@@ -203,8 +203,8 @@ describe("new-word learning journey", () => {
     expect(screen.getByText(/选择评分/)).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "良好" }));
-    // The grade advances the session position server-side; the client
-    // re-reads the session before enabling the next card.
+    // The grade advances the session position server-side; the client mirrors
+    // that successful result locally without a redundant session GET.
     await screen.findByText(/第 2 张 \/ 共 5 张/);
     const grades = gradeRequests(server.requests);
     expect(grades).toHaveLength(1);
@@ -271,6 +271,7 @@ describe("new-word learning journey", () => {
     await user.click(screen.getByRole("button", { name: "良好" }));
     // Pending: every rating control is disabled, the card does not advance.
     expect((screen.getByRole("button", { name: "良好" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole("button", { name: "良好" }).getAttribute("aria-pressed")).toBe("true");
     expect((screen.getByRole("button", { name: "再次" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByText(/第 2 张/)).toBeNull();
 
