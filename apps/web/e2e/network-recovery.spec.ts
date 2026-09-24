@@ -163,6 +163,7 @@ test("R2 denial surfaces inline without blocking study", async ({ page }) => {
   await page.getByRole("button", { name: "开始学习" }).click();
   await expect(page.getByText(`第 1 词 / 共 ${groupSize} 词`)).toBeVisible();
   await expect(page.getByRole("heading", { name: "anchor", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "播放单词音频" }).click();
   await expect(page.getByText("音频暂时无法播放，可先继续学习。")).toBeVisible();
   await page.getByRole("button", { name: "很陌生" }).click();
   if (groupSize > 1) {
