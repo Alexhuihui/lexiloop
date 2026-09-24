@@ -61,4 +61,3 @@ resources closer to users in mainland China.
 - Five fresh grade/undo samples are recorded. The target is Worker grade p50
   below 1 second and client-observed grade p50 below 2 seconds; actual measured
   values are reported without hiding a miss.
-
