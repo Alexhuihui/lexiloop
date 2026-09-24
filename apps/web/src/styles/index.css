@@ -345,11 +345,14 @@ ul { padding-left: 1.2rem; }
 .choice-chip {
   padding: 0 8px; color: var(--ink-soft); background: #f1f0ea;
   border: 1px solid transparent; border-radius: 11px; font-weight: 700; cursor: pointer;
+  touch-action: manipulation;
 }
+.choice-chip:active:not(:disabled) { transform: scale(0.98); }
 .choice-chip[aria-pressed="true"] {
   color: var(--brand); background: var(--brand-soft); border-color: rgba(23,74,59,0.3);
 }
 .choice-chip:disabled { opacity: 0.52; }
+.choice-chip:disabled[aria-pressed="true"] { opacity: 1; }
 .study-card__footer { margin-top: 16px; }
 .recall-card__prompt {
   min-height: 180px; display: grid; place-items: center;

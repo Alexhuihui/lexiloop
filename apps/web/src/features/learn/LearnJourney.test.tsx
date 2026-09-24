@@ -86,6 +86,42 @@ afterEach(() => {
 });
 
 describe("new-word learning journey", () => {
+  it("selects familiarity immediately and does not let a slow save block the next word", async () => {
+    const server = createFakeServer();
+    const user = userEvent.setup();
+    const pendingFamiliarity = new Promise<Response>(() => undefined);
+
+    renderLearn((url, init) => {
+      if (
+        new URL(url).pathname.startsWith("/api/study/sessions/") &&
+        init?.method === "PATCH"
+      ) {
+        const body = JSON.parse(String(init.body)) as { action?: string; word_key?: string };
+        if (body.action === "FAMILIARITY_SET" && body.word_key === "w-1") {
+          // Model a high-latency mobile request. The UI must not wait for it
+          // before painting the choice or enabling the next word's controls.
+          return pendingFamiliarity;
+        }
+      }
+      return server.stub(url, init);
+    });
+
+    await startSession();
+    await screen.findByRole("heading", { name: "abandon" });
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: "有印象" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    await user.click(screen.getByRole("button", { name: "有印象" }));
+    expect(screen.getByRole("button", { name: "有印象" }).getAttribute("aria-pressed")).toBe("true");
+
+    await user.click(screen.getByRole("button", { name: "下一词" }));
+    await screen.findByRole("heading", { name: "ability" });
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: "很陌生" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
   it("runs the full journey: familiarity for every studied word without grades, multi-card quick recall in queue order, reveal before rating, and group completion", async () => {
     const server = createFakeServer();
     const user = userEvent.setup();

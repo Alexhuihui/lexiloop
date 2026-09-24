@@ -21,9 +21,12 @@
  * - A failed (network) patch is retried through `retryPresentation` — or the
  *   recall/complete-phase retry control — with the SAME event id; no second
  *   event is ever generated for one presentation.
- * - A familiarity choice sends FAMILIARITY_SET (fresh event id per choice;
- *   it may be changed while the word is current) and NEVER calls the
- *   grade endpoint.
+ * - A familiarity choice updates the UI optimistically, then sends
+ *   FAMILIARITY_SET in the background (fresh event id per choice; it may be
+ *   changed while the word is current) and NEVER calls the grade endpoint.
+ *   Pending writes are tracked per word so a slow save for the previous word
+ *   never blocks the next word's controls; a failed save rolls back the
+ *   optimistic choice.
  * - Grading happens only in QUICK_RECALL_REVEALED: one client-generated
  *   `event_id` per reveal->rating cycle; the SAME id is replayed when the
  *   grade request fails; the next card is enabled only after the grade and
@@ -105,7 +108,7 @@ interface MachineState {
   starting: boolean;
   setupError: string | null;
   presentationKey: string | null;
-  familiarityPending: boolean;
+  familiarityPendingWordKeys: string[];
   recallCards: QuickRecallCard[] | null;
   queueIndex: number;
   gradeEventId: string | null;
@@ -140,9 +143,17 @@ type MachineAction =
   | { type: "GRADE_FAILED"; message: string }
   | { type: "GRADE_ADVANCED"; session: SessionView }
   | { type: "SUMMARY"; introduced: number; total: number }
-  | { type: "FAMILIARITY_PENDING" }
-  | { type: "FAMILIARITY_ACKED"; wordKey: string; choice: FamiliarityChoice }
-  | { type: "FAMILIARITY_FAILED" };
+  | {
+      type: "FAMILIARITY_PENDING";
+      wordKey: string;
+      choice: FamiliarityChoice;
+    }
+  | { type: "FAMILIARITY_ACKED"; wordKey: string }
+  | {
+      type: "FAMILIARITY_FAILED";
+      wordKey: string;
+      previousChoice: FamiliarityChoice | null;
+    };
 
 const INITIAL_STATE: MachineState = {
   phase: "SETUP",
@@ -152,7 +163,7 @@ const INITIAL_STATE: MachineState = {
   starting: false,
   setupError: null,
   presentationKey: null,
-  familiarityPending: false,
+  familiarityPendingWordKeys: [],
   recallCards: null,
   queueIndex: 0,
   gradeEventId: null,
@@ -300,18 +311,34 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
     case "SUMMARY":
       return { ...state, summary: { introduced: action.introduced, total: action.total } };
     case "FAMILIARITY_PENDING":
-      return { ...state, familiarityPending: true };
-    case "FAMILIARITY_ACKED":
       return {
         ...state,
-        familiarityPending: false,
+        familiarityPendingWordKeys: state.familiarityPendingWordKeys.includes(action.wordKey)
+          ? state.familiarityPendingWordKeys
+          : [...state.familiarityPendingWordKeys, action.wordKey],
         words: updateWord(state.words, action.wordKey, (word) => ({
           ...word,
           familiarity: action.choice,
         })),
       };
+    case "FAMILIARITY_ACKED":
+      return {
+        ...state,
+        familiarityPendingWordKeys: state.familiarityPendingWordKeys.filter(
+          (wordKey) => wordKey !== action.wordKey,
+        ),
+      };
     case "FAMILIARITY_FAILED":
-      return { ...state, familiarityPending: false };
+      return {
+        ...state,
+        familiarityPendingWordKeys: state.familiarityPendingWordKeys.filter(
+          (wordKey) => wordKey !== action.wordKey,
+        ),
+        words: updateWord(state.words, action.wordKey, (word) => ({
+          ...word,
+          familiarity: action.previousChoice,
+        })),
+      };
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -374,6 +401,7 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
   const stateRef = useRef(state);
   const contentRequestsRef = useRef(new Set<string>());
   const backgroundContentFailuresRef = useRef(new Set<string>());
+  const familiarityRequestsRef = useRef(new Set<string>());
   stateRef.current = state;
 
   const loadContent = useCallback(
@@ -600,13 +628,18 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
     async (wordKey: string, choice: FamiliarityChoice) => {
       const current = stateRef.current;
       const word = current.words.find((candidate) => candidate.wordKey === wordKey);
-      if (!word || !current.session || current.familiarityPending) {
+      if (!word || !current.session || familiarityRequestsRef.current.has(wordKey)) {
         return;
       }
       if (word.presentation !== "acked") {
         return; // the controls are disabled until the ack anyway
       }
-      dispatch({ type: "FAMILIARITY_PENDING" });
+      const previousChoice = word.familiarity;
+      familiarityRequestsRef.current.add(wordKey);
+      // Paint the selected state immediately. Persistence continues in the
+      // background, so the network round trip is no longer interaction
+      // latency from the learner's point of view.
+      dispatch({ type: "FAMILIARITY_PENDING", wordKey, choice });
       try {
         // A fresh event per choice; changing the choice while the word is
         // current simply sends another FAMILIARITY_SET. Never a grade call.
@@ -616,9 +649,11 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
           word_key: wordKey,
           familiarity: choice,
         });
-        dispatch({ type: "FAMILIARITY_ACKED", wordKey, choice });
+        dispatch({ type: "FAMILIARITY_ACKED", wordKey });
       } catch {
-        dispatch({ type: "FAMILIARITY_FAILED" });
+        dispatch({ type: "FAMILIARITY_FAILED", wordKey, previousChoice });
+      } finally {
+        familiarityRequestsRef.current.delete(wordKey);
       }
     },
     [api],
@@ -747,7 +782,9 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
     studyIndex: state.studyIndex,
     starting: state.starting,
     setupError: state.setupError,
-    familiarityPending: state.familiarityPending,
+    familiarityPending: state.familiarityPendingWordKeys.includes(
+      state.words[state.studyIndex]?.wordKey ?? "",
+    ),
     gradePending: state.gradePending,
     gradeError: state.gradeError,
     recallCards: state.recallCards,
