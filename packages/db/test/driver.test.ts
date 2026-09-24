@@ -89,6 +89,13 @@ describe("driver-agnostic repositories", () => {
       // Alias resolution: no edge -> identity; canonical root disagreement throws.
       const aliases = new AliasRepository(db);
       await expect(aliases.resolve({ releaseId: "r-driver-2", key: "word-1" })).resolves.toBe("word-1");
+      const aliasSnapshot = await aliases.snapshot("r-driver-2");
+      await expect(aliasSnapshot.resolveMany(["word-1", "word-2"])).resolves.toEqual(
+        new Map([
+          ["word-1", "word-1"],
+          ["word-2", "word-2"],
+        ]),
+      );
 
       const users = new UserRepository(db);
       const user = await users.create({

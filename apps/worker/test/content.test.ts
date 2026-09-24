@@ -883,7 +883,9 @@ describe("production entry point (src/index.ts)", () => {
           all: async () => ({ results: handlerFor(query), meta: { rows_read: 2, rows_written: 0 } }),
           // drizzle's D1 driver maps selected rows through the raw() path
           // (array rows in column order), so both shapes are served here.
-          raw: async () => handlerFor(query).map((row) => Object.values(row)),
+          raw: async () => query.includes("auth_session") && query.includes("app_user")
+            ? [[...Object.values(sessionRow), ...Object.values(userRow)]]
+            : handlerFor(query).map((row) => Object.values(row)),
           run: async () => ({ results: [], meta: { rows_read: 0, rows_written: 1 } }),
           first: async () => handlerFor(query)[0] ?? null,
         };

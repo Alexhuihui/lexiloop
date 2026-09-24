@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Hono } from "hono";
 import {
   CardStateRepository,
@@ -13,6 +13,8 @@ import { createMigratedTestDb, type TestDatabase } from "../../../packages/db/te
 import { buildApp, type AppEnv, type LoginRateLimiter, type WorkerDeps } from "../src/app";
 import { hashPassword } from "../src/auth/password";
 import { SESSION_COOKIE } from "../src/auth/session";
+import { StudyService } from "../src/study/service";
+import { gradeReview, gradeReviewBatch } from "../src/study/grade";
 
 /**
  * Task 13 acceptance tests (spec 5.7/6.4/8.3, plan step 3): the
@@ -504,6 +506,17 @@ describe("POST /api/study/sessions", () => {
     expect(body.current_card_key).toBe("k-wm-1");
   });
 
+  it("resolves several presented cards through one reusable alias snapshot", async () => {
+    const created = await createSession(fx.bobAuth, "NEW_WORDS");
+    const service = new StudyService(fx.db, () => T0);
+    const session = await service.requireSession(fx.bob, created.body.session_id);
+
+    const resolved = await service.resolvePresentedMany(session, ["k-wm-1", "k-wm-2"]);
+
+    expect(resolved.items.map((item) => item.canonicalCardKey)).toEqual(["k-wm-1", "k-wm-2"]);
+    expect(resolved.items.every((item) => item.localWordKey === "w1")).toBe(true);
+  });
+
   it("offers only the missing card of an introduced word as the QUICK_TEST (supplemental) queue", async () => {
     const { status, body } = await createSession(fx.aliceAuth, "QUICK_TEST");
     expect(status).toBe(201);
@@ -826,6 +839,40 @@ describe("PATCH /api/study/sessions/:id (StudyPatch)", () => {
 });
 
 describe("POST /api/reviews/grade", () => {
+  it("uses batched state and idempotency reads for single and grouped grades", async () => {
+    const singleSession = await createSession(fx.bobAuth, "NEW_WORDS");
+    const singleService = new StudyService(fx.db, () => T0);
+    const singleStateBatch = vi.spyOn(singleService.cardStates, "getMany");
+    const singleStateRead = vi.spyOn(singleService.cardStates, "get");
+    await gradeReview(singleService, fx.bob, {
+      event_id: "evt-batched-single",
+      session_id: singleSession.body.session_id,
+      card_key: "k-wm-1",
+      rating: 3,
+    });
+    expect(singleStateBatch).toHaveBeenCalledTimes(1);
+    expect(singleStateRead).not.toHaveBeenCalled();
+
+    const batchSession = await createSession(fx.bobAuth, "NEW_WORDS");
+    const batchService = new StudyService(fx.db, () => T0);
+    const logBatch = vi.spyOn(batchService.reviewLogs, "getMany");
+    const logRead = vi.spyOn(batchService.reviewLogs, "get");
+    const stateBatch = vi.spyOn(batchService.cardStates, "getMany");
+    const stateRead = vi.spyOn(batchService.cardStates, "get");
+    await gradeReviewBatch(batchService, fx.bob, {
+      session_id: batchSession.body.session_id,
+      grades: [
+        { event_id: "evt-batched-1", card_key: "k-wm-1" },
+        { event_id: "evt-batched-2", card_key: "k-wm-2" },
+      ],
+      rating: 3,
+    });
+    expect(logBatch).toHaveBeenCalledTimes(1);
+    expect(logRead).not.toHaveBeenCalled();
+    expect(stateBatch).toHaveBeenCalledTimes(1);
+    expect(stateRead).not.toHaveBeenCalled();
+  });
+
   it("atomically grades consecutive same-word meaning cards and advances by the batch size", async () => {
     const created = await createSession(fx.bobAuth, "NEW_WORDS");
     const request = {

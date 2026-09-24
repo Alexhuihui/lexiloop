@@ -29,6 +29,7 @@ import {
   word,
   wordProgress,
   type AtomicBatchRunner,
+  type AliasSnapshot,
   type CardDefinitionRow,
   type LexiloopDatabase,
   type StudySessionMode,
@@ -88,6 +89,18 @@ export interface SessionView {
   /** Distinct release-local word keys of the snapshot's cards (sorted).
    *  Lets a resuming client verify the session matches its study selection. */
   word_keys: string[];
+}
+
+export interface ResolvedPresentedCard {
+  card: CardDefinitionRow;
+  canonicalCardKey: string;
+  canonicalWordKey: string;
+  localWordKey: string;
+}
+
+export interface ResolvedPresentedCards {
+  items: ResolvedPresentedCard[];
+  aliases: AliasSnapshot;
 }
 
 function sessionViewFromDefinitions(
@@ -385,13 +398,33 @@ export class StudyService {
     session: StudySessionRecord,
     presentedCardKey: string,
   ): Promise<{ card: CardDefinitionRow; canonicalCardKey: string; canonicalWordKey: string; localWordKey: string }> {
-    const card = await this.content.getCard(session.releaseId, presentedCardKey);
-    if (!card) {
-      throw new StudyHttpError(400, "STUDY_CARD_INVALID", "Card does not exist in the session's pinned release");
-    }
-    const canonicalCardKey = await this.aliases.resolve({ releaseId: session.releaseId, key: presentedCardKey });
-    const canonicalWordKey = await this.aliases.resolve({ releaseId: session.releaseId, key: card.wordKey });
-    return { card, canonicalCardKey, canonicalWordKey, localWordKey: card.wordKey };
+    const resolved = await this.resolvePresentedMany(session, [presentedCardKey]);
+    return resolved.items[0]!;
+  }
+
+  /** Resolves several cards from one definition query and one fresh alias
+   * snapshot while preserving the caller's order. */
+  async resolvePresentedMany(
+    session: StudySessionRecord,
+    presentedCardKeys: readonly string[],
+  ): Promise<ResolvedPresentedCards> {
+    const [cards, aliases] = await Promise.all([
+      this.content.getCards(session.releaseId, presentedCardKeys),
+      this.aliases.snapshot(session.releaseId),
+    ]);
+    const byKey = new Map(cards.map((card) => [card.contentCardKey, card]));
+    const items = await Promise.all(presentedCardKeys.map(async (presentedCardKey) => {
+      const card = byKey.get(presentedCardKey);
+      if (!card) {
+        throw new StudyHttpError(400, "STUDY_CARD_INVALID", "Card does not exist in the session's pinned release");
+      }
+      const [canonicalCardKey, canonicalWordKey] = await Promise.all([
+        aliases.resolve(presentedCardKey),
+        aliases.resolve(card.wordKey),
+      ]);
+      return { card, canonicalCardKey, canonicalWordKey, localWordKey: card.wordKey };
+    }));
+    return { items, aliases };
   }
 
   /**
@@ -399,10 +432,17 @@ export class StudyService {
    * keys are release-local, so each resolves through the alias repository
    * before comparison with (canonically keyed) card_state rows.
    */
-  async canonicalCardKeys(releaseId: string, localWordKey: string): Promise<string[]> {
-    const rows = await this.definitionsOf(releaseId, [localWordKey]);
+  async canonicalCardKeys(
+    releaseId: string,
+    localWordKey: string,
+    aliasSnapshot?: AliasSnapshot,
+  ): Promise<string[]> {
+    const [rows, aliases] = await Promise.all([
+      this.definitionsOf(releaseId, [localWordKey]),
+      aliasSnapshot ? Promise.resolve(aliasSnapshot) : this.aliases.snapshot(releaseId),
+    ]);
     const activeKeys = rows.filter((row) => row.status === "ACTIVE").map((row) => row.contentCardKey);
-    const roots = await this.aliases.resolveMany({ releaseId, keys: activeKeys });
+    const roots = await aliases.resolveMany(activeKeys);
     const keys = new Set(activeKeys.map((key) => roots.get(key)!));
     return [...keys];
   }

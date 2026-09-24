@@ -186,6 +186,8 @@ describe("cross-user isolation", () => {
   it("never returns another user's card state", async () => {
     const { alice, cardStates } = fx;
     await expect(cardStates.get(alice, fx.bobCardKey)).resolves.toBeUndefined();
+    const many = await cardStates.getMany(alice, [fx.bobCardKey, fx.aliceCardKey, fx.aliceCardKey]);
+    expect(many.map((row) => row.contentCardKey)).toEqual([fx.aliceCardKey]);
     const due = await cardStates.getDue(alice, T0 + 4 * HOUR, 50);
     expect(due.map((row) => row.contentCardKey)).toEqual([fx.aliceCardKey]);
   });
@@ -197,6 +199,8 @@ describe("cross-user isolation", () => {
     expect(recent.map((row) => row.eventId)).toEqual([fx.aliceEventId]);
     // Bob's context cannot read Alice's event either.
     await expect(reviewLogs.get(fx.bob, fx.aliceEventId)).resolves.toBeUndefined();
+    const many = await reviewLogs.getMany(alice, [fx.bobEventId, fx.aliceEventId, fx.aliceEventId]);
+    expect(many.map((row) => row.eventId)).toEqual([fx.aliceEventId]);
   });
 
   it("never returns another user's study session", async () => {

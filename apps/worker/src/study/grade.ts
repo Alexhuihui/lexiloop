@@ -83,14 +83,26 @@ export async function gradeReview(
   ctx: UserContext,
   request: GradeRequest,
 ): Promise<GradeResult> {
-  // 1. event_id idempotency (spec 8.3): replay the prior result verbatim.
-  const existing = await service.reviewLogs.get(ctx, request.event_id);
+  // Idempotency and the owned session are independent reads. Keep the
+  // historical single-grade behavior where a recorded event replays even if
+  // its old session has since expired.
+  const [existingResult, sessionResult] = await Promise.allSettled([
+    service.reviewLogs.get(ctx, request.event_id),
+    service.requireSession(ctx, request.session_id),
+  ]);
+  if (existingResult.status === "rejected") {
+    throw existingResult.reason;
+  }
+  const existing = existingResult.value;
   if (existing) {
     return toResult(existing, request.session_id, true);
   }
+  if (sessionResult.status === "rejected") {
+    throw sessionResult.reason;
+  }
 
   // 2. study-session queue position.
-  const session = await service.requireSession(ctx, request.session_id);
+  const session = sessionResult.value;
   const current = service.currentCard(session);
   if (!current) {
     throw new StudyHttpError(409, "STUDY_QUEUE_EXHAUSTED", "Every card in this session has been answered");
@@ -100,24 +112,26 @@ export async function gradeReview(
   }
 
   // 3. card validity in the session's pinned release + alias resolution.
-  const resolved = await service.resolvePresented(session, current.presented_card_key);
+  const resolvedCards = await service.resolvePresentedMany(session, [current.presented_card_key]);
+  const resolved = resolvedCards.items[0]!;
   const now = service.now();
 
-  // 4. server-side FSRS on the canonical state.
-  const before = (await service.cardStates.get(ctx, resolved.canonicalCardKey))?.state ?? null;
+  // 4. The remaining state reads depend only on resolved keys and therefore
+  // share one network phase. getMany also keeps grouped grading under D1's
+  // simultaneous-connection limit.
+  const [stateRows, canonicalKeys, progress] = await Promise.all([
+    service.cardStates.getMany(ctx, [resolved.canonicalCardKey]),
+    service.canonicalCardKeys(session.releaseId, resolved.localWordKey, resolvedCards.aliases),
+    service.words.get(ctx, resolved.canonicalWordKey),
+  ]);
+  const before = stateRows[0]?.state ?? null;
   const outcome = gradeCard({ before, rating: request.rating, reviewedAt: now });
-
-  // The word's active cards in the PINNED release, in canonical keys — the
-  // completeness check compares canonically keyed card_state rows, so it
-  // stays correct across aliased (renamed) cards.
-  const canonicalKeys = await service.canonicalCardKeys(session.releaseId, resolved.localWordKey);
 
   const statements: SQL[] = [
     sqlInsertReviewLog(ctx.userId, request, resolved.canonicalCardKey, session.releaseId, outcome, now),
     sqlUpsertCardState(ctx.userId, resolved.canonicalCardKey, outcome.after, now),
     sql`UPDATE study_session SET position = position + 1 WHERE session_id = ${session.sessionId} AND user_id = ${ctx.userId}`,
   ];
-  const progress = await service.words.get(ctx, resolved.canonicalWordKey);
   // Flip only a first-introduction word (IN_PROGRESS) whose active cards are
   // now ALL graded; the count is evaluated INSIDE the batch, after the
   // card_state upsert, so the flip is atomic with the grade that completed it.
@@ -170,11 +184,13 @@ export async function gradeReviewBatch(
   ctx: UserContext,
   request: GradeBatchRequest,
 ): Promise<GradeBatchResult> {
-  const existing = await Promise.all(
-    request.grades.map((grade) => service.reviewLogs.get(ctx, grade.event_id)),
-  );
+  const [existingRows, session] = await Promise.all([
+    service.reviewLogs.getMany(ctx, request.grades.map((grade) => grade.event_id)),
+    service.requireSession(ctx, request.session_id),
+  ]);
+  const existingById = new Map(existingRows.map((record) => [record.eventId, record]));
+  const existing = request.grades.map((grade) => existingById.get(grade.event_id));
   if (existing.every((record) => record !== undefined)) {
-    const session = await service.requireSession(ctx, request.session_id);
     return {
       session_id: request.session_id,
       position: session.position,
@@ -190,7 +206,6 @@ export async function gradeReviewBatch(
     );
   }
 
-  const session = await service.requireSession(ctx, request.session_id);
   const queued = session.queue.cards.slice(
     session.position,
     session.position + request.grades.length,
@@ -204,9 +219,11 @@ export async function gradeReviewBatch(
     }
   }
 
-  const resolved = await Promise.all(
-    queued.map((card) => service.resolvePresented(session, card.presented_card_key)),
+  const resolvedCards = await service.resolvePresentedMany(
+    session,
+    queued.map((card) => card.presented_card_key),
   );
+  const resolved = resolvedCards.items;
   const localWordKey = resolved[0]?.localWordKey;
   if (
     !localWordKey ||
@@ -233,9 +250,13 @@ export async function gradeReviewBatch(
     rating: request.rating,
     ...(perCardDuration === undefined ? {} : { duration_ms: perCardDuration }),
   }));
-  const beforeStates = await Promise.all(
-    resolved.map(async (item) => (await service.cardStates.get(ctx, item.canonicalCardKey))?.state ?? null),
-  );
+  const [stateRows, canonicalKeys, progress] = await Promise.all([
+    service.cardStates.getMany(ctx, resolved.map((item) => item.canonicalCardKey)),
+    service.canonicalCardKeys(session.releaseId, localWordKey, resolvedCards.aliases),
+    service.words.get(ctx, resolved[0]!.canonicalWordKey),
+  ]);
+  const statesByKey = new Map(stateRows.map((record) => [record.contentCardKey, record.state]));
+  const beforeStates = resolved.map((item) => statesByKey.get(item.canonicalCardKey) ?? null);
   const outcomes = beforeStates.map((before) =>
     gradeCard({ before, rating: request.rating, reviewedAt: now }),
   );
@@ -258,8 +279,6 @@ export async function gradeReviewBatch(
   statements.push(
     sql`UPDATE study_session SET position = position + ${request.grades.length} WHERE session_id = ${session.sessionId} AND user_id = ${ctx.userId}`,
   );
-  const canonicalKeys = await service.canonicalCardKeys(session.releaseId, localWordKey);
-  const progress = await service.words.get(ctx, resolved[0]!.canonicalWordKey);
   if (progress && progress.stage === "IN_PROGRESS" && canonicalKeys.length > 0) {
     statements.push(
       sqlFlipWordIntroduced(
@@ -276,9 +295,12 @@ export async function gradeReviewBatch(
     await service.atomic.run(statements);
   } catch (error) {
     if (isUniqueEventIdViolation(error)) {
-      const winners = await Promise.all(
-        request.grades.map((grade) => service.reviewLogs.get(ctx, grade.event_id)),
+      const winnerRows = await service.reviewLogs.getMany(
+        ctx,
+        request.grades.map((grade) => grade.event_id),
       );
+      const winnerById = new Map(winnerRows.map((record) => [record.eventId, record]));
+      const winners = request.grades.map((grade) => winnerById.get(grade.event_id));
       if (winners.every((record) => record !== undefined)) {
         const refreshed = await service.requireSession(ctx, request.session_id);
         return {

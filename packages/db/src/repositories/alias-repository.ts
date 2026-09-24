@@ -9,6 +9,12 @@ export interface ResolveAliasInput {
   key: string;
 }
 
+/** One immutable alias-table read reused across a grading request. */
+export interface AliasSnapshot {
+  resolve(key: string): Promise<string>;
+  resolveMany(keys: readonly string[]): Promise<Map<string, string>>;
+}
+
 /** One row of the release-scoped `content_key_alias` table (insert shape). */
 export interface AliasRowInput {
   /**
@@ -64,6 +70,12 @@ export class AliasRepository {
    * canonical-root failures, without per-key round trips on D1.
    */
   async resolveMany(input: { releaseId: string; keys: readonly string[] }): Promise<Map<string, string>> {
+    return await (await this.snapshot(input.releaseId)).resolveMany(input.keys);
+  }
+
+  /** Loads the small migration-edge table once so several dependent reads do
+   * not each pay another D1 network round trip. */
+  async snapshot(releaseId: string): Promise<AliasSnapshot> {
     const byFrom = new Map<string, ContentKeyAliasRow[]>();
     for (const edge of await this.db.select().from(contentKeyAlias)) {
       const edges = byFrom.get(edge.fromKey);
@@ -73,11 +85,18 @@ export class AliasRepository {
         byFrom.set(edge.fromKey, [edge]);
       }
     }
-    const resolved = new Map<string, string>();
-    for (const key of new Set(input.keys)) {
-      resolved.set(key, await this.walk(input.releaseId, key, async (fromKey) => byFrom.get(fromKey) ?? []));
-    }
-    return resolved;
+    const resolve = async (key: string): Promise<string> =>
+      await this.walk(releaseId, key, async (fromKey) => byFrom.get(fromKey) ?? []);
+    return {
+      resolve,
+      resolveMany: async (keys: readonly string[]): Promise<Map<string, string>> => {
+        const resolved = new Map<string, string>();
+        for (const key of new Set(keys)) {
+          resolved.set(key, await resolve(key));
+        }
+        return resolved;
+      },
+    };
   }
 
   /**

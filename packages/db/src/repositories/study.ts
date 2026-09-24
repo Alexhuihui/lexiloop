@@ -153,6 +153,19 @@ export class CardStateRepository {
     return row ? toCardStateRecord(row) : undefined;
   }
 
+  /** Reads a bounded grading batch in one indexed query. */
+  async getMany(ctx: UserContext, contentCardKeys: readonly string[]): Promise<CardStateRecord[]> {
+    const unique = [...new Set(contentCardKeys)];
+    if (unique.length === 0) {
+      return [];
+    }
+    return (await this.db
+      .select()
+      .from(cardState)
+      .where(and(eq(cardState.userId, ctx.userId), inArray(cardState.contentCardKey, unique))))
+      .map(toCardStateRecord);
+  }
+
   async upsert(ctx: UserContext, input: UpsertCardStateInput): Promise<CardStateRecord> {
     const state = validateFsrsState(input.state);
     const blob = JSON.stringify(state);
@@ -289,6 +302,19 @@ export class ReviewLogRepository {
       .where(and(eq(reviewLog.eventId, eventId), eq(reviewLog.userId, ctx.userId)))
       .get();
     return row ? toReviewLogRecord(row) : undefined;
+  }
+
+  /** Reads an idempotency batch in one indexed query; callers restore request order. */
+  async getMany(ctx: UserContext, eventIds: readonly string[]): Promise<ReviewLogRecord[]> {
+    const unique = [...new Set(eventIds)];
+    if (unique.length === 0) {
+      return [];
+    }
+    return (await this.db
+      .select()
+      .from(reviewLog)
+      .where(and(eq(reviewLog.userId, ctx.userId), inArray(reviewLog.eventId, unique))))
+      .map(toReviewLogRecord);
   }
 
   /**
