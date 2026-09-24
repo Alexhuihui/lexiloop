@@ -22,6 +22,8 @@ import { createAppQueryClient } from "../../lib/query-cache";
 import { createAppRoutes } from "../../app/router";
 import {
   K_W1_CONTEXT,
+  K_W1_DISCRIMINATION,
+  K_W1_PHRASE,
   K_W1_WORD,
   K_W2_WORD,
   createReviewServer,
@@ -164,6 +166,38 @@ describe("review journey", () => {
     expect(screen.getByText(/能力；才能/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "良好" }));
     await screen.findByText("本次复习已完成");
+  });
+
+  it("shows and rates every consecutive due card of one word as one review", async () => {
+    const server = createReviewServer({
+      presetSessions: [],
+      queueKeys: [
+        K_W1_CONTEXT,
+        K_W1_WORD,
+        K_W1_PHRASE,
+        K_W1_DISCRIMINATION,
+        K_W2_WORD,
+      ],
+    });
+    const user = userEvent.setup();
+    renderReview(server.stub);
+    await screen.findByRole("heading", { name: "复习" });
+    await user.click(screen.getByRole("button", { name: "开始复习" }));
+
+    await screen.findByText(/第 1 张 \/ 共 2 张/);
+    expect(screen.getByText(/She ＿+ the plan\./)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "揭示答案" }));
+    await user.click(screen.getByRole("button", { name: "良好" }));
+
+    await screen.findByText(/第 2 张 \/ 共 2 张/);
+    await screen.findByRole("heading", { name: "ability" });
+    expect(server.state.positionOf("sess-review-created-1")).toBe(4);
+    const batchRequests = server.requests.filter(
+      ({ url, init }) =>
+        new URL(url).pathname === "/api/reviews/grade-batch" && init?.method === "POST",
+    );
+    expect(batchRequests).toHaveLength(1);
+    expect((batchRequests[0]?.body as { grades: unknown[] }).grades).toHaveLength(4);
   });
 
   it("undoes only the latest grade, rewinds to the undone card, and surfaces a rejection when the worker refuses", async () => {

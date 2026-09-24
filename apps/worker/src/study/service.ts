@@ -190,7 +190,9 @@ export class StudyService {
   }
 
   async listSessions(ctx: UserContext): Promise<SessionView[]> {
-    const records = await this.sessions.listActive(ctx, this.now());
+    const records = (await this.sessions.listActive(ctx, this.now())).filter(
+      (record) => record.position < record.queue.cards.length,
+    );
     const keysByRelease = new Map<string, Set<string>>();
     for (const record of records) {
       const keys = keysByRelease.get(record.releaseId) ?? new Set<string>();
@@ -335,7 +337,9 @@ export class StudyService {
 
   /**
    * REVIEW queue: the user's due cards that the pinned release can present
-   (ACTIVE definitions), ordered by due then canonical stable key (spec 6.3).
+   * (ACTIVE definitions). Words are ordered by their earliest due card; all
+   * cards of that word stay consecutive so the learner rates the word once.
+   * Cards inside a word retain due/key order from the repository.
    */
   private async reviewCards(ctx: UserContext, releaseId: string, now: number): Promise<StudyQueueCard[]> {
     const due = await this.cardStates.getDue(ctx, now, DUE_QUEUE_LIMIT);
@@ -347,11 +351,23 @@ export class StudyService {
       due: record.state.due_at,
     }));
     const presentable = await this.content.getCards(releaseId, candidates.map((c) => c.content_card_key));
-    const presentableKeys = new Set(presentable.filter((row) => row.status === "ACTIVE").map((row) => row.contentCardKey));
-    return dueQueueCards(
-      candidates.filter((candidate) => presentableKeys.has(candidate.content_card_key)),
+    const activeDefinitions = presentable.filter((row) => row.status === "ACTIVE");
+    const wordByCardKey = new Map(
+      activeDefinitions.map((row) => [row.contentCardKey, row.wordKey]),
+    );
+    const ordered = dueQueueCards(
+      candidates.filter((candidate) => wordByCardKey.has(candidate.content_card_key)),
       now,
     );
+    const cardsByWord = new Map<string, StudyQueueCard[]>();
+    for (const card of ordered) {
+      const wordKey = wordByCardKey.get(card.presented_card_key);
+      if (wordKey === undefined) continue;
+      const cards = cardsByWord.get(wordKey);
+      if (cards) cards.push(card);
+      else cardsByWord.set(wordKey, [card]);
+    }
+    return [...cardsByWord.values()].flat();
   }
 
   private definitionsOf(releaseId: string, wordKeys: readonly string[]): Promise<CardDefinitionRow[]> {

@@ -175,9 +175,9 @@ export async function gradeReview(
 }
 
 /**
- * Grades consecutive WORD_MEANING cards for one word in a single atomic
- * write. The content model keeps one FSRS state per sense, while the learner
- * sees and rates the word only once with all of its senses on the back.
+ * Grades consecutive cards for one word in a single atomic write. The
+ * content model keeps separate FSRS states for its recall targets, while the
+ * learner sees and rates the word only once.
  */
 export async function gradeReviewBatch(
   service: StudyService,
@@ -227,14 +227,12 @@ export async function gradeReviewBatch(
   const localWordKey = resolved[0]?.localWordKey;
   if (
     !localWordKey ||
-    resolved.some(
-      (item) => item.localWordKey !== localWordKey || item.card.cardType !== "WORD_MEANING",
-    )
+    resolved.some((item) => item.localWordKey !== localWordKey)
   ) {
     throw new StudyHttpError(
       400,
       "REVIEW_BATCH_INVALID",
-      "Only consecutive WORD_MEANING cards for one word may be graded together",
+      "Only consecutive cards for one word may be graded together",
     );
   }
 

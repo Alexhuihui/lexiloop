@@ -211,6 +211,55 @@ export function createReviewServer(options: ReviewServerOptions = {}): ReviewSer
         ? errorEnvelope("STUDY_SESSION_INVALID", 400)
         : jsonResponse(sessionView(sessionId, position));
     }
+    if (path === "/api/reviews/grade-batch" && method === "POST") {
+      const body = JSON.parse(String(init?.body)) as {
+        session_id: string;
+        grades: Array<{ event_id: string; card_key: string }>;
+        rating: number;
+        duration_ms?: number;
+      };
+      const position = positions.get(body.session_id);
+      if (position === undefined) {
+        return errorEnvelope("STUDY_SESSION_INVALID", 400);
+      }
+      const expected = queue.slice(position, position + body.grades.length);
+      if (
+        expected.length !== body.grades.length ||
+        body.grades.some((grade, index) => grade.card_key !== expected[index])
+      ) {
+        return errorEnvelope("STUDY_CARD_NOT_CURRENT", 409);
+      }
+      for (const grade of body.grades) {
+        events.push({
+          eventId: grade.event_id,
+          rating: body.rating,
+          cardKey: grade.card_key,
+          sessionId: body.session_id,
+          undoneAt: null,
+        });
+      }
+      const nextPosition = position + body.grades.length;
+      positions.set(body.session_id, nextPosition);
+      return jsonResponse({
+        session_id: body.session_id,
+        position: nextPosition,
+        results: body.grades.map((grade) => ({
+          event_id: grade.event_id,
+          session_id: body.session_id,
+          card_key: grade.card_key,
+          presented_card_key: grade.card_key,
+          release_id: "rel-1",
+          rating: body.rating,
+          before_state: null,
+          after_state: AFTER_STATE,
+          reviewed_at: NOW,
+          duration_ms: body.duration_ms ?? null,
+          undone_at: null,
+          replayed: false,
+        })),
+        replayed: false,
+      });
+    }
     if (path === "/api/reviews/grade" && method === "POST") {
       const body = JSON.parse(String(init?.body)) as {
         event_id: string;

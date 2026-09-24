@@ -18,7 +18,7 @@ import { CONTENT_BOOTSTRAP_QUERY_KEY } from "../../lib/query-cache";
 import { createAudioPlayer, type AudioPlayer } from "../../lib/audio";
 import { useKeyboardShortcuts } from "../../lib/keyboard";
 import { useAudioPrefetch } from "../../lib/audio-prefetch";
-import { ReviewCard } from "./ReviewCard";
+import { groupReviewCards, ReviewCard } from "./ReviewCard";
 import { useReviewSession } from "./useReviewSession";
 
 export interface ReviewPageProps {
@@ -53,7 +53,13 @@ export function ReviewPage({ api }: ReviewPageProps): React.JSX.Element {
   }
   useEffect(() => () => playerRef.current?.dispose(), []);
 
-  const currentCard = study.cards[study.queueIndex] ?? null;
+  const reviewGroups = useMemo(() => groupReviewCards(study.cards), [study.cards]);
+  const visibleIndex = reviewGroups.findIndex(
+    (group) =>
+      study.queueIndex >= group.rawStart &&
+      study.queueIndex < group.rawStart + group.rawLength,
+  );
+  const currentCard = visibleIndex >= 0 ? reviewGroups[visibleIndex]!.card : null;
   const currentWordKey = currentCard && currentCard.form !== "generic" ? currentCard.wordKey : null;
   const currentContent = currentWordKey ? (study.contents.get(currentWordKey) ?? null) : null;
   const currentAudioUrl = useMemo(() => {
@@ -109,8 +115,8 @@ export function ReviewPage({ api }: ReviewPageProps): React.JSX.Element {
       {study.phase === "PREPARING" ? <p role="status">正在准备复习…</p> : null}
       {study.phase === "QUESTION" || study.phase === "REVEALED" ? (
         <ReviewCard
-          position={study.queueIndex}
-          total={study.session?.cards.length ?? 0}
+          position={Math.max(visibleIndex, 0)}
+          total={reviewGroups.length}
           card={currentCard}
           content={currentContent}
           revealed={study.phase === "REVEALED"}
@@ -131,7 +137,7 @@ export function ReviewPage({ api }: ReviewPageProps): React.JSX.Element {
         <div className="empty-state complete-state">
           <span aria-hidden="true">✓</span>
           <h2>本次复习已完成</h2>
-          <p>共 {study.session?.cards.length ?? 0} 张卡已评分。</p>
+          <p>共 {reviewGroups.length} 个单词已评分。</p>
           <Link className="btn btn--primary" to="/today">
             回到今日
           </Link>

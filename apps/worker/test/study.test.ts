@@ -3,6 +3,7 @@ import type { Hono } from "hono";
 import {
   CardStateRepository,
   ReleaseRepository,
+  StudySessionRepository,
   UserRepository,
   WordProgressRepository,
   createSqliteDatabase,
@@ -524,7 +525,7 @@ describe("POST /api/study/sessions", () => {
     expect(body.release_id).toBe(R1);
   });
 
-  it("orders the REVIEW queue by due then canonical stable key", async () => {
+  it("orders one review word's cards by due then canonical stable key", async () => {
     const { status, body } = await createSession(fx.aliceAuth, "REVIEW");
     expect(status).toBe(201);
     // due ascending: k-cm-4 and k-wm-1 tie at T0-3000 and fall back to the
@@ -534,6 +535,21 @@ describe("POST /api/study/sessions", () => {
       "k-wm-1",
       "k-sd-0",
       "k-wm-2",
+    ]);
+  });
+
+  it("keeps every due card of a word consecutive in the REVIEW queue", async () => {
+    await seedCardState(fx.db, fx.alice.userId, "k-wm-3", T0 - 2500);
+
+    const { status, body } = await createSession(fx.aliceAuth, "REVIEW");
+
+    expect(status).toBe(201);
+    expect(body.cards.map((card) => card.canonical_card_key)).toEqual([
+      "k-cm-4",
+      "k-wm-1",
+      "k-sd-0",
+      "k-wm-2",
+      "k-wm-3",
     ]);
   });
 
@@ -594,6 +610,20 @@ describe("session resume (GET)", () => {
     }
     const bobRes = await fx.app.request("/api/study/sessions", { headers: { cookie: fx.bobAuth.cookie } });
     expect(((await bobRes.json()) as { sessions: SessionBody[] }).sessions).toHaveLength(0);
+  });
+
+  it("does not list a completed session as resumable", async () => {
+    const created = await createSession(fx.bobAuth, "NEW_WORDS");
+    await new StudySessionRepository(fx.db).patch(fx.bob, created.body.session_id, {
+      position: created.body.cards.length,
+    });
+
+    const response = await fx.app.request("/api/study/sessions", {
+      headers: { cookie: fx.bobAuth.cookie },
+    });
+
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { sessions: SessionBody[] }).sessions).toEqual([]);
   });
 
   it("answers 400 for an expired session", async () => {
@@ -904,6 +934,24 @@ describe("POST /api/reviews/grade", () => {
     expect(replay.status).toBe(200);
     expect(replay.body).toMatchObject({ position: 2, replayed: true });
     expect(replay.body.results.every((result) => result.replayed)).toBe(true);
+  });
+
+  it("atomically grades different due card types of one review word", async () => {
+    const created = await createSession(fx.aliceAuth, "REVIEW");
+    const cards = created.body.cards.map((card) => card.presented_card_key);
+
+    const outcome = await gradeBatch(fx.aliceAuth, {
+      session_id: created.body.session_id,
+      grades: cards.map((cardKey, index) => ({
+        event_id: `evt-review-word-${index}`,
+        card_key: cardKey,
+      })),
+      rating: 3,
+    });
+
+    expect(outcome.status).toBe(200);
+    expect(outcome.body.position).toBe(cards.length);
+    expect(outcome.body.results.map((result) => result.presented_card_key)).toEqual(cards);
   });
 
   it("rejects a batch that crosses words instead of silently over-grading", async () => {

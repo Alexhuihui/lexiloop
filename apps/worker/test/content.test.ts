@@ -840,6 +840,44 @@ describe("GET /api/progress/words batch", () => {
     });
     expect(invalid.status).toBe(400);
   });
+
+  it("reads a 116-word unit without exceeding D1's 100 binding limit", async () => {
+    const keys = Array.from({ length: 116 }, (_, index) => `w-unit-${index + 1}`);
+    await new WordProgressRepository(fx.db).upsert({ userId: fx.alice.userId }, {
+      wordKey: keys[0]!,
+      stage: "IN_PROGRESS",
+      initialFamiliarity: "UNKNOWN",
+      firstSeenAt: T0,
+      lastSeenAt: T0,
+    });
+
+    const originalPrepare = fx.env.sqlite.prepare.bind(fx.env.sqlite);
+    fx.env.sqlite.prepare = ((source: string) => {
+      if ((source.match(/\?/g) ?? []).length > 100) {
+        throw new Error("simulated D1 binding limit");
+      }
+      return originalPrepare(source);
+    }) as typeof fx.env.sqlite.prepare;
+    try {
+      const params = new URLSearchParams({ keys: keys.join(",") });
+      const response = await fx.app.request(`/api/progress/words?${params.toString()}`, {
+        headers: { cookie: fx.aliceCookie },
+      });
+
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        words: Array<{ word_key: string; progress: { stage: string } | null }>;
+      };
+      expect(body.words).toHaveLength(116);
+      expect(body.words[0]).toEqual({
+        word_key: keys[0],
+        progress: expect.objectContaining({ stage: "IN_PROGRESS" }),
+      });
+      expect(body.words[115]).toEqual({ word_key: keys[115], progress: null });
+    } finally {
+      fx.env.sqlite.prepare = originalPrepare as typeof fx.env.sqlite.prepare;
+    }
+  });
 });
 
 describe("production entry point (src/index.ts)", () => {

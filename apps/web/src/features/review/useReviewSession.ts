@@ -13,14 +13,14 @@
  *   "nothing due" outcome, never an error.
  * - Prompt derivation waits for BOTH the session's word contents and the
  *   bootstrap's unit->book map (see buildReviewCards in ReviewCard.tsx).
- * - One client-generated `event_id` per reveal->rating cycle; a failed grade
- *   is retried with the SAME id (no second event, spec 11.2); the next card
- *   activates only after the grade and the session re-read both succeed.
+ * - One client-generated event-id base per reveal->rating cycle; a failed
+ *   single or grouped grade replays the SAME ids. Successful responses move
+ *   the local position immediately without a redundant session read.
  * - Undo is latest-only by construction: the client undoes ITS latest
- *   successful grade event. After an undo the session is re-read (the
- *   position was rewound server-side), the undone event id is dropped, and
- *   the undone card returns in the question phase (a fresh reveal creates a
- *   fresh event).
+ *   successful grade event group in reverse order. After undo the session is
+ *   re-read (the position was rewound server-side), the undone event ids are
+ *   dropped, and the word returns in the question phase (a fresh reveal
+ *   creates fresh ids).
  */
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
@@ -33,7 +33,7 @@ import {
 } from "../../lib/api-client";
 import { messageFor } from "../learn/useStudySession";
 import type { QuickRecallCard } from "../learn/QuickRecall";
-import { buildReviewCards } from "./ReviewCard";
+import { buildReviewCards, groupReviewCards } from "./ReviewCard";
 
 export type ReviewPhase = "IDLE" | "PREPARING" | "QUESTION" | "REVEALED" | "COMPLETE";
 
@@ -75,7 +75,7 @@ interface MachineState {
   revealedAt: number | null;
   gradePending: boolean;
   gradeError: string | null;
-  lastGradeEventId: string | null;
+  lastGradeEventIds: string[];
   undoPending: boolean;
   undoError: string | null;
   queueEmpty: boolean;
@@ -95,7 +95,7 @@ type MachineAction =
   | { type: "REVEALED"; eventId: string; revealedAt: number }
   | { type: "GRADE_PENDING" }
   | { type: "GRADE_FAILED"; message: string }
-  | { type: "GRADE_ADVANCED"; session: SessionView; gradedEventId: string }
+  | { type: "GRADE_ADVANCED"; session: SessionView; gradedEventIds: string[] }
   | { type: "UNDO_PENDING" }
   | { type: "UNDO_FAILED"; message: string }
   | { type: "UNDO_DONE"; session: SessionView };
@@ -110,7 +110,7 @@ const INITIAL_STATE: MachineState = {
   revealedAt: null,
   gradePending: false,
   gradeError: null,
-  lastGradeEventId: null,
+  lastGradeEventIds: [],
   undoPending: false,
   undoError: null,
   queueEmpty: false,
@@ -144,7 +144,7 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
         gradeEventId: null,
         revealedAt: null,
         gradeError: null,
-        lastGradeEventId: null,
+        lastGradeEventIds: [],
         undoError: null,
       };
     case "CONTENTS_LOADED":
@@ -183,8 +183,8 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
         queueIndex: action.session.position,
         gradeEventId: null,
         revealedAt: null,
-        // The fresh grade is now the latest event available for undo.
-        lastGradeEventId: action.gradedEventId,
+        // The fresh grade group is now the latest history available for undo.
+        lastGradeEventIds: action.gradedEventIds,
         phase: done ? "COMPLETE" : "QUESTION",
       };
     }
@@ -196,7 +196,7 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
         ...state,
         undoPending: false,
         undoError: action.message,
-        lastGradeEventId: null,
+        lastGradeEventIds: [],
       };
     case "UNDO_DONE":
       return {
@@ -204,7 +204,7 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
         undoPending: false,
         session: action.session,
         queueIndex: action.session.position,
-        lastGradeEventId: null,
+        lastGradeEventIds: [],
         gradeEventId: null,
         revealedAt: null,
         phase: "QUESTION",
@@ -336,8 +336,9 @@ export function useReviewSession({
   const rate = useCallback(
     async (rating: GradeRating) => {
       const current = stateRef.current;
-      const sessionId = current.session?.session_id;
-      const cardKey = current.session?.cards[current.queueIndex]?.presented_card_key;
+      const session = current.session;
+      const sessionId = session?.session_id;
+      const cardKey = session?.cards[current.queueIndex]?.presented_card_key;
       if (
         !sessionId ||
         !cardKey ||
@@ -350,16 +351,56 @@ export function useReviewSession({
       dispatch({ type: "GRADE_PENDING" });
       const eventId = current.gradeEventId;
       try {
-        await api.gradeReview({
-          event_id: eventId,
-          session_id: sessionId,
-          card_key: cardKey,
-          rating,
-          duration_ms: Math.max(Date.now() - current.revealedAt, 0),
+        const activeGroup = groupReviewCards(current.cards).find(
+          (group) =>
+            current.queueIndex >= group.rawStart &&
+            current.queueIndex < group.rawStart + group.rawLength,
+        );
+        // A legacy resumed session may already be inside a group. Grade only
+        // the still-current suffix so queue validation remains exact.
+        const gradedCount = activeGroup
+          ? activeGroup.rawStart + activeGroup.rawLength - current.queueIndex
+          : 1;
+        const cardsToGrade = session.cards.slice(
+          current.queueIndex,
+          current.queueIndex + gradedCount,
+        );
+        const eventIds = cardsToGrade.map((_, index) =>
+          index === 0 ? eventId : `${eventId}:${index}`,
+        );
+        const durationMs = Math.max(Date.now() - current.revealedAt, 0);
+        if (cardsToGrade.length > 1) {
+          await api.gradeReviewBatch({
+            session_id: sessionId,
+            grades: cardsToGrade.map((card, index) => ({
+              event_id: eventIds[index]!,
+              card_key: card.presented_card_key,
+            })),
+            rating,
+            duration_ms: durationMs,
+          });
+        } else {
+          await api.gradeReview({
+            event_id: eventId,
+            session_id: sessionId,
+            card_key: cardKey,
+            rating,
+            duration_ms: durationMs,
+          });
+        }
+        const nextPosition = Math.min(
+          current.queueIndex + cardsToGrade.length,
+          session.cards.length,
+        );
+        dispatch({
+          type: "GRADE_ADVANCED",
+          session: {
+            ...session,
+            position: nextPosition,
+            current_card_key: session.cards[nextPosition]?.presented_card_key ?? null,
+          },
+          gradedEventIds: eventIds,
         });
-        // The client advances only on success, after re-reading the session.
-        const refreshed = await api.getStudySession(sessionId);
-        dispatch({ type: "GRADE_ADVANCED", session: refreshed, gradedEventId: eventId });
       } catch (cause) {
         dispatch({ type: "GRADE_FAILED", message: messageFor(cause) });
       }
@@ -369,14 +410,16 @@ export function useReviewSession({
 
   const undoLast = useCallback(async () => {
     const current = stateRef.current;
-    const eventId = current.lastGradeEventId;
+    const eventIds = current.lastGradeEventIds;
     const sessionId = current.session?.session_id;
-    if (!eventId || current.undoPending) {
+    if (eventIds.length === 0 || current.undoPending) {
       return;
     }
     dispatch({ type: "UNDO_PENDING" });
     try {
-      await api.undoReview(eventId);
+      for (const eventId of [...eventIds].reverse()) {
+        await api.undoReview(eventId);
+      }
       if (!sessionId) {
         return;
       }
@@ -395,7 +438,7 @@ export function useReviewSession({
     queueIndex: state.queueIndex,
     gradePending: state.gradePending,
     gradeError: state.gradeError,
-    canUndo: state.lastGradeEventId !== null,
+    canUndo: state.lastGradeEventIds.length > 0,
     undoPending: state.undoPending,
     undoError: state.undoError,
     queueEmpty: state.queueEmpty,

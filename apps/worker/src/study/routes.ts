@@ -10,7 +10,7 @@
  *   (WORD_PRESENTED / FAMILIARITY_SET), idempotent by event_id.
  * - `POST /api/reviews/grade` — server-side FSRS grading as one atomic batch.
  * - `POST /api/reviews/grade-batch` — one visible word rating atomically
- *   grades its consecutive per-sense WORD_MEANING cards.
+ *   grades its consecutive due cards.
  * - `POST /api/reviews/:eventId/undo` — latest-only revocation.
  *
  * Every route serves personal data: auth comes exclusively from the session

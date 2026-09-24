@@ -161,6 +161,40 @@ export async function buildReviewCards(
   });
 }
 
+/** One learner-visible review. New REVIEW sessions keep all due cards of a
+ * word consecutive; the first context prompt is preferred while rawLength
+ * preserves how many server-side FSRS states the one rating must update. */
+export interface ReviewCardGroup {
+  card: QuickRecallCard;
+  rawStart: number;
+  rawLength: number;
+}
+
+export function groupReviewCards(cards: readonly QuickRecallCard[]): ReviewCardGroup[] {
+  const groups: ReviewCardGroup[] = [];
+  let index = 0;
+  while (index < cards.length) {
+    const first = cards[index]!;
+    if (first.wordKey === null) {
+      groups.push({ card: first, rawStart: index, rawLength: 1 });
+      index += 1;
+      continue;
+    }
+    let end = index + 1;
+    while (end < cards.length && cards[end]?.wordKey === first.wordKey) {
+      end += 1;
+    }
+    const wordCards = cards.slice(index, end);
+    const preferred =
+      wordCards.find((card) => card.form === "context") ??
+      wordCards.find((card) => card.form === "word") ??
+      first;
+    groups.push({ card: preferred, rawStart: index, rawLength: end - index });
+    index = end;
+  }
+  return groups;
+}
+
 const RATINGS: ReadonlyArray<{ value: GradeRating; label: string }> = [
   { value: 1, label: "再次" },
   { value: 2, label: "困难" },

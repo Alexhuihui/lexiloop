@@ -53,10 +53,22 @@ export class WordProgressRepository {
     if (unique.length === 0) {
       return [];
     }
-    return await this.db
-      .select()
-      .from(wordProgress)
-      .where(and(eq(wordProgress.userId, ctx.userId), inArray(wordProgress.wordKey, unique)));
+    // D1 accepts at most 100 bound values per statement. The user id consumes
+    // one binding, so keep each IN list below the remaining budget.
+    const chunks: string[][] = [];
+    for (let index = 0; index < unique.length; index += 99) {
+      chunks.push(unique.slice(index, index + 99));
+    }
+    return (
+      await Promise.all(
+        chunks.map(async (keys) =>
+          await this.db
+            .select()
+            .from(wordProgress)
+            .where(and(eq(wordProgress.userId, ctx.userId), inArray(wordProgress.wordKey, keys))),
+        ),
+      )
+    ).flat();
   }
 
   async upsert(ctx: UserContext, input: UpsertWordProgressInput): Promise<WordProgressRow> {
