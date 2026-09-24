@@ -1,0 +1,20 @@
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  {
+    ignores: [
+      "**/dist/**",
+      "**/coverage/**",
+      "playwright-report/**",
+      "test-results/**",
+      "artifacts/**",
+      "**/.venv/**",
+      "**/.wrangler/**",
+      "**/node_modules/**",
+      ".lexiloop-private/**",
+    ],
+  },
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+);

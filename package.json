@@ -1,0 +1,32 @@
+{
+  "name": "lexiloop",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "compiler": "pnpm --filter @lexiloop/content-compiler exec tsx src/cli.ts",
+    "toolchain:check": "tsx scripts/check-toolchain.ts",
+    "typecheck": "pnpm -r typecheck",
+    "typecheck:root": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:python": "uv run pytest",
+    "lint": "eslint .",
+    "verify": "pnpm lint && pnpm typecheck:root && pnpm typecheck && pnpm test && pnpm test:python"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20260908.1",
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.63.0",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "26.5.0",
+    "better-sqlite3": "13.0.3",
+    "eslint": "10.10.0",
+    "sharp": "0.35.4",
+    "tsx": "4.23.13",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.0",
+    "vitest": "5.0.0",
+    "wrangler": "4.130.0"
+  }
+}

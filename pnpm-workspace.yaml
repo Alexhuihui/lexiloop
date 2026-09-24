@@ -1,0 +1,11 @@
+packages:
+  - apps/*
+  - packages/*
+  - tools/*
+
+# pnpm 11 blocks dependency build scripts by default; allow the known-native
+# toolchain deps to run their install scripts.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  workerd: true

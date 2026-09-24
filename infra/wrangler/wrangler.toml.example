@@ -1,0 +1,43 @@
+# LexiLoop Worker Wrangler configuration template.
+#
+# Copy this file to `wrangler.toml` (git-ignored) or the matching
+# environment-specific location and replace every `<...>` marker with the real
+# environment-specific value. Real production IDs may also be managed as
+# Cloudflare bindings/dashboard configuration; they never enter Git.
+
+name = "lexiloop-worker"
+main = "../../apps/worker/src/index.ts"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lexiloop"
+database_id = "<D1_DATABASE_ID>"
+
+[[r2_buckets]]
+binding = "AUDIO"
+bucket_name = "<R2_BUCKET_NAME>"
+
+# Login rate limiter (used by the auth session routes).
+[[unsafe.bindings]]
+name = "LOGIN_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+
+[unsafe.bindings.simple]
+limit = 5
+period = 60
+
+# Daily application-level user-data backup (gzip JSONL + manifest to the
+# private R2 bucket), 19:00 UTC = 03:00 Asia/Shanghai. The scheduled handler
+# lives in apps/worker/src/scheduled.ts; restore drills run via
+# scripts/restore-drill.ts (docs/runbooks/backup-and-restore.md).
+[triggers]
+crons = ["0 19 * * *"]
+
+# PWA static assets. Unknown navigation routes fall back to index.html so
+# React Router deep links work after a refresh or from a shared URL.
+[assets]
+directory = "../../apps/web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"

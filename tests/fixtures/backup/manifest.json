@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "created_at": 1773169200000,
+  "object_key": "backups/2026-03-10/user-data.jsonl.gz",
+  "sha256": "d44b725f1d8022c740518498ddd6d41059aefb67363c8fe4c06b9811fa44129f",
+  "active_release_id": "fixrel-active",
+  "previous_release_id": "fixrel-prev",
+  "row_counts": {
+    "app_user": 1,
+    "user_settings": 1,
+    "word_progress": 2,
+    "card_state": 1,
+    "review_log": 1,
+    "study_session": 2
+  },
+  "required_releases": [
+    {
+      "release_id": "fixrel-active",
+      "reasons": [
+        "active",
+        "session",
+        "introduced"
+      ]
+    },
+    {
+      "release_id": "fixrel-prev",
+      "reasons": [
+        "previous",
+        "session",
+        "review",
+        "alias"
+      ]
+    }
+  ],
+  "alias_edges": [
+    {
+      "release_id": "fixrel-prev",
+      "from_key": "c-haven",
+      "to_key": "c-harbor-1",
+      "edge_type": "RENAME",
+      "canonical_key": "c-harbor-1",
+      "created_at": 1772996400000
+    },
+    {
+      "release_id": "fixrel-prev",
+      "from_key": "w-haven",
+      "to_key": "w-harbor",
+      "edge_type": "RENAME",
+      "canonical_key": "w-harbor",
+      "created_at": 1772996400000
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="LexiLoop">
+  <!-- LexiLoop source mark (repo-native, hand-authored). The full-bleed
+       square background keeps this art valid as a maskable icon: every mark
+       element stays inside the central 80% safe zone (r <= 204 px). -->
+  <rect width="512" height="512" fill="#0f766e"/>
+  <!-- The LexiLoop: an open reading loop above a word line. -->
+  <circle cx="256" cy="228" r="104" fill="none" stroke="#f0fdfa" stroke-width="36" stroke-linecap="round" stroke-dasharray="560 194" transform="rotate(-137 256 228)"/>
+  <rect x="196" y="384" width="120" height="32" rx="16" fill="#f0fdfa"/>
+</svg>

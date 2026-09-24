@@ -1,0 +1,85 @@
+{
+  "release_id": "fixrel-prev",
+  "status": "READY",
+  "created_at": "2026-03-05T19:00:00.000Z",
+  "book": {
+    "book_key": "bk-1",
+    "edition": "1st"
+  },
+  "source_pdf_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "config_versions": {
+    "schema_version": "schema-v1",
+    "watermark_rules_version": "1",
+    "ocr_config_version": "1",
+    "prompt_version": "prompt-v1",
+    "card_rules_version": "v1",
+    "synthesis_config_version": "scv-1"
+  },
+  "model_config": {
+    "generation_model_id": "agent-generation-fixture",
+    "review_model_id": "agent-review-fixture",
+    "repair_model_id": "agent-repair-fixture",
+    "tts_model_id": "tts-fixture",
+    "tts_voice": "voice-fixture"
+  },
+  "units": [
+    {
+      "unit_key": "u-1",
+      "status": "PASSED",
+      "counts": {
+        "words": 1,
+        "senses": 1,
+        "phrases": 0,
+        "examples": 0,
+        "explanations": 0,
+        "cards": 0
+      }
+    }
+  ],
+  "totals": {
+    "units": 1,
+    "units_passed": 1,
+    "units_blocked": 0,
+    "words": 1,
+    "cards": 0,
+    "audio_assets": 0
+  },
+  "files": [
+    {
+      "path": "d1/001-content.sql",
+      "sha256": "4d6e4c53cf17ccf81197582a4be9830601cbcbbceddac863184689883163cdc4",
+      "bytes": 1157
+    },
+    {
+      "path": "d1/002-cards.sql",
+      "sha256": "1c4b9dbb1f738f417747ad12cb2415acbd8b47ed797196b696a43066deacd236",
+      "bytes": 69
+    },
+    {
+      "path": "d1/003-search.sql",
+      "sha256": "06393c0868118d2a60e6844cc3d403c394e1f5c615b0339896333af4d56fa7c4",
+      "bytes": 123
+    },
+    {
+      "path": "qa/unit-status.json",
+      "sha256": "00de07c4d639aa3ef8eaa0be9f6b3ecb382e0ef1a04c5b2141e50b437bf06ddc",
+      "bytes": 37
+    },
+    {
+      "path": "qa/validation-summary.json",
+      "sha256": "34e7590c51c9389c952bfdcbdb35b735d6fd1a155ddb8e575b11dce72972bf1f",
+      "bytes": 35
+    },
+    {
+      "path": "rollback.json",
+      "sha256": "aa9446e86f8feac4daca3bbb77ce1acc7fec8c9b3690cc5d7fb79a56154de377",
+      "bytes": 81
+    }
+  ],
+  "gates": [
+    {
+      "name": "fixture_synthetic",
+      "passed": true
+    }
+  ]
+}
