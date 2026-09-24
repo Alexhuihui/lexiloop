@@ -843,6 +843,34 @@ describe("GET /api/progress/words batch", () => {
 });
 
 describe("production entry point (src/index.ts)", () => {
+  it("serves static assets through the Worker with the global security headers", async () => {
+    const worker = await import("../src/index");
+    let assetRequests = 0;
+    const response = await worker.default.fetch(
+      new Request("https://lexiloop.example/learn"),
+      {
+        DB: {} as D1Database,
+        AUDIO: {} as R2Bucket,
+        ASSETS: {
+          fetch: async () => {
+            assetRequests += 1;
+            return new Response("<!doctype html><title>LexiLoop</title>", {
+              headers: { "content-type": "text/html" },
+            });
+          },
+        } as unknown as Fetcher,
+        LOGIN_RATE_LIMITER: { limit: async () => ({ success: true }) },
+      } as Parameters<typeof worker.default.fetch>[1],
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("LexiLoop");
+    expect(assetRequests).toBe(1);
+    expect(response.headers.get("content-security-policy")).toContain("default-src 'self'");
+    expect(response.headers.get("strict-transport-security")).toBe("max-age=31536000; includeSubDomains");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
   it("wires the real bindings and reports per-request D1 usage in the logs", async () => {
     const worker = await import("../src/index");
     // The production path runs on the real clock, so this test issues a
@@ -906,6 +934,7 @@ describe("production entry point (src/index.ts)", () => {
         {
           DB: fakeD1,
           AUDIO: { get: async () => null, head: async () => null } as unknown as R2Bucket,
+          ASSETS: { fetch: async () => new Response("not used") } as unknown as Fetcher,
           LOGIN_RATE_LIMITER: { limit: async () => ({ success: true }) },
           WORKER_RELEASE_ID: "worker-rel-9",
         },

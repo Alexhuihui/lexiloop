@@ -47,3 +47,4 @@ crons = ["0 19 * * *"]
 directory = "../../apps/web/dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+run_worker_first = true

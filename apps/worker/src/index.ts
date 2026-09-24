@@ -24,6 +24,7 @@ import { schema } from "@lexiloop/db";
 import { buildApp, type WorkerDeps } from "./app";
 import { createLoginRateLimiter, type RateLimitBinding } from "./auth/routes";
 import { scheduled } from "./scheduled";
+import { applySecurityHeaders } from "./middleware/security-headers";
 import {
   createRequestLogContext,
   instrumentD1,
@@ -35,6 +36,7 @@ import {
 export interface Env {
   DB: D1Database;
   AUDIO: R2Bucket;
+  ASSETS: Fetcher;
   LOGIN_RATE_LIMITER: RateLimitBinding;
   /** Comma-separated extra accepted write-request Origins (optional). */
   ALLOWED_ORIGINS?: string;
@@ -65,6 +67,18 @@ function parseAllowedOrigins(raw: string | undefined): string[] | undefined {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const pathname = new URL(request.url).pathname;
+    if (pathname !== "/api" && !pathname.startsWith("/api/")) {
+      const asset = await env.ASSETS.fetch(request);
+      const headers = new Headers(asset.headers);
+      applySecurityHeaders(headers);
+      return new Response(asset.body, {
+        status: asset.status,
+        statusText: asset.statusText,
+        headers,
+      });
+    }
+
     // One log context per request: created before the bindings are wrapped,
     // so the instrumented D1/R2 calls feed exactly the counters this
     // request's log line reports.
