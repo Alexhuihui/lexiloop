@@ -20,6 +20,7 @@ export WORKER_URL="https://<worker-host>"
 export R2_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com"
 export MIGRATION_DIR="<private-absolute-directory>"
 export D1_EXPORT="$MIGRATION_DIR/lexiloop-cutover.sql"
+export TARGET_WRANGLER_CONFIG="$MIGRATION_DIR/wrangler-d1-target.toml"
 ```
 
 Set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` through the private shell
@@ -44,9 +45,9 @@ Run the same count query before export and after import. Save both outputs in
 the private migration directory and compare every row count, including FTS.
 
 ```bash
-export COUNT_SQL="SELECT 'app_meta' AS table_name, COUNT(*) AS row_count FROM app_meta UNION ALL SELECT 'app_user', COUNT(*) FROM app_user UNION ALL SELECT 'audio_asset', COUNT(*) FROM audio_asset UNION ALL SELECT 'auth_session', COUNT(*) FROM auth_session UNION ALL SELECT 'book', COUNT(*) FROM book UNION ALL SELECT 'card_definition', COUNT(*) FROM card_definition UNION ALL SELECT 'card_state', COUNT(*) FROM card_state UNION ALL SELECT 'content_audio_link', COUNT(*) FROM content_audio_link UNION ALL SELECT 'content_key_alias', COUNT(*) FROM content_key_alias UNION ALL SELECT 'content_release', COUNT(*) FROM content_release UNION ALL SELECT 'content_search_fts', COUNT(*) FROM content_search_fts UNION ALL SELECT 'example', COUNT(*) FROM example UNION ALL SELECT 'explanation', COUNT(*) FROM explanation UNION ALL SELECT 'lexical_relation', COUNT(*) FROM lexical_relation UNION ALL SELECT 'phrase', COUNT(*) FROM phrase UNION ALL SELECT 'release_unit', COUNT(*) FROM release_unit UNION ALL SELECT 'review_log', COUNT(*) FROM review_log UNION ALL SELECT 'sense', COUNT(*) FROM sense UNION ALL SELECT 'study_session', COUNT(*) FROM study_session UNION ALL SELECT 'unit', COUNT(*) FROM unit UNION ALL SELECT 'user_settings', COUNT(*) FROM user_settings UNION ALL SELECT 'word', COUNT(*) FROM word UNION ALL SELECT 'word_progress', COUNT(*) FROM word_progress ORDER BY table_name"
+export COUNT_SQL="SELECT (SELECT COUNT(*) FROM app_meta) AS app_meta, (SELECT COUNT(*) FROM app_user) AS app_user, (SELECT COUNT(*) FROM audio_asset) AS audio_asset, (SELECT COUNT(*) FROM auth_session) AS auth_session, (SELECT COUNT(*) FROM book) AS book, (SELECT COUNT(*) FROM card_definition) AS card_definition, (SELECT COUNT(*) FROM card_state) AS card_state, (SELECT COUNT(*) FROM content_audio_link) AS content_audio_link, (SELECT COUNT(*) FROM content_key_alias) AS content_key_alias, (SELECT COUNT(*) FROM content_release) AS content_release, (SELECT COUNT(*) FROM content_search_fts) AS content_search_fts, (SELECT COUNT(*) FROM example) AS example, (SELECT COUNT(*) FROM explanation) AS explanation, (SELECT COUNT(*) FROM lexical_relation) AS lexical_relation, (SELECT COUNT(*) FROM phrase) AS phrase, (SELECT COUNT(*) FROM release_unit) AS release_unit, (SELECT COUNT(*) FROM review_log) AS review_log, (SELECT COUNT(*) FROM sense) AS sense, (SELECT COUNT(*) FROM study_session) AS study_session, (SELECT COUNT(*) FROM unit) AS unit, (SELECT COUNT(*) FROM user_settings) AS user_settings, (SELECT COUNT(*) FROM word) AS word, (SELECT COUNT(*) FROM word_progress) AS word_progress"
 pnpm exec wrangler d1 execute "$SOURCE_D1" --remote --json --config "$WRANGLER_CONFIG" --command "$COUNT_SQL" \
-  | jq 'map(.results) | add' > "$MIGRATION_DIR/source-counts.json"
+  | jq 'map(.results) | add | .[0]' > "$MIGRATION_DIR/source-counts.json"
 pnpm exec wrangler d1 execute "$SOURCE_D1" --remote --json --config "$WRANGLER_CONFIG" --command "PRAGMA foreign_key_check" \
   | jq 'map(.results) | add' > "$MIGRATION_DIR/source-foreign-keys.json"
 test "$(jq 'length' "$MIGRATION_DIR/source-foreign-keys.json")" -eq 0
@@ -96,25 +97,53 @@ remote with the same private credentials and download-check every object:
 rclone check "r2:$SOURCE_R2" "r2:$TARGET_R2" --download --one-way
 ```
 
-For D1, use one final full export and one import. Choose a quiet cutover window
-and keep the export-to-deploy interval as short as possible:
+Wrangler cannot export a database containing an FTS5 virtual table as one
+unfiltered file. Create a private target Wrangler config containing the new
+D1 ID and the repository's `infra/migrations` directory; never put that ID in
+Git. Its D1 section has this shape:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "lexiloop-apac"
+database_id = "<D1_DATABASE_ID>"
+migrations_dir = "<absolute-path-to-repo>/infra/migrations"
+```
+
+Use one final data export and one business-data import. The target schema is
+created from the same migrations first; those migrations create FTS and its
+triggers, so importing `word`, `sense`, `phrase`, and `example` rebuilds FTS.
+Choose a quiet cutover window and keep export-to-deploy as short as possible:
 
 ```bash
+CI=1 pnpm exec wrangler d1 migrations apply "$TARGET_D1" --remote \
+  --config "$TARGET_WRANGLER_CONFIG"
+pnpm exec wrangler d1 execute "$TARGET_D1" --remote \
+  --config "$TARGET_WRANGLER_CONFIG" --command "DELETE FROM app_meta WHERE id = 1"
 pnpm exec wrangler d1 export "$SOURCE_D1" --remote --config "$WRANGLER_CONFIG" \
-  --output "$D1_EXPORT" --skip-confirmation
-pnpm exec wrangler d1 execute "$TARGET_D1" --remote --file "$D1_EXPORT"
-pnpm exec wrangler d1 execute "$TARGET_D1" --remote --json --command "$COUNT_SQL" \
-  | jq 'map(.results) | add' > "$MIGRATION_DIR/target-counts.json"
+  --output "$D1_EXPORT" --skip-confirmation --no-schema \
+  --table app_meta --table app_user --table audio_asset --table auth_session --table book \
+  --table card_definition --table card_state --table content_audio_link --table content_key_alias \
+  --table content_release --table example --table explanation --table lexical_relation --table phrase \
+  --table release_unit --table review_log --table sense --table study_session --table unit \
+  --table user_settings --table word --table word_progress
+pnpm exec wrangler d1 execute "$TARGET_D1" --remote \
+  --config "$TARGET_WRANGLER_CONFIG" --file "$D1_EXPORT"
 pnpm exec wrangler d1 execute "$TARGET_D1" --remote --json \
+  --config "$TARGET_WRANGLER_CONFIG" --command "$COUNT_SQL" \
+  | jq 'map(.results) | add | .[0]' > "$MIGRATION_DIR/target-counts.json"
+pnpm exec wrangler d1 execute "$TARGET_D1" --remote --json --config "$TARGET_WRANGLER_CONFIG" \
   --command "PRAGMA foreign_key_check" | jq 'map(.results) | add' \
   > "$MIGRATION_DIR/target-foreign-keys.json"
 diff -u "$MIGRATION_DIR/source-counts.json" "$MIGRATION_DIR/target-counts.json"
 test "$(jq 'length' "$MIGRATION_DIR/target-foreign-keys.json")" -eq 0
 ```
 
-Refresh `source-counts.json` immediately before the export if any source write
-occurred after step 2. The diff must be empty and the target foreign-key output
-must contain no violation rows. Do not deploy against a partial import.
+Refresh `source-counts.json` immediately before export and again after import.
+The post-import source counts must still match the export snapshot and target;
+otherwise a source write landed during the window and cutover stops. The diff
+must be empty and the target foreign-key output must contain no violation rows.
+Do not deploy against a partial import.
 
 ## 4. Switch bindings and Worker placement
 
