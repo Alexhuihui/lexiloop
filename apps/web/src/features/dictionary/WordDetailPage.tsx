@@ -10,6 +10,9 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { ApiError, type ApiClient } from "../../lib/api-client";
 import { ExampleAudioButton } from "../../components/ExampleAudioButton";
+import { AudioButton } from "../../components/AudioButton";
+import { ExampleExplanation } from "../../components/ExampleExplanation";
+import { useAudioPrefetch } from "../../lib/audio-prefetch";
 
 export interface WordDetailPageProps {
   api: ApiClient;
@@ -61,6 +64,11 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
     queryFn: () => api.wordProgress(wordKey),
     enabled: wordKey !== "",
   });
+
+  const audioUrls = content.data
+    ? content.data.audio.map((asset) => api.audioUrl(asset.asset_key))
+    : [];
+  useAudioPrefetch(audioUrls, api.prefetchAudio);
 
   // Related words resolve to their headwords so the links read naturally;
   // unresolved entries fall back to the key.
@@ -134,7 +142,11 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
       </header>
       {wordAudio ? (
         <div className="audio-player">
-          <audio controls src={api.audioUrl(wordAudio.asset_key)}></audio>
+          <AudioButton
+            url={api.audioUrl(wordAudio.asset_key)}
+            label="听单词"
+            ariaLabel="播放单词音频"
+          />
         </div>
       ) : null}
 
@@ -181,6 +193,11 @@ export function WordDetailPage({ api }: WordDetailPageProps): React.JSX.Element 
                   );
                   return asset ? <ExampleAudioButton url={api.audioUrl(asset.asset_key)} /> : null;
                 })()}
+                <ExampleExplanation
+                  exampleKey={example.example_key}
+                  origin={example.origin}
+                  explanations={data.explanations}
+                />
               </li>
             ))}
           </ul>

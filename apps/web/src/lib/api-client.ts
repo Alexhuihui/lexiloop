@@ -354,6 +354,10 @@ const wordProgressResponseSchema = z.object({
 
 export type WordProgressResponse = z.infer<typeof wordProgressResponseSchema>;
 
+const wordProgressBatchResponseSchema = z.object({
+  words: z.array(wordProgressResponseSchema),
+});
+
 const statsOverviewSchema = z.object({
   learned_words: z.number(),
   learned_cards: z.number(),
@@ -442,8 +446,12 @@ export interface ApiClient {
   searchContent(query: string, limit?: number): Promise<SearchResponse>;
   /** URL for a private audio asset, optionally session-release-pinned. */
   audioUrl(assetKey: string, sessionId?: string): string;
+  /** Silently downloads an audio asset so the SW/browser can cache it. */
+  prefetchAudio(url: string): Promise<void>;
   /** Word-level personal progress (spec 8.2): the ONLY personal word state. */
   wordProgress(wordKey: string): Promise<WordProgressResponse>;
+  /** Batch progress for setup previews (one request for the whole unit). */
+  wordProgressBatch(wordKeys: readonly string[]): Promise<WordProgressResponse[]>;
   /** Learning overview (spec 9.6). */
   statsOverview(): Promise<StatsOverview>;
   /** The caller's unexpired study sessions (resume, spec 8.3). */
@@ -668,10 +676,51 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       return url.toString();
     },
 
+    async prefetchAudio(url: string): Promise<void> {
+      const response = await fetchFn(url, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { accept: "audio/*" },
+      });
+      if (response.status === 401) {
+        signalUnauthorized();
+      }
+      if (!response.ok) {
+        throw new ApiError(response.status, {
+          code: "AUDIO_PREFETCH_FAILED",
+          message: "Audio prefetch failed",
+          request_id: "",
+        });
+      }
+      // Consume the body: this guarantees the full object is available to
+      // the Service Worker's cache.put() (or the browser HTTP cache).
+      await response.arrayBuffer();
+    },
+
     async wordProgress(wordKey: string): Promise<WordProgressResponse> {
       return wordProgressResponseSchema.parse(
         await request(`/api/progress/words/${encodeURIComponent(wordKey)}`),
       );
+    },
+
+    async wordProgressBatch(wordKeys: readonly string[]): Promise<WordProgressResponse[]> {
+      const unique = [...new Set(wordKeys)];
+      if (unique.length === 0) {
+        return [];
+      }
+      const chunks = Array.from(
+        { length: Math.ceil(unique.length / 200) },
+        (_, index) => unique.slice(index * 200, (index + 1) * 200),
+      );
+      const responses = await Promise.all(
+        chunks.map(async (chunk) => {
+          const params = new URLSearchParams({ keys: chunk.join(",") });
+          return wordProgressBatchResponseSchema.parse(
+            await request(`/api/progress/words?${params.toString()}`),
+          ).words;
+        }),
+      );
+      return responses.flat();
     },
 
     async statsOverview(): Promise<StatsOverview> {

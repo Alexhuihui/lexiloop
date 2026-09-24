@@ -809,6 +809,39 @@ describe("GET /api/progress/words/:wordKey", () => {
   });
 });
 
+describe("GET /api/progress/words batch", () => {
+  it("returns a whole preview in one private, user-scoped response", async () => {
+    await new WordProgressRepository(fx.db).upsert({ userId: fx.alice.userId }, {
+      wordKey: "w-abandon",
+      stage: "IN_PROGRESS",
+      initialFamiliarity: "RECOGNIZABLE",
+      firstSeenAt: T0,
+      lastSeenAt: T0,
+    });
+    const res = await fx.app.request(
+      "/api/progress/words?keys=w-abandon,w-ability,w-abandon",
+      { headers: { cookie: fx.aliceCookie } },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    const body = (await res.json()) as {
+      words: Array<{ word_key: string; progress: { stage: string } | null }>;
+    };
+    expect(body.words).toEqual([
+      { word_key: "w-abandon", progress: expect.objectContaining({ stage: "IN_PROGRESS" }) },
+      { word_key: "w-ability", progress: null },
+    ]);
+  });
+
+  it("requires authentication and rejects an empty key list", async () => {
+    expect((await fx.app.request("/api/progress/words?keys=w-abandon")).status).toBe(401);
+    const invalid = await fx.app.request("/api/progress/words", {
+      headers: { cookie: fx.aliceCookie },
+    });
+    expect(invalid.status).toBe(400);
+  });
+});
+
 describe("production entry point (src/index.ts)", () => {
   it("wires the real bindings and reports per-request D1 usage in the logs", async () => {
     const worker = await import("../src/index");

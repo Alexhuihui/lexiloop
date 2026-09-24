@@ -408,6 +408,17 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       const content = WORD_CONTENTS[key];
       return content ? jsonResponse(content) : errorEnvelope("CONTENT_WORD_NOT_FOUND", 404);
     }
+    if (path.startsWith("/api/audio/")) {
+      return new Response(new Uint8Array([82, 73, 70, 70]), {
+        headers: { "content-type": "audio/wav" },
+      });
+    }
+    if (path === "/api/progress/words") {
+      const keys = (new URL(url).searchParams.get("keys") ?? "").split(",").filter(Boolean);
+      return jsonResponse({
+        words: keys.map((key) => ({ word_key: key, progress: progress.get(key) ?? null })),
+      });
+    }
     if (path.startsWith("/api/progress/words/")) {
       const key = decodeURIComponent(path.replace("/api/progress/words/", ""));
       return jsonResponse({ word_key: key, progress: progress.get(key) ?? null });

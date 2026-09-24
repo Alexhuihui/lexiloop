@@ -32,6 +32,7 @@ import {
 import { useStudySession, type StudySessionControls } from "./useStudySession";
 import { WordStudyCard } from "./WordStudyCard";
 import { QuickRecall } from "./QuickRecall";
+import { useAudioPrefetch } from "../../lib/audio-prefetch";
 
 export interface LearnSetupPageProps {
   api: ApiClient;
@@ -117,15 +118,8 @@ function SetupView({ api, settings, study }: SetupViewProps): React.JSX.Element 
     queryKey: ["progress", "unit", unitKey],
     queryFn: async (): Promise<ProgressMap> => {
       const words = unit.data?.words ?? [];
-      const entries = await Promise.all(
-        words.map(async (word) => {
-          try {
-            return [word.word_key, (await api.wordProgress(word.word_key)).progress] as const;
-          } catch {
-            return [word.word_key, null] as const;
-          }
-        }),
-      );
+      const rows = await api.wordProgressBatch(words.map((word) => word.word_key));
+      const entries = rows.map((row) => [row.word_key, row.progress] as const);
       return Object.fromEntries(entries);
     },
     enabled: unitKey !== "" && unit.data !== undefined,
@@ -239,7 +233,15 @@ function toGroupWord(word: SetupWord) {
 
 function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls }): React.JSX.Element {
   const word = study.words[study.studyIndex];
-  if (!word || !study.session) {
+  const session = study.session;
+  const sessionId = session?.session_id;
+  const audioUrls =
+    word?.content && sessionId
+      ? word.content.audio.map((asset) => api.audioUrl(asset.asset_key, sessionId))
+      : [];
+  useAudioPrefetch(audioUrls, api.prefetchAudio);
+
+  if (!word || !session) {
     return (
       <p role="status">正在准备学习…</p>
     );
@@ -250,13 +252,13 @@ function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls
   const exampleAudioUrls = Object.fromEntries(
     (word.content?.audio ?? [])
       .filter((asset) => asset.entity_type === "example")
-      .map((asset) => [asset.entity_key, api.audioUrl(asset.asset_key, study.session!.session_id)]),
+      .map((asset) => [asset.entity_key, api.audioUrl(asset.asset_key, session.session_id)]),
   );
   const isLastWord = study.studyIndex === study.words.length - 1;
   return (
     <div className="study-flow">
       <div className="session-overview">
-        本组共 {study.session.cards.length} 张卡（完成学习后逐卡快速回忆）。
+        本组共 {session.cards.length} 张卡（完成学习后逐卡快速回忆）。
       </div>
       <WordStudyCard
         key={word.wordKey}
@@ -264,7 +266,7 @@ function StudyView({ api, study }: { api: ApiClient; study: StudySessionControls
         total={study.words.length}
         word={word}
         familiarityPending={study.familiarityPending}
-        audioUrl={wordAudio ? api.audioUrl(wordAudio.asset_key, study.session.session_id) : null}
+        audioUrl={wordAudio ? api.audioUrl(wordAudio.asset_key, session.session_id) : null}
         exampleAudioUrls={exampleAudioUrls}
         onFamiliarity={(choice) => void study.chooseFamiliarity(word.wordKey, choice)}
         onRetryPresentation={() => void study.retryPresentation(word.wordKey)}

@@ -40,6 +40,7 @@ import {
   type WordContentResponse,
 } from "../../lib/api-client";
 import { buildQuickRecallCards, type QuickRecallCard } from "./QuickRecall";
+import { scheduleIdleTask } from "../../lib/audio-prefetch";
 
 export type LearnPhase =
   | "SETUP"
@@ -103,7 +104,6 @@ interface MachineState {
   studyIndex: number;
   starting: boolean;
   setupError: string | null;
-  contentLoadingKey: string | null;
   presentationKey: string | null;
   familiarityPending: boolean;
   recallCards: QuickRecallCard[] | null;
@@ -126,7 +126,6 @@ type MachineAction =
       phase: LearnPhase;
       recallCards: QuickRecallCard[] | null;
     }
-  | { type: "CONTENT_LOADING"; wordKey: string }
   | { type: "CONTENT_LOADED"; wordKey: string; content: WordContentResponse }
   | { type: "CONTENT_RETRY"; wordKey: string }
   | { type: "CONTENT_FAILED"; wordKey: string }
@@ -152,7 +151,6 @@ const INITIAL_STATE: MachineState = {
   studyIndex: 0,
   starting: false,
   setupError: null,
-  contentLoadingKey: null,
   presentationKey: null,
   familiarityPending: false,
   recallCards: null,
@@ -191,13 +189,9 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
         queueIndex: action.session.position,
         summary: null,
       };
-    case "CONTENT_LOADING":
-      return { ...state, contentLoadingKey: action.wordKey };
     case "CONTENT_LOADED":
       return {
         ...state,
-        contentLoadingKey:
-          state.contentLoadingKey === action.wordKey ? null : state.contentLoadingKey,
         words: updateWord(state.words, action.wordKey, (word) => ({
           ...word,
           content: action.content,
@@ -215,8 +209,6 @@ function reducer(state: MachineState, action: MachineAction): MachineState {
     case "CONTENT_FAILED":
       return {
         ...state,
-        contentLoadingKey:
-          state.contentLoadingKey === action.wordKey ? null : state.contentLoadingKey,
         words: updateWord(state.words, action.wordKey, (word) => ({
           ...word,
           contentFailed: true,
@@ -380,22 +372,38 @@ export interface UseStudySessionOptions {
 export function useStudySession({ api }: UseStudySessionOptions): StudySessionControls {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const stateRef = useRef(state);
+  const contentRequestsRef = useRef(new Set<string>());
+  const backgroundContentFailuresRef = useRef(new Set<string>());
   stateRef.current = state;
 
   const loadContent = useCallback(
-    async (wordKey: string) => {
+    async (wordKey: string, background = false) => {
       const current = stateRef.current;
       const word = current.words.find((candidate) => candidate.wordKey === wordKey);
-      if (!word || word.content || word.contentFailed || current.contentLoadingKey !== null) {
+      if (
+        !word ||
+        word.content ||
+        word.contentFailed ||
+        contentRequestsRef.current.has(wordKey) ||
+        (background && backgroundContentFailuresRef.current.has(wordKey))
+      ) {
         return;
       }
-      dispatch({ type: "CONTENT_LOADING", wordKey });
+      contentRequestsRef.current.add(wordKey);
       try {
         const content = await api.wordContent(wordKey, current.session?.session_id);
+        backgroundContentFailuresRef.current.delete(wordKey);
         dispatch({ type: "CONTENT_LOADED", wordKey, content });
       } catch {
-        // Shown inline; a content failure never discards the position.
-        dispatch({ type: "CONTENT_FAILED", wordKey });
+        if (background) {
+          backgroundContentFailuresRef.current.add(wordKey);
+        } else {
+          // Visible failures stay inline; speculative failures remain silent
+          // so the normal visible-card request can retry automatically.
+          dispatch({ type: "CONTENT_FAILED", wordKey });
+        }
+      } finally {
+        contentRequestsRef.current.delete(wordKey);
       }
     },
     [api],
@@ -447,6 +455,28 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
     if (word && word.content === null && !word.contentFailed) {
       void loadContent(word.wordKey);
     }
+  }, [state.phase, state.words, state.studyIndex, loadContent]);
+
+  // Once the visible card has rendered, fetch subsequent word entries one at
+  // a time during idle periods. “下一词” is then instant without letting
+  // background work compete with the first card or its audio.
+  useEffect(() => {
+    if (state.phase !== "STUDY_WORDS") {
+      return;
+    }
+    const visible = state.words[state.studyIndex];
+    if (!visible?.content) {
+      return;
+    }
+    const next = state.words
+      .slice(state.studyIndex + 1)
+      .find((word) => word.content === null && !word.contentFailed);
+    if (!next) {
+      return;
+    }
+    return scheduleIdleTask(() => {
+      void loadContent(next.wordKey, true);
+    });
   }, [state.phase, state.words, state.studyIndex, loadContent]);
 
   // Study view: present the visible word once its content is available.
@@ -529,17 +559,18 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
         const firstUnpresented = words.findIndex((word) => word.presentation !== "acked");
         if (firstUnpresented === -1) {
           // Every group word was presented: continue directly in quick recall.
-          const loaded: StudyWordState[] = [];
-          for (const word of words) {
-            try {
-              loaded.push({
-                ...word,
-                content: await api.wordContent(word.wordKey, session.session_id),
-              });
-            } catch {
-              loaded.push(word);
-            }
-          }
+          const loaded = await Promise.all(
+            words.map(async (word): Promise<StudyWordState> => {
+              try {
+                return {
+                  ...word,
+                  content: await api.wordContent(word.wordKey, session.session_id),
+                };
+              } catch {
+                return word;
+              }
+            }),
+          );
           dispatch({
             type: "SESSION_STARTED",
             session,
@@ -608,19 +639,22 @@ export function useStudySession({ api }: UseStudySessionOptions): StudySessionCo
     if (!session) {
       return;
     }
-    const words = [...current.words];
-    for (const [index, word] of words.entries()) {
-      if (word.content === null) {
+    const words = await Promise.all(
+      current.words.map(async (word): Promise<StudyWordState> => {
+        if (word.content !== null) {
+          return word;
+        }
         try {
-          words[index] = {
+          return {
             ...word,
             content: await api.wordContent(word.wordKey, session.session_id),
           };
         } catch {
           // Missing content degrades that card to a generic prompt only.
+          return word;
         }
-      }
-    }
+      }),
+    );
     dispatch({
       type: "RECALL_STARTED",
       session,

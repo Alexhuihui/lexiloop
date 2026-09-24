@@ -17,6 +17,7 @@ import type { ApiClient } from "../../lib/api-client";
 import { CONTENT_BOOTSTRAP_QUERY_KEY } from "../../lib/query-cache";
 import { createAudioPlayer, type AudioPlayer } from "../../lib/audio";
 import { useKeyboardShortcuts } from "../../lib/keyboard";
+import { useAudioPrefetch } from "../../lib/audio-prefetch";
 import { ReviewCard } from "./ReviewCard";
 import { useReviewSession } from "./useReviewSession";
 
@@ -64,6 +65,7 @@ export function ReviewPage({ api }: ReviewPageProps): React.JSX.Element {
     );
     return asset ? api.audioUrl(asset.asset_key, study.session.session_id) : null;
   }, [api, currentContent, currentWordKey, study.session]);
+  useAudioPrefetch(currentAudioUrl ? [currentAudioUrl] : [], api.prefetchAudio);
 
   const playCurrentAudio = useCallback(() => {
     if (!currentAudioUrl) {

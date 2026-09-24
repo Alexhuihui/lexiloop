@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, sql } from "drizzle-orm";
 import {
   parseFsrsState,
   parseQueueSnapshot,
@@ -45,6 +45,18 @@ export class WordProgressRepository {
       .from(wordProgress)
       .where(and(eq(wordProgress.userId, ctx.userId), eq(wordProgress.wordKey, wordKey)))
       .get();
+  }
+
+  /** Reads a preview/group in one query instead of one round trip per word. */
+  async getMany(ctx: UserContext, wordKeys: readonly string[]): Promise<WordProgressRow[]> {
+    const unique = [...new Set(wordKeys)];
+    if (unique.length === 0) {
+      return [];
+    }
+    return await this.db
+      .select()
+      .from(wordProgress)
+      .where(and(eq(wordProgress.userId, ctx.userId), inArray(wordProgress.wordKey, unique)));
   }
 
   async upsert(ctx: UserContext, input: UpsertWordProgressInput): Promise<WordProgressRow> {

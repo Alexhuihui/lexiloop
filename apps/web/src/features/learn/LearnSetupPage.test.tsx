@@ -72,6 +72,17 @@ describe("LearnSetupPage", () => {
     expect(screen.getByText(/预计本组 2 个新词/)).toBeTruthy();
     expect(screen.getByText(/abnormal/)).toBeTruthy(); // rest of the unit visible
 
+    // The setup preview reads the whole unit's progress in one request; the
+    // previous one-request-per-word waterfall would make large units slow.
+    const progressReads = requests.filter(
+      ({ url }) => new URL(url).pathname === "/api/progress/words",
+    );
+    expect(progressReads).toHaveLength(1);
+    expect(new URL(progressReads[0]!.url).searchParams.get("keys")).toBe("w-1,w-2,w-3");
+    expect(
+      requests.some(({ url }) => new URL(url).pathname.startsWith("/api/progress/words/")),
+    ).toBe(false);
+
     const tierSelect = screen.getByLabelText("选择分层");
     await userEvent.setup().selectOptions(tierSelect, "EXTENSION");
     await waitFor(() => {

@@ -10,10 +10,11 @@
  * discards the study position (the parent simply keeps rendering this card).
  */
 
-import { useEffect, useState } from "react";
 import type { FamiliarityChoice } from "../../lib/api-client";
 import type { StudyWordState } from "./useStudySession";
 import { ExampleAudioButton } from "../../components/ExampleAudioButton";
+import { AudioButton } from "../../components/AudioButton";
+import { ExampleExplanation } from "../../components/ExampleExplanation";
 
 const FAMILIARITY_CHOICES: ReadonlyArray<{ value: FamiliarityChoice; label: string }> = [
   { value: "VERY_UNFAMILIAR", label: "很陌生" },
@@ -53,11 +54,6 @@ export function WordStudyCard({
   nextLabel,
   nextDisabled,
 }: WordStudyCardProps): React.JSX.Element {
-  const [audioFailed, setAudioFailed] = useState(false);
-  useEffect(() => {
-    setAudioFailed(false);
-  }, [audioUrl]);
-
   const content = word.content;
   const familiarityDisabled = word.presentation !== "acked" || familiarityPending;
   const wordAudio = content?.audio.find(
@@ -87,15 +83,11 @@ export function WordStudyCard({
           </header>
           {wordAudio ? (
             <div className="audio-player">
-              {/* Audio failure is announced inline; reading never blocked. */}
-              <audio
-                controls
-                src={audioUrl ?? undefined}
-                onError={() => setAudioFailed(true)}
-              ></audio>
+              {audioUrl ? (
+                <AudioButton url={audioUrl} label="听单词" ariaLabel="播放单词音频" />
+              ) : null}
             </div>
           ) : null}
-          {audioFailed ? <p role="status">音频暂时无法播放，可先继续学习。</p> : null}
 
           <section className="content-block content-block--meaning" aria-label="核心词义">
             <p className="content-block__label">核心词义</p>
@@ -135,6 +127,11 @@ export function WordStudyCard({
                     {exampleAudioUrls[example.example_key] ? (
                       <ExampleAudioButton url={exampleAudioUrls[example.example_key]!} />
                     ) : null}
+                    <ExampleExplanation
+                      exampleKey={example.example_key}
+                      origin={example.origin}
+                      explanations={content.explanations}
+                    />
                   </li>
                 ))}
               </ul>

@@ -135,6 +135,11 @@ function renderDetail(initialPath: string) {
               404,
             );
       }
+      if (path.startsWith("/api/audio/")) {
+        return new Response(new Uint8Array([82, 73, 70, 70]), {
+          headers: { "content-type": "audio/wav" },
+        });
+      }
       if (path.startsWith("/api/progress/words/")) {
         const key = decodeURIComponent(path.replace("/api/progress/words/", ""));
         return jsonResponse(PROGRESS[key] ?? { word_key: key, progress: null });

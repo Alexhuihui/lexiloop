@@ -380,12 +380,43 @@ describe("new-word learning journey", () => {
     renderLearn(server.stub);
     await startSession();
 
+    const wordButton = await screen.findByRole("button", { name: "播放单词音频" });
     const button = await screen.findByRole("button", { name: "播放真题句音频" });
+    // Headword and sentence playback are the same compact control, not a
+    // native browser player beside a custom button.
+    expect(wordButton.className).toBe("audio-button");
+    expect(button.className).toBe("audio-button");
     const example = button.closest("li");
     const audio = example?.querySelector("audio");
     expect(audio).toBeTruthy();
     expect(audio?.getAttribute("src")).toContain("audio/ex/def222.wav");
     expect(audio?.getAttribute("src")).toContain("session=sess-created-1");
+
+    // The reviewed notes are attached to this exact exam sentence instead
+    // of living only in the generic word-level block below the whole list.
+    const sentenceNotes = example?.querySelector('[aria-label="真题句子讲解"]');
+    expect(sentenceNotes?.textContent).toContain("语境义：放弃（计划等）");
+    expect(sentenceNotes?.textContent).toContain("句子结构：abandon 后接名词或动名词作宾语");
+    expect(sentenceNotes?.textContent).toContain("理解提示：表示「放弃」；注意宾语的位置");
+  });
+
+  it("renders the first card before silently prefetching its audio and the next word", async () => {
+    const server = createFakeServer();
+    renderLearn(server.stub);
+    await startSession();
+    await screen.findByRole("heading", { name: "abandon" });
+
+    await waitFor(() => {
+      const paths = server.requests.map(({ url }) => new URL(url).pathname);
+      expect(paths).toContain("/api/audio/audio/ab/abc111.wav");
+      expect(paths).toContain("/api/audio/audio/ex/def222.wav");
+      expect(paths).toContain("/api/content/words/w-2");
+    });
+
+    const paths = server.requests.map(({ url }) => new URL(url).pathname);
+    const contentIndex = paths.indexOf("/api/content/words/w-1");
+    expect(paths.indexOf("/api/audio/audio/ab/abc111.wav")).toBeGreaterThan(contentIndex);
+    expect(paths.indexOf("/api/audio/audio/ex/def222.wav")).toBeGreaterThan(contentIndex);
   });
 
   it("resumes an interrupted session through the Session APIs without re-presenting studied words", async () => {
