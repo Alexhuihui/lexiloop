@@ -4,6 +4,7 @@ import { appUser, authSession, userSettings, type AppUserRow, type AuthSessionRo
 import type { UserContext } from "./context";
 
 export type AppUserStatus = "ACTIVE" | "DISABLED";
+export type AppUserAccountType = "TRIAL" | "FORMAL";
 
 export interface CreateUserInput {
   userId: string;
@@ -11,6 +12,9 @@ export interface CreateUserInput {
   passwordSalt: string;
   passwordVerifier: string;
   status?: AppUserStatus;
+  accountType?: AppUserAccountType;
+  accessExpiresAt?: number | null;
+  externalRef?: string | null;
   sessionVersion?: number;
   createdAt: number;
 }
@@ -42,6 +46,9 @@ export class UserRepository {
         passwordSalt: input.passwordSalt,
         passwordVerifier: input.passwordVerifier,
         status: input.status ?? "ACTIVE",
+        accountType: input.accountType ?? "FORMAL",
+        accessExpiresAt: input.accessExpiresAt ?? null,
+        externalRef: input.externalRef ?? null,
         sessionVersion: input.sessionVersion ?? 1,
         createdAt: input.createdAt,
       })

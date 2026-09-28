@@ -82,6 +82,9 @@ export function registerAuthRoutes(app: Hono<AppEnv>): void {
       }
 
       const now = deps.now?.() ?? Date.now();
+      if (user.accessExpiresAt !== null && user.accessExpiresAt <= now) {
+        return jsonError(c, 403, "AUTH_ACCOUNT_EXPIRED", "Account access has expired");
+      }
       const idleHours = deps.sessionIdleHours ?? DEFAULT_SESSION_IDLE_HOURS;
       const issued = await issueSession(deps.db, user, { now, idleHours });
       const csrfToken = await deriveCsrfToken(issued.token, issued.sessionId);
@@ -95,7 +98,13 @@ export function registerAuthRoutes(app: Hono<AppEnv>): void {
       });
       return c.json(
         {
-          user: { user_id: user.userId, username: user.normalizedUsername, status: user.status },
+          user: {
+            user_id: user.userId,
+            username: user.normalizedUsername,
+            status: user.status,
+            account_type: user.accountType,
+            access_expires_at: user.accessExpiresAt,
+          },
           session: { expires_at: issued.expiresAt },
           csrf_token: csrfToken,
         },
@@ -129,6 +138,8 @@ export function registerAuthRoutes(app: Hono<AppEnv>): void {
           user_id: auth.user.userId,
           username: auth.user.normalizedUsername,
           status: auth.user.status,
+          account_type: auth.user.accountType,
+          access_expires_at: auth.user.accessExpiresAt,
           session_version: auth.user.sessionVersion,
         },
         session: { expires_at: auth.session.expiresAt },

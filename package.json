@@ -5,6 +5,7 @@
   "packageManager": "pnpm@11.15.1",
   "scripts": {
     "compiler": "pnpm --filter @lexiloop/content-compiler exec tsx src/cli.ts",
+    "accounts": "tsx scripts/account-admin.ts",
     "toolchain:check": "tsx scripts/check-toolchain.ts",
     "typecheck": "pnpm -r typecheck",
     "typecheck:root": "tsc --noEmit -p tsconfig.json",

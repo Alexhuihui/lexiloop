@@ -1,0 +1,4 @@
+interface:
+  display_name: "LexiLoop Account Admin"
+  short_description: "Create and manage LexiLoop trial and formal learning accounts"
+  default_prompt: "Use $lexiloop-account-admin to create or manage a LexiLoop learning account safely."

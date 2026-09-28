@@ -36,7 +36,12 @@ export function requireAuth(): MiddlewareHandler<AppEnv> {
     const now = deps.now?.() ?? Date.now();
     const resolution = await resolveSession(deps.db, rawToken, now);
     if (!resolution.ok) {
-      const code = resolution.reason === "EXPIRED" ? "AUTH_SESSION_EXPIRED" : "AUTH_SESSION_INVALID";
+      const code =
+        resolution.reason === "EXPIRED"
+          ? "AUTH_SESSION_EXPIRED"
+          : resolution.reason === "ACCOUNT_EXPIRED"
+            ? "AUTH_ACCOUNT_EXPIRED"
+            : "AUTH_SESSION_INVALID";
       return jsonError(c, 401, code, "Session is missing, invalid, or no longer active");
     }
     const principal: AuthenticatedPrincipal = {

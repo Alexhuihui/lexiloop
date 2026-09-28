@@ -59,7 +59,7 @@ export async function issueSession(
 
 export type SessionResolution =
   | { ok: true; session: AuthSessionRow; user: AppUserRow }
-  | { ok: false; reason: "INVALID" | "EXPIRED" | "REVOKED" | "DISABLED" | "VERSION_MISMATCH" };
+  | { ok: false; reason: "INVALID" | "EXPIRED" | "REVOKED" | "DISABLED" | "ACCOUNT_EXPIRED" | "VERSION_MISMATCH" };
 
 /**
  * Resolves a presented cookie token through the full spec 7.2 chain. Order is
@@ -81,6 +81,9 @@ export async function resolveSession(db: LexiloopDatabase, rawToken: string, now
   }
   if (user.status !== "ACTIVE") {
     return { ok: false, reason: "DISABLED" };
+  }
+  if (user.accessExpiresAt !== null && user.accessExpiresAt <= now) {
+    return { ok: false, reason: "ACCOUNT_EXPIRED" };
   }
   if (user.sessionVersion !== session.sessionVersion) {
     return { ok: false, reason: "VERSION_MISMATCH" };

@@ -1,5 +1,23 @@
 # LexiLoop 交接说明（给下一位接手的同事）
 
+## 2026-09-28 学习账号发放工具（生产已部署）
+
+- 新增 `pnpm accounts` 账号管理 CLI 和仓库内 Skill
+  `skills/lexiloop-account-admin/`。支持固定 90 分钟体验账号、默认无到期时间的正式
+  账号、体验转正式（保留学习进度）、查询、禁用/启用、重置密码和过期体验号清扫。
+- 体验期限由 Worker 在登录及每个已登录请求上强制检查，不依赖清扫任务；密码只写入
+  权限为 `0600` 的私密回执文件，不进入 argv、普通日志或 Git。远程写操作还要求
+  `--confirm-remote`。
+- 迁移 `infra/migrations/0003_account_access.sql` 已应用到生产 `lexiloop-apac`，既有
+  3 个账号均保持 `FORMAL` 且无到期时间；新版 Worker/PWA 已部署，Worker 版本为
+  `4fa90ab8-17e5-498b-80fc-a174753840ed`。线上首页、鉴权错误、安全响应头、新表列与
+  两个索引均已验证，远程账号 CLI 读取也已通过。
+- Skill 已安装到本机 `/home/alex/.codex/skills/lexiloop-account-admin`。换电脑可在克隆
+  仓库后运行 `bash skills/lexiloop-account-admin/scripts/install.sh`，或把目标 Agent 的
+  skills 目录作为参数传入。
+- 验证通过：`pnpm verify`（49 个 Vitest 文件、824 项测试，另含 Lint、全仓
+  TypeScript 和 Python 环境门禁）以及仓库/安装副本的 Skill 校验。
+
 ## 2026-09-23 校对版全书发布（当前生产状态）
 
 - 权威内容源改为 `/home/alex/workspace/ocr/out/恋练有词6500-校对版.md` 及

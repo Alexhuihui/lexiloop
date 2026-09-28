@@ -230,6 +230,30 @@ describe("POST /api/auth/login", () => {
     expect(((await res.json()) as { code: string }).code).toBe("AUTH_ACCOUNT_DISABLED");
   });
 
+  it("rejects an expired trial account at login", async () => {
+    await seedUser(fx.db, "trial-expired", PASSWORD);
+    fx.env.sqlite
+      .prepare("UPDATE app_user SET account_type = 'TRIAL', access_expires_at = ? WHERE normalized_username = ?")
+      .run(T0, "trial-expired");
+    const res = await login(fx.app, "trial-expired", PASSWORD);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { code: string }).code).toBe("AUTH_ACCOUNT_EXPIRED");
+  });
+
+  it("invalidates an existing session when its trial access reaches 90 minutes", async () => {
+    await seedUser(fx.db, "trial-live", PASSWORD);
+    fx.env.sqlite
+      .prepare("UPDATE app_user SET account_type = 'TRIAL', access_expires_at = ? WHERE normalized_username = ?")
+      .run(T0 + 90 * 60 * 1000, "trial-live");
+    const loginResponse = await login(fx.app, "trial-live", PASSWORD);
+    expect(loginResponse.status).toBe(200);
+    const cookie = sessionCookieOf(loginResponse)!.split(";")[0]!;
+    fx.clock.now = T0 + 90 * 60 * 1000;
+    const me = await fx.app.request("/api/auth/me", { headers: { cookie } });
+    expect(me.status).toBe(401);
+    expect(((await me.json()) as { code: string }).code).toBe("AUTH_ACCOUNT_EXPIRED");
+  });
+
   it("answers 429 through the injectable rate-limit adapter before creating a session", async () => {
     const limited = await createFixture({ loginRateLimiter: new FakeRateLimiter(() => false) });
     try {

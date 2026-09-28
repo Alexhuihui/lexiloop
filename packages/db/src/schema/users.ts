@@ -13,6 +13,11 @@ export const appUser = sqliteTable("app_user", {
   status: text("status").notNull().default("ACTIVE"),
   sessionVersion: integer("session_version").notNull().default(1),
   createdAt: integer("created_at").notNull(),
+  // Appended by migration 0003; keep this order aligned with SQLite's
+  // physical column order for D1 raw-row mapping and test adapters.
+  accessExpiresAt: integer("access_expires_at"),
+  accountType: text("account_type").notNull().default("FORMAL"),
+  externalRef: text("external_ref"),
 });
 
 export type AppUserRow = typeof appUser.$inferSelect;

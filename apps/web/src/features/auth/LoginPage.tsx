@@ -31,6 +31,8 @@ function errorMessageFor(cause: unknown): string {
         return "用户名或密码不正确";
       case "AUTH_ACCOUNT_DISABLED":
         return "账户已被禁用";
+      case "AUTH_ACCOUNT_EXPIRED":
+        return "体验账号已到期，请联系卖家开通正式账号";
       case "RATE_LIMITED":
         return "尝试次数过多，请稍后再试";
       case "NETWORK_ERROR":
